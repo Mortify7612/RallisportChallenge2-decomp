@@ -66,9 +66,11 @@ static void set_notify_status(MCPXAPUState *d, uint32_t v, int notifier,
  * Filter helpers
  * ============================================================ */
 
+static void voice_resampler_reset_fwd(uint16_t v);
 static void voice_reset_filters(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
+    voice_resampler_reset_fwd(v);
     memset(&d->vp.filters[v].svf, 0, sizeof(d->vp.filters[v].svf));
     hrtf_filter_clear_history(&d->vp.filters[v].hrtf);
     if (d->vp.filters[v].resampler) {
@@ -940,37 +942,110 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
 }
 
 /* ============================================================
- * Voice resampling (simplified - no libsamplerate)
+ * Voice resampling
  *
- * Since libsamplerate is stubbed, we do a simple nearest-neighbor
- * resample. This gives us functional audio at the cost of quality.
+ * A voice's pitch is the rate it walks through its samples: `rate` is
+ * output/input (libsamplerate's ratio, as xemu passes it), so each 48 kHz
+ * output frame advances 1/rate source frames. This used to be ignored and
+ * every voice was read one source frame per output frame -- right for the
+ * 48 kHz music streams and wrong for every effect recorded at another rate
+ * or pitched at run time (the engine, which follows the revs), which all
+ * played at the wrong speed and pitch.
+ *
+ * Each voice keeps the source frames it has fetched but not yet passed,
+ * plus one behind, and a fractional read position into them; output frames
+ * are 4-point cubic (Catmull-Rom) interpolations. VOICE_ON resets it.
  * ============================================================ */
+
+#define RS_MAX_STEP 64.0                    /* 6 octaves up */
+#define RS_CAP      (NUM_SAMPLES_PER_FRAME * 64 + 8)
+
+typedef struct {
+    float buf[RS_CAP][2];
+    int len;                                /* frames in buf */
+    double pos;                             /* read position in buf */
+} VoiceResampler;
+
+static VoiceResampler s_rs[MCPX_HW_MAX_VOICES];
+
+static void voice_resampler_reset(uint16_t v)
+{
+    VoiceResampler *rs = &s_rs[v];
+    rs->buf[0][0] = rs->buf[0][1] = 0.0f;   /* the frame "before" the first */
+    rs->len = 1;
+    rs->pos = 1.0;
+}
+
+static void voice_resampler_reset_fwd(uint16_t v) { voice_resampler_reset(v); }
+
+static inline float cubic(float y0, float y1, float y2, float y3, float t)
+{
+    float a = -0.5f * y0 + 1.5f * y1 - 1.5f * y2 + 0.5f * y3;
+    float b = y0 - 2.5f * y1 + 2.0f * y2 - 0.5f * y3;
+    float c = -0.5f * y0 + 0.5f * y2;
+    return ((a * t + b) * t + c) * t + y1;
+}
 
 static int voice_resample(MCPXAPUState *d, uint16_t v, float samples[][2],
                           int requested_num, float rate)
 {
-    /* Without libsamplerate, just fetch raw samples at native rate.
-     * Rate < 1.0 means we need more source samples than output samples.
-     * For initial functionality, just get the samples directly. */
-    int sample_count = 0;
-    while (sample_count < requested_num) {
-        int active = voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
-                                    NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE);
-        if (!active) break;
+    VoiceResampler *rs = &s_rs[v];
+    double step = rate > 0.0f ? 1.0 / rate : 1.0;
+    int out = 0;
 
-        int count = voice_get_samples(d, v, &samples[sample_count],
-                                      requested_num - sample_count);
-        if (count < 0) break;
-        if (count == 0) return -1;
-        sample_count += count;
+    if (step > RS_MAX_STEP) step = RS_MAX_STEP;
+    if (step < 1.0 / RS_MAX_STEP) step = 1.0 / RS_MAX_STEP;
+    if (rs->len < 1)
+        voice_resampler_reset(v);
+
+    while (out < requested_num) {
+        int i0 = (int)rs->pos;
+        if (i0 + 2 >= rs->len) {
+            /* Need buf[i0 + 2]: drop what is behind buf[i0 - 1], then fetch
+             * enough for the rest of this frame. */
+            int drop = i0 - 1, need, got;
+            if (drop > 0) {
+                memmove(rs->buf, rs->buf + drop, sizeof(rs->buf[0]) * (size_t)(rs->len - drop));
+                rs->len -= drop;
+                rs->pos -= drop;
+                i0 -= drop;
+            }
+            need = (int)ceil((requested_num - out) * step) + 3;
+            if (need > RS_CAP - rs->len)
+                need = RS_CAP - rs->len;
+            if (!voice_get_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
+                                NV_PAVS_VOICE_PAR_STATE_ACTIVE_VOICE))
+                break;
+            got = voice_get_samples(d, v, &rs->buf[rs->len], need);
+            if (got <= 0) {
+                if (out)
+                    break;
+                return -1;
+            }
+            rs->len += got;
+            continue;
+        }
+        {
+            float t = (float)(rs->pos - i0);
+            const float *a = rs->buf[i0 - 1], *b = rs->buf[i0];
+            const float *c = rs->buf[i0 + 1], *e = rs->buf[i0 + 2];
+            samples[out][0] = cubic(a[0], b[0], c[0], e[0], t);
+            samples[out][1] = cubic(a[1], b[1], c[1], e[1], t);
+        }
+        out++;
+        rs->pos += step;
     }
-    (void)rate; /* Ignored until we add proper resampling */
-    return sample_count;
+    return out;
 }
 
 /* ============================================================
  * Voice processing (main per-voice function)
  * ============================================================ */
+
+/* RECOMP_APU_STATS bookkeeping (see vp_stats_frame). */
+static unsigned long s_vstat_active[3], s_vstat_frames, s_vstat_loud;
+static struct { unsigned long frames; float peak, ea, rate; uint16_t vol0, vol1, vols[8]; int bins[8]; int list, mp, mpbin; float inpk; double sll, srr, slr;
+                int bin0, bin1, stereo, paused; } s_vinfo[256];
 
 static void voice_process(MCPXAPUState *d,
                           float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME],
@@ -1136,6 +1211,37 @@ static void voice_process(MCPXAPUState *d,
         }
     }
 
+    /* RECOMP_APU_STATS: what each voice actually carried this period. */
+    if (v < 256) {
+        float pk = 0.0f;
+        for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+            float a = fabsf(samples[i][0]), b2 = fabsf(samples[i][channels - 1]);
+            if (a > pk) pk = a;
+            if (b2 > pk) pk = b2;
+        }
+        if (pk > s_vinfo[v].peak) s_vinfo[v].peak = pk;
+        if (stereo)
+            for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+                s_vinfo[v].sll += samples[i][0] * samples[i][0];
+                s_vinfo[v].srr += samples[i][1] * samples[i][1];
+                s_vinfo[v].slr += samples[i][0] * samples[i][1];
+            }
+        s_vinfo[v].frames++;
+        s_vinfo[v].ea = ea_value;
+        s_vinfo[v].rate = rate;
+        s_vinfo[v].list = voice_list;
+        s_vinfo[v].mp = multipass;
+        s_vinfo[v].mpbin = (int)voice_get_mask(d, v, NV_PAVS_VOICE_CFG_FMT,
+                                               NV_PAVS_VOICE_CFG_FMT_MULTIPASS_BIN);
+        for (int k = 0; k < 8; k++) {
+            s_vinfo[v].vols[k] = vol[k];
+            s_vinfo[v].bins[k] = bin[k];
+        }
+        s_vinfo[v].vol0 = vol[0]; s_vinfo[v].vol1 = vol[1];
+        s_vinfo[v].bin0 = bin[0]; s_vinfo[v].bin1 = bin[1];
+        s_vinfo[v].stereo = stereo; s_vinfo[v].paused = paused;
+    }
+
     /* Mix into bins */
     for (int b = 0; b < 8; b++) {
         float g = ea_value;
@@ -1175,6 +1281,61 @@ static void voice_process(MCPXAPUState *d,
  * Simplified single-threaded version (no worker threads initially)
  * ============================================================ */
 
+/* RECOMP_APU_STATS: every 5 s, how many voices each list (2D, 3D, MP) ran
+ * per frame and how many frames reached the mixbins with any signal. */
+static void vp_stats_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
+{
+    static int on = -1;
+    static uint64_t t0;
+    int b, i, loud = 0;
+    if (on < 0)
+        on = getenv("RECOMP_APU_STATS") != NULL;
+    if (!on)
+        return;
+    for (b = 0; b < NUM_MIXBINS && !loud; b++)
+        for (i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+            if (mixbins[b][i] > 1e-4f || mixbins[b][i] < -1e-4f) { loud = 1; break; }
+    s_vstat_frames++;
+    s_vstat_loud += loud;
+    {
+        uint64_t now = (uint64_t)qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+        if (!t0) t0 = now;
+        if (now - t0 >= 5000000u) {
+            fprintf(stderr, "[APU-STATS] %lu frames: voices/frame 2D %.2f 3D %.2f MP %.2f;"
+                    " frames with signal %lu\n", s_vstat_frames,
+                    s_vstat_active[0] / (double)s_vstat_frames,
+                    s_vstat_active[1] / (double)s_vstat_frames,
+                    s_vstat_active[2] / (double)s_vstat_frames, s_vstat_loud);
+            for (i = 0; i < 256; i++) {
+                if (!s_vinfo[i].frames)
+                    continue;
+                fprintf(stderr, "[APU-STATS]   voice %3d: %lu frames, peak %.4f, env %.3f,"
+                        " rate %.3f vol %03X/%03X -> bins %d/%d%s%s\n", i, s_vinfo[i].frames,
+                        s_vinfo[i].peak, s_vinfo[i].ea, s_vinfo[i].rate, s_vinfo[i].vol0, s_vinfo[i].vol1,
+                        s_vinfo[i].bin0, s_vinfo[i].bin1,
+                        s_vinfo[i].stereo ? " stereo" : "", s_vinfo[i].paused ? " paused" : "");
+                {
+                    int k;
+                    fprintf(stderr, "[APU-STATS]     list %d mp %d mpbin %d",
+                            s_vinfo[i].list, s_vinfo[i].mp, s_vinfo[i].mpbin);
+                    if (s_vinfo[i].stereo && s_vinfo[i].sll > 0 && s_vinfo[i].srr > 0)
+                        fprintf(stderr, " L/R corr %.3f",
+                                s_vinfo[i].slr / sqrt(s_vinfo[i].sll * s_vinfo[i].srr));
+                    fprintf(stderr, " sends:");
+                    for (k = 0; k < 8; k++)
+                        if (s_vinfo[i].vols[k] != 0xFFF)
+                            fprintf(stderr, " s%d:%d@%03X", k, s_vinfo[i].bins[k], s_vinfo[i].vols[k]);
+                    fputc('\n', stderr);
+                }
+            }
+            memset(s_vinfo, 0, sizeof s_vinfo);
+            s_vstat_active[0] = s_vstat_active[1] = s_vstat_active[2] = 0;
+            s_vstat_frames = s_vstat_loud = 0;
+            t0 = now;
+        }
+    }
+}
+
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -1204,10 +1365,12 @@ void mcpx_apu_vp_frame(MCPXAPUState *d,
             } else {
                 /* Process voice directly (single-threaded) */
                 voice_process(d, mixbins, d->vp.sample_buf, v, list);
+                s_vstat_active[list]++;
             }
             d->regs[current] = d->regs[next];
         }
     }
+    vp_stats_frame(mixbins);
 
     /* VP monitor output */
     if (d->monitor.point == MCPX_APU_DEBUG_MON_VP) {

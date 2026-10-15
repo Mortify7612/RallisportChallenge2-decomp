@@ -11,8 +11,7 @@
 #include <string.h>
 #include "apu_xaudio2.h"
 
-/* The XAudio2 backend is Windows-only. On Linux all xa2_* functions are
- * stubbed to report inactive; real audio output via SDL2 comes later. */
+/* XAudio2 on Windows; SDL2 elsewhere (below). */
 #if defined(_WIN32)
 
 #define COBJMACROS
@@ -161,12 +160,134 @@ int xa2_get_buffer_size(void)
     return XA2_BUF_SAMPLES;
 }
 
-#else /* !_WIN32 -- POSIX stubs (no audio output yet) */
+#else /* !_WIN32 -- SDL2 audio */
 
-int  xa2_init(void)                                   { return 0; }
-void xa2_shutdown(void)                               {}
-int  xa2_is_active(void)                              { return 0; }
-int  xa2_submit_samples(const int16_t *s, int n)      { (void)s; (void)n; return 0; }
-int  xa2_get_buffer_size(void)                        { return 0; }
+/* The same contract on SDL2: a queue-based device at 48 kHz stereo 16-bit,
+ * fed from the APU monitor frame. Like the XAudio2 path, a submission is
+ * dropped rather than queued when three buffers are already waiting, so a
+ * frame thread that runs ahead cannot build up latency.
+ *
+ * RECOMP_AUDIO=0 keeps it closed (headless runs, CI); RECOMP_AUDIO_WAV=<file>
+ * also records every submitted sample, which is how output is checked
+ * without speakers. */
+#include <SDL.h>
+#include <stdlib.h>
+
+#define XA2_SAMPLE_RATE   48000
+#define XA2_CHANNELS      2
+#define XA2_BUF_SAMPLES   1024
+#define XA2_NUM_BUFS      3
+
+static SDL_AudioDeviceID g_dev;
+static int   g_xa2_initialized;
+static long  g_xa2_frames_written;
+static FILE *g_wav;
+static uint32_t g_wav_bytes;
+
+static void wav_header(FILE *f, uint32_t data_bytes)
+{
+    uint32_t v;
+    uint16_t h;
+    fseek(f, 0, SEEK_SET);
+    fwrite("RIFF", 1, 4, f); v = 36 + data_bytes; fwrite(&v, 4, 1, f);
+    fwrite("WAVEfmt ", 1, 8, f); v = 16; fwrite(&v, 4, 1, f);
+    h = 1; fwrite(&h, 2, 1, f); h = XA2_CHANNELS; fwrite(&h, 2, 1, f);
+    v = XA2_SAMPLE_RATE; fwrite(&v, 4, 1, f);
+    v = XA2_SAMPLE_RATE * XA2_CHANNELS * 2; fwrite(&v, 4, 1, f);
+    h = XA2_CHANNELS * 2; fwrite(&h, 2, 1, f); h = 16; fwrite(&h, 2, 1, f);
+    fwrite("data", 1, 4, f); fwrite(&data_bytes, 4, 1, f);
+    fseek(f, 0, SEEK_END);
+}
+
+int xa2_init(void)
+{
+    SDL_AudioSpec want, have;
+    const char *off = getenv("RECOMP_AUDIO"), *wav = getenv("RECOMP_AUDIO_WAV");
+
+    if (g_xa2_initialized) return 1;
+    if (wav && *wav) {
+        g_wav = fopen(wav, "wb");
+        if (g_wav) wav_header(g_wav, 0);
+    }
+    if (off && !strcmp(off, "0")) {
+        if (!g_wav) return 0;
+        g_xa2_initialized = 1;            /* recording only */
+        fprintf(stderr, "[XA2] SDL audio off; recording to %s\n", wav);
+        return 1;
+    }
+    /* SDL would otherwise turn SIGINT/SIGTERM into an SDL_QUIT event that only
+     * the window thread reads: with no window, the process stopped answering
+     * kill and Ctrl-C. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
+    if (SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+        fprintf(stderr, "[XA2] SDL audio init failed: %s\n", SDL_GetError());
+        if (!g_wav) return 0;
+    } else {
+        SDL_zero(want);
+        want.freq = XA2_SAMPLE_RATE;
+        want.format = AUDIO_S16SYS;
+        want.channels = XA2_CHANNELS;
+        want.samples = XA2_BUF_SAMPLES;
+        want.callback = NULL;              /* SDL_QueueAudio */
+        g_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+        if (!g_dev) {
+            fprintf(stderr, "[XA2] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
+            if (!g_wav) return 0;
+        } else {
+            SDL_PauseAudioDevice(g_dev, 0);
+            fprintf(stderr, "[XA2] SDL2 audio output: %d Hz, %d channels (%s)\n",
+                    have.freq, have.channels, SDL_GetCurrentAudioDriver());
+        }
+    }
+    g_xa2_initialized = 1;
+    return 1;
+}
+
+void xa2_shutdown(void)
+{
+    if (g_dev) {
+        SDL_CloseAudioDevice(g_dev);
+        g_dev = 0;
+    }
+    if (g_wav) {
+        wav_header(g_wav, g_wav_bytes);
+        fclose(g_wav);
+        g_wav = NULL;
+    }
+    if (g_xa2_initialized)
+        fprintf(stderr, "[XA2] Shut down (%ld buffers written)\n", g_xa2_frames_written);
+    g_xa2_initialized = 0;
+}
+
+int xa2_is_active(void)
+{
+    return g_xa2_initialized;
+}
+
+int xa2_submit_samples(const int16_t *samples, int num_samples)
+{
+    uint32_t bytes;
+    if (!g_xa2_initialized) return 0;
+    if (num_samples > XA2_BUF_SAMPLES) num_samples = XA2_BUF_SAMPLES;
+    bytes = (uint32_t)num_samples * XA2_CHANNELS * sizeof(int16_t);
+    if (g_dev && SDL_GetQueuedAudioSize(g_dev) >= XA2_NUM_BUFS * XA2_BUF_SAMPLES
+                                                 * XA2_CHANNELS * sizeof(int16_t))
+        return 0;
+    if (g_dev && SDL_QueueAudio(g_dev, samples, bytes) != 0)
+        return 0;
+    if (g_wav) {
+        fwrite(samples, 1, bytes, g_wav);
+        g_wav_bytes += bytes;
+        if ((g_xa2_frames_written & 63) == 0)
+            wav_header(g_wav, g_wav_bytes);   /* playable even if killed */
+    }
+    g_xa2_frames_written++;
+    return 1;
+}
+
+int xa2_get_buffer_size(void)
+{
+    return XA2_BUF_SAMPLES;
+}
 
 #endif /* _WIN32 */

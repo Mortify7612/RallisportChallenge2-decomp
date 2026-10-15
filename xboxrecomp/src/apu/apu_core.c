@@ -75,7 +75,9 @@ extern uint32_t xbox_ContiguousAllocatedBytes(void);
 
 uint8_t *mcpx_apu_phys(uint64_t addr)
 {
-    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu, va;
+    if (xbox_PhysUntag(a, &va))
+        return g_apu_ram_ptr + va;
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (a < xbox_ContiguousAllocatedBytes())
@@ -319,6 +321,16 @@ void mcpx_apu_monitor_init(MCPXAPUState *d, Error **errp)
     d->monitor.queued_bytes_low = 1024;
     d->monitor.queued_bytes_high = 3072;
 
+    /* RECOMP_AUDIO=0: no output device at all, on any host (unattended runs).
+     * On POSIX the SDL backend still records RECOMP_AUDIO_WAV if asked. */
+    {
+        const char *a = getenv("RECOMP_AUDIO");
+        if (a && !strcmp(a, "0") && !getenv("RECOMP_AUDIO_WAV")) {
+            fprintf(stderr, "[APU] audio output off (RECOMP_AUDIO=0)\n");
+            return;
+        }
+    }
+
     /* Try XAudio2 first (lower latency) */
     if (xa2_init()) {
         fprintf(stderr, "[APU] Using XAudio2 audio backend\n");
@@ -383,37 +395,37 @@ void mcpx_apu_monitor_frame(MCPXAPUState *d)
         return;
     }
 
-    /* XAudio2 path: render and submit a buffer */
+    /* XAudio2 / SDL2 path: submit this monitor period.
+     *
+     * frame_buf already holds it -- the 8 EP frames since the last call each
+     * wrote their 32 samples (mcpx_apu_dsp_frame), 256 in all. This path used
+     * to clear the buffer and render xa2_get_buffer_size() samples of the
+     * software mixer alone: every voice the title played through the VP was
+     * thrown away, and four times as many samples as real time went out. Now
+     * the software voices and the test tone are mixed on top, and exactly the
+     * period goes out. */
     if (xa2_is_active()) {
-        int buf_size = xa2_get_buffer_size();
-        int16_t xa2_tmp[1024][2];  /* matches XA2_BUF_SAMPLES max */
-        int remaining = buf_size;
-        int out_offset = 0;
+        const int period = 8 * NUM_SAMPLES_PER_FRAME;
+        int i;
 
-        while (remaining > 0) {
-            int chunk = (remaining < MIXER_FRAME_SAMPLES) ? remaining : MIXER_FRAME_SAMPLES;
+        if (g_audio_muted) {
             memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
-
-            if (g_test_tone.active && !g_audio_muted) {
-                for (int i = 0; i < chunk; i++) {
-                    int16_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
-                    d->monitor.frame_buf[i][0] = s;
-                    d->monitor.frame_buf[i][1] = s;
+        } else {
+            if (g_test_tone.active) {
+                for (i = 0; i < period; i++) {
+                    int32_t s = (int16_t)(sin(g_test_tone.phase) * g_test_tone.amplitude);
+                    int32_t l = d->monitor.frame_buf[i][0] + s;
+                    int32_t r = d->monitor.frame_buf[i][1] + s;
+                    d->monitor.frame_buf[i][0] = (int16_t)(l > 32767 ? 32767 : l < -32768 ? -32768 : l);
+                    d->monitor.frame_buf[i][1] = (int16_t)(r > 32767 ? 32767 : r < -32768 ? -32768 : r);
                     g_test_tone.phase += g_test_tone.phase_inc;
                     if (g_test_tone.phase >= 2.0 * M_PI)
                         g_test_tone.phase -= 2.0 * M_PI;
                 }
             }
-
-            if (!g_audio_muted)
-                mixer_render(d->monitor.frame_buf, chunk);
-
-            memcpy(xa2_tmp + out_offset, d->monitor.frame_buf, chunk * 2 * sizeof(int16_t));
-            out_offset += chunk;
-            remaining -= chunk;
+            mixer_render(d->monitor.frame_buf, period);
         }
-
-        xa2_submit_samples((const int16_t *)xa2_tmp, buf_size);
+        xa2_submit_samples((const int16_t *)d->monitor.frame_buf, period);
         return;
     }
 

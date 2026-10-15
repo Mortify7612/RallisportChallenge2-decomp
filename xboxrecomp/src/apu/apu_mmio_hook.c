@@ -15,11 +15,15 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
-/* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux the
- * equivalent goes through sigaction + ucontext_t (Stage 2 / main.c). For
- * now the whole body is Windows-only so apu_emu links on Debian. */
+/* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux x86-64
+ * the VEH is the sigaction shim in win32_compat.c, which hands over the same
+ * CONTEXT fields; other POSIX hosts have no fault path yet. */
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include "win32_compat.h"
+#endif
 
 /* APU MMIO base in Xbox VA space */
 #define APU_MMIO_BASE  0xFE800000u
@@ -72,6 +76,17 @@ static int decode_modrm_len(const uint8_t *ip, int has_rex_b)
     else if (mod == 1) len += 1;
     else if (mod == 2) len += 4;
     return len;
+}
+
+/* ZF, SF and CF after an emulated compare-shaped access, so the jcc after
+ * it branches as it would on the hardware. OF is cleared, as TEST and the
+ * logical ops do; it is not modelled for ADD/SUB/CMP. */
+static void apu_set_flags(PCONTEXT ctx, uint64_t result, int size, int cf)
+{
+    ctx->EFlags &= ~(0x0001u | 0x0040u | 0x0080u | 0x0800u);
+    if (result == 0) ctx->EFlags |= 0x0040u;
+    if (result & (1ULL << (size * 8 - 1))) ctx->EFlags |= 0x0080u;
+    if (cf) ctx->EFlags |= 0x0001u;
 }
 
 /* ============================================================
@@ -240,6 +255,86 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
         return true;
     }
 
+    /* The immediate forms. GCC folds `MEM32(reg) & mask` straight into a
+     * memory-operand TEST and `MEM32(reg) |= bit` into an ALU op on memory,
+     * so the lifted DirectSound reaches the APU through these as often as
+     * through a plain MOV; RalliSport Challenge 2's first APU access was
+     * `test dword [rax+r8], 0x18`. */
+
+    /* TEST r/m, imm (F6 /0 imm8, F7 /0 imm16/32) */
+    if ((opcode[0] == 0xF6 || opcode[0] == 0xF7) && ((opcode[1] >> 3) & 7) == 0) {
+        int modrm_len, imm_len;
+        uint64_t imm, mem_val;
+        if (opcode[0] == 0xF6) access_size = 1;
+        modrm_len = decode_modrm_len(opcode + 1, rex_b);
+        imm_len = access_size == 1 ? 1 : access_size == 2 ? 2 : 4;
+        imm = imm_len == 1 ? opcode[1 + modrm_len]
+            : imm_len == 2 ? *(const uint16_t *)(opcode + 1 + modrm_len)
+            : (uint64_t)(int64_t)*(const int32_t *)(opcode + 1 + modrm_len);
+        mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
+        apu_set_flags(ctx, mem_val & imm, access_size, 0);
+        ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
+        g_apu_mmio_read_count++;
+        return true;
+    }
+
+    /* ALU r/m, imm (80 /n imm8, 81 /n imm16/32, 83 /n imm8 sign-extended):
+     * ADD OR AND SUB XOR CMP. ADC/SBB need the incoming carry and are left
+     * to the decode-fail report. */
+    if (opcode[0] == 0x80 || opcode[0] == 0x81 || opcode[0] == 0x83) {
+        int ext = (opcode[1] >> 3) & 7;
+        if (ext != 2 && ext != 3) {
+            int modrm_len, imm_len;
+            uint64_t imm, m, r, mask;
+            int cf = 0;
+            if (opcode[0] == 0x80) access_size = 1;
+            modrm_len = decode_modrm_len(opcode + 1, rex_b);
+            imm_len = (opcode[0] == 0x81) ? (access_size == 2 ? 2 : 4) : 1;
+            if (opcode[0] == 0x81)
+                imm = access_size == 2 ? *(const uint16_t *)(opcode + 1 + modrm_len)
+                    : (uint64_t)(int64_t)*(const int32_t *)(opcode + 1 + modrm_len);
+            else if (opcode[0] == 0x83)
+                imm = (uint64_t)(int64_t)(int8_t)opcode[1 + modrm_len];
+            else
+                imm = opcode[1 + modrm_len];
+            mask = access_size < 8 ? (1ULL << (access_size * 8)) - 1 : ~0ULL;
+            m = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size) & mask;
+            imm &= mask;
+            switch (ext) {
+            case 0: r = m + imm; cf = (r & mask) < m; break;   /* ADD */
+            case 1: r = m | imm; break;                        /* OR  */
+            case 4: r = m & imm; break;                        /* AND */
+            case 5: case 7: r = m - imm; cf = m < imm; break;  /* SUB, CMP */
+            default: r = m ^ imm; break;                       /* XOR */
+            }
+            apu_set_flags(ctx, r & mask, access_size, cf);
+            if (ext != 7) {
+                mcpx_apu_mmio_write(g_apu_state, mmio_offset, r & mask, access_size);
+                g_apu_mmio_write_count++;
+            } else {
+                g_apu_mmio_read_count++;
+            }
+            ctx->Rip += prefix_len + 1 + modrm_len + imm_len;
+            return true;
+        }
+    }
+
+    /* MOVSX r, r/m8|16 (0F BE / 0F BF) */
+    if (opcode[0] == 0x0F && (opcode[1] == 0xBE || opcode[1] == 0xBF)) {
+        int sz = opcode[1] == 0xBE ? 1 : 2;
+        int modrm_len = decode_modrm_len(opcode + 2, rex_b);
+        int reg = ((opcode[2] >> 3) & 7) | (rex_r ? 8 : 0);
+        uint64_t v = mcpx_apu_mmio_read(g_apu_state, mmio_offset, sz);
+        int64_t sv = sz == 1 ? (int64_t)(int8_t)v : (int64_t)(int16_t)v;
+        uint64_t *dst = ctx_reg64(ctx, reg);
+        if (has_66)     *dst = (*dst & ~0xFFFFULL) | ((uint64_t)sv & 0xFFFF);
+        else if (rex_w) *dst = (uint64_t)sv;
+        else            *dst = (uint64_t)sv & 0xFFFFFFFFULL;
+        ctx->Rip += prefix_len + 2 + modrm_len;
+        g_apu_mmio_read_count++;
+        return true;
+    }
+
     /* Unrecognized */
     g_apu_mmio_decode_fail++;
     if (g_apu_mmio_decode_fail <= 20) {
@@ -280,4 +375,4 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     return ok;
 }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || linux x86-64 */

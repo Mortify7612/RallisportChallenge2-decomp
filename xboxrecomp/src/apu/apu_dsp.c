@@ -25,6 +25,7 @@
 #include "apu_state.h"
 #include "fpconv.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -138,74 +139,160 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
     (void)d;
 }
 
+/* ── Stereo mixdown standing in for the GP/EP ─────────────────────────────
+ *
+ * The VP leaves 32 mixbins; on hardware the GP's DSP program (DirectSound's
+ * standard effects image) turns them into speaker feeds and the EP encodes
+ * those. Neither runs here, so this folds the bins down to stereo the way
+ * the standard image routes them:
+ *
+ *   0 front L, 1 front R, 2 centre, 3 LFE, 4 back L, 5 back R,
+ *   6..9 the crosstalk (virtual-surround) FL/FR/BL/BR, 10 the I3DL2 reverb
+ *   send, 11..30 effect sends, 31 the multipass bin.
+ *
+ * The multipass bin is an intermediate: multipass voices read it back and
+ * redistribute it, so playing it as well doubled every sound routed through
+ * it -- RalliSport Challenge 2 sends its engine and most effects there.
+ * The reverb send is the input of a reverb, not something to hear dry; it
+ * feeds a small reverb below. The previous even-left / odd-right split
+ * played bin 31 dry on the right and bin 10 dry on the left, which with
+ * everything summed hard-clipped about one sample in a hundred in a race.
+ *
+ * Bins come back up by the headroom the VP divided them by (the GP program
+ * undoes it), and the result goes through a soft limiter instead of being
+ * hard-clipped.
+ *
+ * ponytail: not the title's DSP program -- no per-title effects, and the
+ * reverb is a fixed Freeverb, not the I3DL2 parameters the title set.
+ * RECOMP_APU_MIXDOWN_ALL=0 restores the old two-bin read, RECOMP_APU_REVERB=<wet>
+ * sets the reverb level (0 turns it off). */
+
+#define FV_COMBS 8
+#define FV_APS   4
+static const int fv_comb_len[FV_COMBS] = { 1215, 1293, 1390, 1476, 1548, 1623, 1695, 1760 };
+static const int fv_ap_len[FV_APS] = { 605, 480, 371, 245 };
+#define FV_SPREAD 25
+
+typedef struct {
+    float *comb[2][FV_COMBS], comb_lp[2][FV_COMBS];
+    int comb_i[2][FV_COMBS], comb_n[2][FV_COMBS];
+    float *ap[2][FV_APS];
+    int ap_i[2][FV_APS], ap_n[2][FV_APS];
+} Reverb;
+
+static Reverb s_rv;
+static float s_rv_wet = -1.0f;
+
+static void reverb_init(void)
+{
+    const char *e = getenv("RECOMP_APU_REVERB");
+    int c, k;
+    s_rv_wet = e && *e ? (float)atof(e) : 0.3f;
+    if (s_rv_wet <= 0.0f)
+        return;
+    for (c = 0; c < 2; c++) {
+        for (k = 0; k < FV_COMBS; k++) {
+            s_rv.comb_n[c][k] = fv_comb_len[k] + c * FV_SPREAD;
+            s_rv.comb[c][k] = (float *)calloc((size_t)s_rv.comb_n[c][k], sizeof(float));
+        }
+        for (k = 0; k < FV_APS; k++) {
+            s_rv.ap_n[c][k] = fv_ap_len[k] + c * FV_SPREAD;
+            s_rv.ap[c][k] = (float *)calloc((size_t)s_rv.ap_n[c][k], sizeof(float));
+        }
+    }
+}
+
+/* One mono sample in, a stereo pair of reverb out (Freeverb structure). */
+static void reverb_tick(float in, float *outl, float *outr)
+{
+    const float feedback = 0.80f, damp = 0.25f;
+    int c, k;
+    in *= 0.015f;
+    for (c = 0; c < 2; c++) {
+        float acc = 0.0f;
+        for (k = 0; k < FV_COMBS; k++) {
+            float *b = s_rv.comb[c][k];
+            int i = s_rv.comb_i[c][k];
+            float y = b[i];
+            s_rv.comb_lp[c][k] = y * (1.0f - damp) + s_rv.comb_lp[c][k] * damp;
+            b[i] = in + s_rv.comb_lp[c][k] * feedback;
+            if (++i >= s_rv.comb_n[c][k]) i = 0;
+            s_rv.comb_i[c][k] = i;
+            acc += y;
+        }
+        for (k = 0; k < FV_APS; k++) {
+            float *b = s_rv.ap[c][k];
+            int i = s_rv.ap_i[c][k];
+            float bo = b[i];
+            b[i] = acc + bo * 0.5f;
+            acc = bo - acc;
+            if (++i >= s_rv.ap_n[c][k]) i = 0;
+            s_rv.ap_i[c][k] = i;
+        }
+        if (c == 0) *outl = acc * 3.0f;
+        else        *outr = acc * 3.0f;
+    }
+}
+
+/* Unity below 0.75, then a tanh knee that never quite reaches 1. */
+static inline float soft_limit(float x)
+{
+    float a = fabsf(x);
+    if (a <= 0.75f)
+        return x;
+    a = 0.75f + 0.25f * tanhf((a - 0.75f) / 0.25f);
+    return x < 0.0f ? -a : a;
+}
+
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
-    /* Bypass DSP: take mixbin 0 (front-left) and mixbin 1 (front-right)
-     * and write them directly to the monitor frame buffer as the final
-     * EP output.
-     *
-     * The Xbox DirectSound typically routes:
-     *   Mixbin 0 = Front Left
-     *   Mixbin 1 = Front Right
-     *   Mixbin 2 = Center (often unused in stereo)
-     *   Mixbin 3 = LFE
-     *   Mixbin 4-5 = Rear L/R
-     *
-     * For stereo output, bins 0 and 1 are what we want.
-     */
-
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
 
+    if (s_rv_wet < 0.0f)
+        reverb_init();
+
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
+        float gain[NUM_MIXBINS];
+        for (int b = 0; b < NUM_MIXBINS; b++)
+            gain[b] = (float)(1 << d->vp.submix_headroom[b]);
+        {
+            static unsigned n;
+            if (getenv("RECOMP_APU_STATS") && (n++ % 7500) == 0) {
+                fprintf(stderr, "[APU-STATS] headroom: hrtf %u, bins", d->vp.hrtf_headroom);
+                for (int b = 0; b < NUM_MIXBINS; b++)
+                    fprintf(stderr, " %u", d->vp.submix_headroom[b]);
+                fputc('\n', stderr);
+            }
+        }
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            /* Bins 2..31 used to be computed and then dropped on the floor.
-             * On hardware the GP and EP mix the submixes down; here they are
-             * stubs, so thirty of thirty-two bins were discarded every frame
-             * with no counter anywhere to say so.
-             *
-             * Measured on Jet Set Radio Future, one 200 s gameplay run, with
-             * a positive control moving beside it:
-             *
-             *     [APU-BIN] 2D heard=557466 lost=0
-             *               3D heard=0      lost=377768
-             *               lost by bin: 6,7,8,9,10
-             *
-             * 557,466 music voice-frames heard and none lost; 377,768 effect
-             * voice-frames produced correctly and thrown away. The title's 3D
-             * positional voices -- its sound effects -- are routed to bins 6
-             * to 10 by the guest's own V0BIN..V3BIN, and music on 2D voices
-             * lands in bins 0 and 1, which is why the music was always
-             * audible and no effect ever was. Every instrument upstream of
-             * this line read healthy.
-             *
-             * Gating the HRTF submix override was tried first and did not fix
-             * it, so the defect is the width of this mixdown and nothing else.
-             *
-             * Even bins left, odd bins right, which preserves the stereo
-             * pairing the guest set up -- bins 6/7 and 8/9 arrive with matched
-             * counts. This is not what a real EP does; it is the cheapest
-             * mixdown that stops discarding audio. */
             float left, right;
             if (mcpx_apu_mixdown_all()) {
-                left = 0.0f;
-                right = 0.0f;
-                for (int b = 0; b < NUM_MIXBINS; ++b) {
-                    if (b & 1) right += mixbins[b][i];
-                    else       left  += mixbins[b][i];
+                float c = 0.7071f * (mixbins[2][i] * gain[2] + mixbins[3][i] * gain[3]);
+                float fx = 0.0f;
+                left  = mixbins[0][i] * gain[0] + mixbins[4][i] * gain[4]
+                      + mixbins[6][i] * gain[6] + mixbins[8][i] * gain[8] + c;
+                right = mixbins[1][i] * gain[1] + mixbins[5][i] * gain[5]
+                      + mixbins[7][i] * gain[7] + mixbins[9][i] * gain[9] + c;
+                for (int b = 11; b < MULTIPASS_BIN; b++)
+                    fx += mixbins[b][i] * gain[b];
+                left += 0.7071f * fx;
+                right += 0.7071f * fx;
+                if (s_rv_wet > 0.0f) {
+                    float rl, rr;
+                    reverb_tick(mixbins[10][i] * gain[10], &rl, &rr);
+                    left += s_rv_wet * rl;
+                    right += s_rv_wet * rr;
                 }
             } else {
                 left = mixbins[0][i];
                 right = mixbins[1][i];
             }
-            /* Clamp to [-1, 1] range */
-            if (left > 1.0f) left = 1.0f;
-            if (left < -1.0f) left = -1.0f;
-            if (right > 1.0f) right = 1.0f;
-            if (right < -1.0f) right = -1.0f;
+            left = soft_limit(left);
+            right = soft_limit(right);
 
-            /* Convert to 16-bit and write (not accumulate) into frame buffer.
-             * Each of the 8 sub-frames writes its own 32-sample slice. */
+            /* Write (not accumulate) into the frame buffer: each of the 8
+             * sub-frames writes its own 32-sample slice. */
             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
         }
