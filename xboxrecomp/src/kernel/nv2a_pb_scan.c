@@ -163,8 +163,12 @@ void nv2a_pb_scan_report(void)
  * The NV2A has one level of subroutine, so a CALL inside a call is not
  * followed. Addresses are physical, like PUT's, and reach guest memory the
  * same way: through the contiguous window. */
+/* RECOMP_PB_SCAN: keep the method inventory. A linear search per word, so
+ * only when asked -- it was a quarter of the executor's time in a race. */
+static int s_scan_enabled = -1;
+
 static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
-                        uint32_t *jumps, uint32_t *unknown)
+                        uint32_t *jumps, uint32_t *unknown, uint32_t *jump_to)
 {
     const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
     uint32_t words = 0;
@@ -178,8 +182,13 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                              : (w & 0x1FFFFFFCu);
             (*jumps)++;
-            if (!in_call)
-                break;                        /* the ring: a jump ends it */
+            if (!in_call) {
+                /* The ring: a jump ends it. Where it goes is the ring's
+                 * start, which the caller needs after a wrap. */
+                if (jump_to)
+                    *jump_to = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
+                break;
+            }
             va = XBOX_CONTIG_BASE | (target & 0x0FFFFFFFu);
             end_va = va + 0x400000u;
             continue;
@@ -193,7 +202,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
             if (!in_call) {
                 uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
                 s_tot_calls++;
-                words += pb_walk(sub, sub + 0x400000u, 1, jumps, unknown);
+                words += pb_walk(sub, sub + 0x400000u, 1, jumps, unknown, NULL);
             }
             continue;
         }
@@ -205,7 +214,8 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
 
             for (uint32_t i = 0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
-                note(subch, m);
+                if (s_scan_enabled)
+                    note(subch, m);
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
@@ -222,24 +232,26 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
     return words;
 }
 
-void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
+/* Returns the guest VA the segment's closing JUMP goes to, or 0 when it
+ * ended without one. */
+uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
 {
-    uint32_t words, jumps = 0, unknown = 0;
+    uint32_t words, jumps = 0, unknown = 0, jump_to = 0;
 
     if (s_exec_enabled < 0)
         s_exec_enabled = getenv("RECOMP_PB_EXEC") != NULL;
-    static int scan = -1;
-    if (scan < 0)
-        scan = getenv("RECOMP_PB_SCAN") != NULL;
-    if (!(scan || s_exec_enabled) || end_va <= start_va)
-        return;
+    if (s_scan_enabled < 0)
+        s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
+    if (!(s_scan_enabled || s_exec_enabled) || end_va <= start_va)
+        return 0;
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
-    words = pb_walk(start_va, end_va, 0, &jumps, &unknown);
+    words = pb_walk(start_va, end_va, 0, &jumps, &unknown, &jump_to);
 
     s_tot_words += words;
     s_tot_unknown += unknown;
     s_tot_jumps += jumps;
     s_tot_segments++;
+    return jump_to;
 }

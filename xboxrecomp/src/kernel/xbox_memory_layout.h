@@ -179,6 +179,21 @@ int xbox_Nv2aFrameCounter(uint32_t device_ptr_va, uint32_t counter_off);
  * stands down, so the count follows what was actually drawn. */
 void xbox_Nv2aFrameCounterFlip(void);
 
+/* PMC / PTIMER / PCRTC interrupt registers with hardware semantics
+ * (nv2a_irq.c, RECOMP_NV2A_IRQ). Init traps their pages; the VEH routes
+ * faults there to HandleMmio; Tick advances the PTIMER alarm and returns
+ * whether the interrupt line is asserted; Peek reads a register as the guest
+ * would, for host code that must not touch the trapped pages. */
+/* RECOMP_DSP_ACK_ALLOC: called by the contiguous-allocation bridges. */
+void     xbox_DspAckNoteAlloc(uint32_t caller, uint32_t size, uint32_t va);
+void     xbox_Nv2aIrqInit(void);
+int      xbox_Nv2aIrqEnabled(void);
+int      xbox_Nv2aIrqOwns(uint32_t xbox_va);
+int      xbox_Nv2aIrqHandleMmio(void *ctx, uint32_t xbox_va);
+int      xbox_Nv2aIrqTick(void);
+void     xbox_Nv2aIrqRaiseVblank(void);
+uint32_t xbox_Nv2aIrqPeek(uint32_t off);
+
 /* Tell the runtime where the display framebuffer is (from AvSetDisplayMode). */
 void xbox_SetDisplayFramebuffer(uint32_t fb_va, uint32_t pitch);
 /* Read it back: 0 until the title sets a mode. Pitch is optional. */
@@ -187,10 +202,58 @@ uint32_t xbox_GetDisplayFramebuffer(uint32_t *pitch);
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
  * below 256 MB, or 0 when the arena is exhausted. */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
+/* The same, honouring MmAllocateContiguousMemoryEx's acceptable physical
+ * range when RECOMP_CONTIG_TOPDOWN is set (the bottom-up arena ignores it). */
+uint32_t xbox_ContiguousAllocRange(uint32_t size, uint32_t alignment,
+                                   uint32_t low, uint32_t high);
 uint32_t xbox_ContiguousAllocatedBytes(void);
+
+/* RECOMP_PHYS_TAG: "physical" addresses of memory outside the contiguous
+ * window carry this bit.
+ *
+ * The window is separate storage here, so physical P names window byte
+ * 0x80000000 + P -- and MmGetPhysicalAddress used to hand back ordinary heap
+ * addresses unchanged, which made heap VA X and window offset X the same
+ * number. Every bus master resolves "below the arena's high-water mark" as
+ * window memory, so a DirectSound stream whose packets sit in the heap had its
+ * scatter-gather entries read out of the window: the voice played, and every
+ * sample was zero. With the arena top-down the high-water mark is the whole
+ * window, so the collision covers every heap address there is.
+ *
+ * Bit 27 is above the console's 64 MB and inside the 28 bits the bus masters
+ * keep; a resolver that sees it strips it and reads ordinary RAM. */
+#define XBOX_PHYS_RAM_TAG 0x08000000u
+int xbox_PhysTagEnabled(void);
+/* Is a 4-byte guest read at va backed by any mapped window? (diagnostics) */
+int xbox_VaReadable(uint32_t va);
+static inline int xbox_PhysUntag(uint32_t phys, uint32_t *va)
+{
+    if ((phys & 0xF8000000u) == XBOX_PHYS_RAM_TAG && xbox_PhysTagEnabled()) {
+        *va = phys & ~XBOX_PHYS_RAM_TAG;
+        return 1;
+    }
+    return 0;
+}
 
 int xbox_Nv2aMirrorFence(uint32_t device_ptr_va,
                          uint32_t put_off, uint32_t get_ptr_off);
+
+/* Where the GPU semaphore DMA object starts, for the pushbuffer executor.
+ *
+ * NV097_BACK_END_WRITE_SEMAPHORE_RELEASE writes at an offset into the
+ * semaphore DMA object, whose base lives in the DMA object in RAMIN -- which
+ * the executor does not decode yet. D3D keeps a pointer to the semaphore word
+ * in its device struct, so register that chain instead:
+ *
+ *     base = MEM32(MEM32(device_ptr_va) + sem_ptr_off)
+ *
+ * The executor then writes each release at base + offset, in stream order,
+ * which is a real completion signal -- unlike xbox_Nv2aMirrorFence, which
+ * declares everything submitted complete whether or not it has been read.
+ * Use one or the other. Returns the resolved base, or 0 while the chain is
+ * not built yet (the executor then falls back to the plain offset). */
+void     xbox_Nv2aSemaphoreBase(uint32_t device_ptr_va, uint32_t sem_ptr_off);
+uint32_t xbox_Nv2aSemaphoreResolve(void);
 
 void xbox_MemoryLayoutShutdown(void);
 

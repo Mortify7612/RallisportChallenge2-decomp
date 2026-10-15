@@ -1,0 +1,273 @@
+/*
+ * NV2A interrupt sources with register semantics: PMC, PCRTC and PTIMER.
+ *
+ * The NV2A register aperture is plain memory here, and for most of it that is
+ * enough. The interrupt plumbing is the exception. On hardware
+ *
+ *   - PCRTC_INTR_0 and PTIMER_INTR_0 are write-1-to-clear status registers,
+ *   - PMC_INTR_0 is not storage at all but the OR of every block whose status
+ *     is set and enabled, and the interrupt line is that OR gated by
+ *     PMC_INTR_EN_0,
+ *   - PTIMER_TIME_0/1 count, and PTIMER_ALARM_0 raises an interrupt when the
+ *     count passes it.
+ *
+ * Plain memory gets all of that wrong, and the runtime papered over it by
+ * holding the status registers at zero from the ack thread ("nothing ever
+ * raises a GPU interrupt") and poking the vblank bits in just before calling
+ * the ISR. That works until a title depends on the timer. XDK 5849's D3D does
+ * once a frame interval is configured: it stops waiting for the CRTC's vblank
+ * and synthesises one from a PTIMER alarm every 16.68 ms (59.94 Hz) or 20 ms,
+ * re-arming the alarm from the vblank DPC. With a timer that never counts and
+ * an alarm that never fires, BlockUntilVerticalBlank waits forever --
+ * RalliSport Challenge 2 froze on its title screen the moment START moved it
+ * to the next screen.
+ *
+ * So the three register pages are trapped (like the OHCI controllers) and
+ * served from this model; every other register on them is backing store.
+ * The interrupt line is raised from the timer thread while a source is
+ * pending and enabled -- level-triggered, as on hardware.
+ *
+ * Opt-in with RECOMP_NV2A_IRQ, because it changes what a title that worked
+ * with the old behaviour sees.
+ */
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "kernel.h"
+#include "xbox_memory_layout.h"
+#include "../platform/mmio_decode.h"
+
+#define NV2A_BASE        0xFD000000u
+#define PG_PMC           0x000000u
+#define PG_PTIMER        0x009000u
+#define PG_PCRTC         0x600000u
+#define PG_PFB           0x100000u
+#define PAGE             0x1000u
+
+#define PMC_INTR_0       0x000100u
+#define PMC_INTR_EN_0    0x000140u
+#define PMC_INTR_PTIMER  (1u << 20)
+#define PMC_INTR_PCRTC   (1u << 24)
+
+#define PTIMER_INTR_0    0x009100u
+#define PTIMER_INTR_EN_0 0x009140u
+#define PTIMER_NUMERATOR 0x009200u
+#define PTIMER_DENOMINATOR 0x009210u
+#define PTIMER_TIME_0    0x009400u
+#define PTIMER_TIME_1    0x009410u
+#define PTIMER_ALARM_0   0x009420u
+
+#define PFB_WBC          0x100410u     /* write-back cache flush */
+#define PFB_WBC_FLUSH    0x00010000u
+
+#define PCRTC_INTR_0     0x600100u
+#define PCRTC_INTR_EN_0  0x600140u
+
+/* The NV2A's core clock, which PTIMER counts in before the numerator and
+ * denominator scale it -- xemu's default for the retail PLL setting. */
+#define NV2A_CORE_HZ     233333324ull
+
+static int s_enabled;
+static int s_pfb;                       /* PFB page trapped too */
+static uint8_t s_store[4][PAGE];        /* backing for everything else */
+static volatile uint32_t s_pcrtc_intr, s_ptimer_intr;
+static volatile uint32_t s_alarm, s_alarm_armed;
+static struct timespec s_t0;
+
+static int page_index(uint32_t off)
+{
+    switch (off & ~(PAGE - 1)) {
+    case PG_PMC:    return 0;
+    case PG_PTIMER: return 1;
+    case PG_PCRTC:  return 2;
+    case PG_PFB:    return s_pfb ? 3 : -1;
+    default:        return -1;
+    }
+}
+
+static uint32_t store_rd(uint32_t off)
+{
+    int p = page_index(off);
+    uint32_t v;
+    if (p < 0) return 0;
+    memcpy(&v, &s_store[p][off & (PAGE - 1) & ~3u], 4);
+    return v;
+}
+
+static void store_wr(uint32_t off, uint32_t v)
+{
+    int p = page_index(off);
+    if (p < 0) return;
+    memcpy(&s_store[p][off & (PAGE - 1) & ~3u], &v, 4);
+}
+
+/* PTIMER's count: host time in core-clock ticks, scaled by the guest's
+ * DENOMINATOR/NUMERATOR (xemu's ptimer_get_clock). */
+static uint64_t ptimer_clock(void)
+{
+    struct timespec now;
+    uint64_t ns, num = store_rd(PTIMER_NUMERATOR), den = store_rd(PTIMER_DENOMINATOR);
+    unsigned __int128 t;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    ns = (uint64_t)(now.tv_sec - s_t0.tv_sec) * 1000000000ull
+       + (uint64_t)(now.tv_nsec - s_t0.tv_nsec);
+    if (!num) num = 1;
+    if (!den) den = 1;
+    t = (unsigned __int128)ns * NV2A_CORE_HZ / 1000000000ull;
+    return (uint64_t)(t * den / num);
+}
+
+static uint32_t ptimer_time0(void) { return (uint32_t)((ptimer_clock() & 0x7FFFFFFull) << 5); }
+
+static uint32_t pmc_pending(void)
+{
+    uint32_t v = 0;
+    if (s_pcrtc_intr & store_rd(PCRTC_INTR_EN_0))   v |= PMC_INTR_PCRTC;
+    if (s_ptimer_intr & store_rd(PTIMER_INTR_EN_0)) v |= PMC_INTR_PTIMER;
+    return v;
+}
+
+static uint64_t reg_read(void *dev, uint32_t off, int size)
+{
+    uint32_t v;
+    (void)dev;
+    switch (off & ~3u) {
+    case PMC_INTR_0:     v = pmc_pending(); break;
+    case PCRTC_INTR_0:   v = s_pcrtc_intr; break;
+    case PTIMER_INTR_0:  v = s_ptimer_intr; break;
+    case PTIMER_TIME_0:  v = ptimer_time0(); break;
+    case PTIMER_TIME_1:  v = (uint32_t)((ptimer_clock() >> 27) & 0x1FFFFFFFull); break;
+    default:             v = store_rd(off); break;
+    }
+    v >>= (off & 3u) * 8;
+    return size >= 4 ? v : (v & ((1u << (size * 8)) - 1));
+}
+
+static void reg_write(void *dev, uint32_t off, uint64_t val, int size)
+{
+    uint32_t v = (uint32_t)val;
+    (void)dev;
+    if (size < 4) {                          /* merge a narrow write */
+        uint32_t sh = (off & 3u) * 8, mask = ((1u << (size * 8)) - 1) << sh;
+        v = (store_rd(off) & ~mask) | ((v << sh) & mask);
+    }
+    switch (off & ~3u) {
+    case PMC_INTR_0:     break;                              /* read-only */
+    case PCRTC_INTR_0:   __atomic_and_fetch(&s_pcrtc_intr, ~v, __ATOMIC_SEQ_CST); break;
+    case PTIMER_INTR_0:  __atomic_and_fetch(&s_ptimer_intr, ~v, __ATOMIC_SEQ_CST); break;
+    case PFB_WBC:
+        /* The flush is done the moment it is asked for. D3D's kick sets the
+         * bit and spins until it clears; when the ack thread cleared it, the
+         * spin lasted until that thread finished executing whatever
+         * pushbuffer it was in the middle of, so every kick waited on the
+         * software GPU and the game and the GPU never overlapped. GET is what
+         * holds the title back when it gets ahead, as on hardware. */
+        store_wr(off, v & ~PFB_WBC_FLUSH);
+        break;
+        /* Opt-in (RECOMP_NV2A_PFB_ASYNC), because it is not yet safe:
+         * RalliSport Challenge 2's D3D patches methods into pushbuffer space
+         * the GPU has not reached (0x00368002) and then waits for a
+         * semaphore those methods release; with the flush no longer pacing
+         * the title the release never came and it hung on the first race
+         * load. Worth ~2x when it works -- the game and the software GPU
+         * would overlap. */
+    case PTIMER_ALARM_0:
+        store_wr(off, v);
+        s_alarm = v;
+        __atomic_store_n(&s_alarm_armed, 1, __ATOMIC_SEQ_CST);
+        break;
+    default:             store_wr(off, v); break;
+    }
+}
+
+int xbox_Nv2aIrqEnabled(void) { return __atomic_load_n(&s_enabled, __ATOMIC_SEQ_CST); }
+
+int xbox_Nv2aIrqOwns(uint32_t va)
+{
+    return s_enabled && va >= NV2A_BASE && va < NV2A_BASE + 0x01000000u
+        && page_index(va - NV2A_BASE) >= 0;
+}
+
+int xbox_Nv2aIrqHandleMmio(void *ctx, uint32_t va)
+{
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
+    if (!xbox_Nv2aIrqOwns(va))
+        return 0;
+    if (!mmio_emulate((PCONTEXT)ctx, va - NV2A_BASE, NULL, reg_read, reg_write)) {
+        static int shown;
+        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
+        if (shown++ < 20)
+            fprintf(stderr, "  [NV2A-IRQ] undecoded access at +0x%06X: "
+                    "%02X %02X %02X %02X %02X %02X\n", va - NV2A_BASE,
+                    ip[0], ip[1], ip[2], ip[3], ip[4], ip[5]);
+        return 0;
+    }
+    return 1;
+#else
+    (void)ctx; (void)va;
+    return 0;
+#endif
+}
+
+uint32_t xbox_Nv2aIrqPeek(uint32_t off)
+{
+    return (uint32_t)reg_read(NULL, off, 4);
+}
+
+void xbox_Nv2aIrqRaiseVblank(void)
+{
+    __atomic_or_fetch(&s_pcrtc_intr, 1u, __ATOMIC_SEQ_CST);
+}
+
+/* Advance the alarm, and say whether the line is asserted: something is
+ * pending and enabled, and PMC_INTR_EN_0 lets hardware interrupts through. */
+int xbox_Nv2aIrqTick(void)
+{
+    if (!s_enabled)
+        return 0;
+    if (__atomic_load_n(&s_alarm_armed, __ATOMIC_SEQ_CST)
+            && (int32_t)(ptimer_time0() - s_alarm) >= 0) {
+        __atomic_store_n(&s_alarm_armed, 0, __ATOMIC_SEQ_CST);
+        __atomic_or_fetch(&s_ptimer_intr, 1u, __ATOMIC_SEQ_CST);
+    }
+    return pmc_pending() && (store_rd(PMC_INTR_EN_0) & 1u);
+}
+
+void xbox_Nv2aIrqInit(void)
+{
+    static const uint32_t pages[4] = { PG_PMC, PG_PTIMER, PG_PCRTC, PG_PFB };
+    ptrdiff_t off = xbox_GetMemoryOffset();
+    int i, npages;
+
+    if (s_enabled || !getenv("RECOMP_NV2A_IRQ"))
+        return;
+    s_pfb = getenv("RECOMP_NV2A_PFB_ASYNC") != NULL;
+    npages = s_pfb ? 4 : 3;
+    if (!off) {
+        fprintf(stderr, "  NV2A-IRQ: guest memory not mapped yet; disabled\n");
+        return;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &s_t0);
+    for (i = 0; i < npages; i++)
+        memcpy(s_store[i], (void *)((uintptr_t)off + NV2A_BASE + pages[i]), PAGE);
+    /* On before the pages close: the ack thread checks this to keep its
+     * hands off them, and it runs concurrently with this. */
+    __atomic_store_n(&s_enabled, 1, __ATOMIC_SEQ_CST);
+    for (i = 0; i < npages; i++) {
+        void *at = (void *)((uintptr_t)off + NV2A_BASE + pages[i]);
+        DWORD old;
+        if (!VirtualProtect(at, PAGE, PAGE_NOACCESS, &old)) {
+            fprintf(stderr, "  NV2A-IRQ: cannot trap page +0x%06X; disabled\n", pages[i]);
+            while (--i >= 0)
+                VirtualProtect((void *)((uintptr_t)off + NV2A_BASE + pages[i]),
+                               PAGE, PAGE_READWRITE, &old);
+            __atomic_store_n(&s_enabled, 0, __ATOMIC_SEQ_CST);
+            return;
+        }
+    }
+    fprintf(stderr, "  NV2A-IRQ: PMC, PTIMER and PCRTC interrupt registers modelled%s\n",
+            npages > 3 ? " (and the PFB flush)" : "");
+}

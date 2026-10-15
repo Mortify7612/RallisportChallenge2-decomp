@@ -30,6 +30,7 @@
 #include "nv2a_vsh_interp.h"
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -39,6 +40,8 @@ static float    s_const[NV2A_VSH_CONSTANTS][4];
 static uint32_t s_load_slot, s_load_word, s_start_slot;
 static uint32_t s_const_load, s_const_word;
 static uint32_t s_cxt_write;
+/* Bumped by every program/constant upload, so consumers can cache. */
+static uint32_t s_prog_serial = 1, s_const_serial = 1;
 
 static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
 {
@@ -55,6 +58,7 @@ void nv2a_vsh_set_load_slot(uint32_t slot)
 
 void nv2a_vsh_program_word(uint32_t word)
 {
+    s_prog_serial++;
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
     if (++s_load_word == 4) {
@@ -63,8 +67,9 @@ void nv2a_vsh_program_word(uint32_t word)
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; s_prog_serial++; }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
+int  nv2a_vsh_cxt_write(void) { return s_cxt_write != 0; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
 {
@@ -74,6 +79,7 @@ void nv2a_vsh_set_constant_load(uint32_t index)
 
 void nv2a_vsh_constant_word(uint32_t word)
 {
+    s_const_serial++;
     if (s_const_load < NV2A_VSH_CONSTANTS)
         memcpy(&s_const[s_const_load][s_const_word], &word, 4);
     if (++s_const_word == 4) {
@@ -84,12 +90,14 @@ void nv2a_vsh_constant_word(uint32_t word)
 
 void nv2a_vsh_set_constant(uint32_t index, const float v[4])
 {
+    s_const_serial++;
     if (index < NV2A_VSH_CONSTANTS)
         memcpy(s_const[index], v, sizeof s_const[index]);
 }
 
 void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
+    s_prog_serial++;
     if (slot < NV2A_VSH_SLOTS)
         memcpy(s_program[slot], words, sizeof s_program[slot]);
 }
@@ -159,6 +167,212 @@ static void dump_program(uint32_t start)
     fflush(stderr);
 }
 
+/* Diagnostics: the loaded program by content, and a listing of it. */
+uint32_t nv2a_vsh_program_hash(void)
+{
+    static uint32_t cached_serial, cached;
+    uint32_t h = 2166136261u, t;
+    int i;
+    if (cached_serial == s_prog_serial)
+        return cached;
+    for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++) {
+        for (i = 0; i < 4; i++)
+            h = (h ^ s_program[t][i]) * 16777619u;
+        if (field(s_program[t], 3, 0, 1))
+            break;
+    }
+    cached_serial = s_prog_serial;
+    cached = h;
+    return h;
+}
+
+uint32_t nv2a_vsh_const_serial(void) { return s_const_serial; }
+const float *nv2a_vsh_constants(void) { return &s_const[0][0]; }
+
+/* ---- translation to GLSL (nv2a_vk.c) -------------------------------------
+ *
+ * The same program, as GLSL statements that do exactly what nv2a_vsh_run
+ * does -- the interpreter stays the reference. Registers: R[0..11] temps,
+ * R[12] oPos, O[] the output file, v[] inputs, k.c[] constants, a0. */
+
+typedef struct { char *p; size_t left; int err; } Out;
+
+static void emit(Out *o, const char *fmt, ...)
+{
+    va_list ap;
+    int n;
+    if (o->err)
+        return;
+    va_start(ap, fmt);
+    n = vsnprintf(o->p, o->left, fmt, ap);
+    va_end(ap);
+    if (n < 0 || (size_t)n >= o->left) {
+        o->err = 1;
+        return;
+    }
+    o->p += n;
+    o->left -= (size_t)n;
+}
+
+static void glsl_src(Out *o, const uint32_t *ins, int which, uint32_t *inmask)
+{
+    static const char sw[] = "xyzw";
+    uint32_t neg, swz, mux, reg;
+    if (which == 0) {
+        neg = field(ins, 1, 8, 1); swz = field(ins, 1, 0, 8);
+        mux = field(ins, 2, 26, 2); reg = field(ins, 2, 28, 4);
+    } else if (which == 1) {
+        neg = field(ins, 2, 25, 1); swz = field(ins, 2, 17, 8);
+        mux = field(ins, 2, 11, 2); reg = field(ins, 2, 13, 4);
+    } else {
+        neg = field(ins, 2, 10, 1); swz = field(ins, 2, 2, 8);
+        mux = field(ins, 3, 28, 2);
+        reg = (field(ins, 2, 0, 2) << 2) | field(ins, 3, 30, 2);
+    }
+    emit(o, "%s", neg ? "-" : "");
+    if (mux == 1) {
+        emit(o, "R[%u]", reg <= 12 ? reg : 0);
+    } else if (mux == 2) {
+        uint32_t v = field(ins, 1, 9, 4);
+        *inmask |= 1u << v;
+        emit(o, "v%u", v);
+    } else if (field(ins, 3, 1, 1)) {
+        emit(o, "k.c[clamp(a0 + %u, 0, %d)]", field(ins, 1, 13, 8),
+             NV2A_VSH_CONSTANTS - 1);
+    } else {
+        uint32_t ci = field(ins, 1, 13, 8);
+        emit(o, "k.c[%u]", ci < NV2A_VSH_CONSTANTS ? ci : 0);
+    }
+    emit(o, ".%c%c%c%c", sw[(swz >> 6) & 3], sw[(swz >> 4) & 3],
+         sw[(swz >> 2) & 3], sw[swz & 3]);
+}
+
+static void glsl_mask(char m[5], uint32_t mask)
+{
+    int n = 0;
+    if (mask & 8) m[n++] = 'x';
+    if (mask & 4) m[n++] = 'y';
+    if (mask & 2) m[n++] = 'z';
+    if (mask & 1) m[n++] = 'w';
+    m[n] = 0;
+}
+
+int nv2a_vsh_to_glsl(char *buf, size_t size, uint32_t *inputs)
+{
+    Out o;
+    uint32_t s, inmask = 0;
+    o.p = buf;
+    o.left = size;
+    o.err = 0;
+    if (s_cxt_write)
+        return 0;
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = s_program[s];
+        uint32_t mac = field(ins, 1, 21, 4), ilu = field(ins, 1, 25, 3);
+        uint32_t mac_mask = field(ins, 3, 24, 4), ilu_mask = field(ins, 3, 16, 4);
+        uint32_t tdst = field(ins, 3, 20, 4);
+        uint32_t omask = field(ins, 3, 12, 4), oaddr = field(ins, 3, 3, 8);
+        int use_a = mac != 0;
+        int use_b = mac == 2 || mac == 4 || (mac >= 5 && mac <= 12);
+        int use_c = mac == 3 || mac == 4 || ilu != 0;
+        char m[5];
+
+        emit(&o, "    /* %u */\n", s);
+        if (use_a) { emit(&o, "    A = "); glsl_src(&o, ins, 0, &inmask); emit(&o, ";\n"); }
+        if (use_b) { emit(&o, "    B = "); glsl_src(&o, ins, 1, &inmask); emit(&o, ";\n"); }
+        if (use_c) { emit(&o, "    C = "); glsl_src(&o, ins, 2, &inmask); emit(&o, ";\n"); }
+        /* The interpreter starts both results at zero every instruction. */
+        if (!mac && omask && !field(ins, 3, 2, 1))
+            emit(&o, "    M = vec4(0.0);\n");
+        if (!ilu && omask && field(ins, 3, 2, 1))
+            emit(&o, "    I = vec4(0.0);\n");
+        switch (mac) {
+        case 0:  break;
+        case 2:  emit(&o, "    M = A * B;\n"); break;
+        case 3:  emit(&o, "    M = A + C;\n"); break;
+        case 4:  emit(&o, "    M = A * B + C;\n"); break;
+        case 5:  emit(&o, "    M = vec4(dot(A.xyz, B.xyz));\n"); break;
+        case 6:  emit(&o, "    M = vec4(dot(A.xyz, B.xyz) + B.w);\n"); break;
+        case 7:  emit(&o, "    M = vec4(dot(A, B));\n"); break;
+        case 8:  emit(&o, "    M = vec4(1.0, A.y * B.y, A.z, B.w);\n"); break;
+        case 9:  emit(&o, "    M = mix(B, A, lessThan(A, B));\n"); break;
+        case 10: emit(&o, "    M = mix(B, A, greaterThanEqual(A, B));\n"); break;
+        case 11: emit(&o, "    M = vec4(lessThan(A, B));\n"); break;
+        case 12: emit(&o, "    M = vec4(greaterThanEqual(A, B));\n"); break;
+        case 13: emit(&o, "    M = A; a0 = int(floor(A.x + 0.001));\n"); break;
+        default: emit(&o, "    M = A;\n"); break;
+        }
+        switch (ilu) {
+        case 0:  break;
+        case 1:  emit(&o, "    I = C;\n"); break;
+        case 2:  emit(&o, "    I = vec4(C.x == 0.0 ? INF : 1.0 / C.x);\n"); break;
+        case 3:  emit(&o, "    I = vec4(rcc(C.x));\n"); break;
+        case 4:  emit(&o, "    I = vec4(inversesqrt(abs(C.x)));\n"); break;
+        case 5:  emit(&o, "    I = vexp(C.x);\n"); break;
+        case 6:  emit(&o, "    I = vlog(C.x);\n"); break;
+        case 7:  emit(&o, "    I = vlit(C);\n"); break;
+        default: emit(&o, "    I = C;\n"); break;
+        }
+        if (mac && mac != 13 && mac_mask && tdst <= 12) {
+            glsl_mask(m, mac_mask);
+            emit(&o, "    R[%u].%s = M.%s;\n", tdst, m, m);
+        }
+        if (ilu && ilu_mask) {
+            uint32_t it = mac ? 1u : tdst;
+            if (it <= 12) {
+                glsl_mask(m, ilu_mask);
+                emit(&o, "    R[%u].%s = I.%s;\n", it, m, m);
+            }
+        }
+        if (omask && field(ins, 3, 11, 1) && oaddr < 13) {
+            const char *src = field(ins, 3, 2, 1) ? "I" : "M";
+            glsl_mask(m, omask);
+            if (oaddr == 0)
+                emit(&o, "    R[12].%s = %s.%s;\n", m, src, m);
+            else
+                emit(&o, "    O[%u].%s = %s.%s;\n", oaddr, m, src, m);
+        }
+        if (field(ins, 3, 0, 1)) {
+            *inputs = inmask;
+            return o.err ? 0 : 1;
+        }
+    }
+    return 0;
+}
+
+void nv2a_vsh_dump_current(void) { dump_program(s_start_slot); }
+
+/* The viewport the loaded program maps into screen space with. D3D's
+ * epilogue is `mul oPos.xyz, R12, c[S]` / `rcc R1.x, R12.w` /
+ * `mad oPos.xyz, R12, R1.x, c[O]`, with S/O = 58/59 by default -- but a title
+ * that writes its own epilogue picks its own registers (RalliSport Challenge
+ * 2 uses c[0]/c[1]), and c[58]/c[59] then hold leftovers. Anything that has
+ * to undo the viewport (near-plane clipping) needs the pair the program
+ * really uses. Returns 0 when the pattern is not there. */
+int nv2a_vsh_viewport_consts(uint32_t *scale, uint32_t *offset)
+{
+    uint32_t t, sc = 0xFFFFFFFFu, of = 0xFFFFFFFFu;
+    for (t = s_start_slot; t < NV2A_VSH_SLOTS; t++) {
+        const uint32_t *ins = s_program[t];
+        uint32_t mac = field(ins, 1, 21, 4);
+        uint32_t amux = field(ins, 2, 26, 2), areg = field(ins, 2, 28, 4);
+        uint32_t bmux = field(ins, 2, 11, 2);
+        uint32_t cmux = field(ins, 3, 28, 2);
+        int a_is_r12 = amux == 1 && areg == 12;
+        if (mac == 2 && a_is_r12 && bmux != 1 && bmux != 2)        /* mul R12, c[S] */
+            sc = field(ins, 1, 13, 8);
+        if (mac == 4 && a_is_r12 && cmux != 1 && cmux != 2)        /* mad R12, ., c[O] */
+            of = field(ins, 1, 13, 8);
+        if (field(ins, 3, 0, 1))
+            break;
+    }
+    if (sc == 0xFFFFFFFFu || of == 0xFFFFFFFFu)
+        return 0;
+    *scale = sc;
+    *offset = of;
+    return 1;
+}
+
 const float *nv2a_vsh_constant(uint32_t index)
 {
     return s_const[index < NV2A_VSH_CONSTANTS ? index : 0];
@@ -166,6 +380,7 @@ const float *nv2a_vsh_constant(uint32_t index)
 
 void nv2a_vsh_constant_component(uint32_t index, uint32_t comp, uint32_t word)
 {
+    s_const_serial++;
     if (index < NV2A_VSH_CONSTANTS && comp < 4)
         memcpy(&s_const[index][comp], &word, 4);
 }
@@ -337,7 +552,13 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
 
     memset(temp, 0, sizeof temp);
     memset(&opos, 0, sizeof opos);
+    /* Every output starts (0,0,0,1) on the hardware, oPos included (xemu
+     * vsh.c). A screen-space program that writes only oPos.xyz -- the
+     * title's sun glare sprites -- otherwise ends with w = 0 and every
+     * vertex at infinity. */
+    opos.v[3] = 1.0f;
     memset(outregs, 0, sizeof outregs);
+    outregs[0][3] = outregs[5][3] = outregs[6][3] = 1.0f;
     outregs[3][3] = outregs[4][3] = 1.0f;      /* colours default opaque */
     /* Unwritten texture coordinates are (0,0,0,1), as xemu initialises them:
      * a projective stage divides by q, and q = 0 would put every texel of an
@@ -389,6 +610,14 @@ int nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out)
             memcpy(out->pos, opos.v, sizeof out->pos);
             memcpy(out->d0, outregs[3], sizeof out->d0);
             memcpy(out->d1, outregs[4], sizeof out->d1);
+            /* The hardware clamps oD0/oD1 to [0,1] before interpolation. */
+            {
+                int k;
+                for (k = 0; k < 4; k++) {
+                    out->d0[k] = out->d0[k] < 0.0f ? 0.0f : (out->d0[k] > 1.0f ? 1.0f : out->d0[k]);
+                    out->d1[k] = out->d1[k] < 0.0f ? 0.0f : (out->d1[k] > 1.0f ? 1.0f : out->d1[k]);
+                }
+            }
             memcpy(out->fog, outregs[5], sizeof out->fog);
             memcpy(out->tex[0], outregs[9], sizeof out->tex[0]);
             memcpy(out->tex[1], outregs[10], sizeof out->tex[1]);

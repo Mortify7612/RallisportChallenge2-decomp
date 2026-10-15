@@ -20,6 +20,7 @@
 #ifndef XBOXRECOMP_NV2A_VSH_INTERP_H
 #define XBOXRECOMP_NV2A_VSH_INTERP_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define NV2A_VSH_SLOTS      136     /* program memory, 128-bit instructions */
@@ -43,6 +44,19 @@ void nv2a_vsh_set_start_slot(uint32_t slot);          /* _PROGRAM_START     */
 void nv2a_vsh_set_constant_load(uint32_t index);      /* _CONSTANT_LOAD     */
 void nv2a_vsh_constant_word(uint32_t word);           /* _CONSTANT(i)       */
 void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
+/* Does the loaded program write constants (CXT_WRITE_EN)? Then vertices
+ * depend on the ones before them and must run in order. */
+int  nv2a_vsh_cxt_write(void);
+uint32_t nv2a_vsh_program_hash(void);   /* diagnostics */
+void nv2a_vsh_dump_current(void);
+/* Change counters: every program / constant upload bumps them. */
+uint32_t nv2a_vsh_const_serial(void);
+const float *nv2a_vsh_constants(void);   /* c[0..191], 4 floats each */
+/* The loaded program as GLSL statements (see nv2a_vk.c for the frame they
+ * run in); *inputs gets the mask of v[] it reads. 0 if there is no complete
+ * program, it writes constants, or buf is too small. */
+int  nv2a_vsh_to_glsl(char *buf, size_t size, uint32_t *inputs);
+int  nv2a_vsh_viewport_consts(uint32_t *scale, uint32_t *offset);
 
 /* Run the program from the start slot on one vertex. Inputs are the ten
  * attribute values as floats. Returns 0 if there is no program to run (no
