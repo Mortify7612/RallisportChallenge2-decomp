@@ -441,8 +441,17 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
+    static int rumble = -1;
+    static const XBOX_VIBRATION still = { 0, 0 };
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
+    /* RECOMP_RUMBLE=0: the pad never vibrates. */
+    if (rumble < 0) {
+        const char *v = getenv("RECOMP_RUMBLE");
+        rumble = !(v && strcmp(v, "0") == 0);
+    }
+    if (!rumble)
+        pVibration = &still;
     pthread_mutex_lock(&g_lock);
     if (g_rumble[dwPort][0] != pVibration->wLeftMotorSpeed
             || g_rumble[dwPort][1] != pVibration->wRightMotorSpeed) {

@@ -2039,8 +2039,21 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * above 4 GB, which is why Half-Life 2 (768 MB) never saw it. Doing
          * this on Windows needs placeholder reservations (VirtualAlloc2). */
 #ifndef _WIN32
+        /* The reservation asks for the whole 4 GB guest space, though only
+         * base + mirrors stay reserved: the windows above them (contiguous
+         * memory at 0x80000000, the tiled and MMIO apertures) are mapped at
+         * fixed host addresses during this init, and a span sized to the
+         * mirrors alone could be placed with a library inside that range.
+         * That happened once a launcher loaded SDL and the Vulkan driver
+         * before boot -- libc landed at guest 0xD18xxxxx, the contiguous
+         * window failed with error 8, and the first physical allocation
+         * faulted. The tail is released at once for those mappings. */
+        size_t full = (size_t)1 << 32;
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+        g_span_base = VirtualAlloc(NULL, g_span_size > full ? g_span_size : full,
+                                   MEM_RESERVE, PAGE_NOACCESS);
+        if (g_span_base && g_span_size < full)
+            VirtualFree((char *)g_span_base + g_span_size, full - g_span_size, MEM_RELEASE);
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,

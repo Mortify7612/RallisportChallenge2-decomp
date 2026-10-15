@@ -55,6 +55,7 @@ set(GAME_SOURCES
     src/rsc2_overrides.c    # hand-written sub_XXXXXXXX (--exclude-manual)
     src/rsc2_profile.c      # RSC2_PROFILE sampling profiler (Linux)
     src/rsc2_callcount.c    # RSC2_CALLCOUNT (needs tools/callcount_instrument.py on)
+    src/launcher.c          # pre-game settings window + settings.ini
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -121,6 +122,18 @@ if(MSVC)
     )
     # The generated code files can be very large. Increase object file section limit.
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
+endif()
+
+# The launcher embeds its font (#embed) and uses stb_truetype; SDL2 comes in
+# through the xboxrecomp targets on POSIX hosts.
+set_source_files_properties(src/launcher.c PROPERTIES
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb"
+    COMPILE_OPTIONS "--embed-dir=${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts"
+    OBJECT_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/NotoSans-Regular.ttf;${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/NotoSans-Bold.ttf")
+if(NOT WIN32)
+    find_package(SDL2 REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE SDL2::SDL2)
 endif()
 
 # ── Game-specific additions ─────────────────────────────────────

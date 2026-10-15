@@ -751,6 +751,14 @@ static void *fb_vk_loop(SDL_Window *win)
     return NULL;
 }
 
+/* RECOMP_FULLSCREEN=1: open fullscreen (desktop resolution); F11 still
+ * toggles. */
+static Uint32 fb_start_flags(void)
+{
+    const char *v = getenv("RECOMP_FULLSCREEN");
+    return v && *v && strcmp(v, "0") != 0 ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0;
+}
+
 static void *fb_thread(void *unused)
 {
     SDL_Window *win;
@@ -779,7 +787,7 @@ static void *fb_thread(void *unused)
             win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                                    (int)s_fb_width * 2, (int)s_fb_height * 2,
                                    SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
-                                   | SDL_WINDOW_VULKAN);
+                                   | SDL_WINDOW_VULKAN | fb_start_flags());
             if (win && SDL_Vulkan_CreateSurface(win, (VkInstance)vkinst, &surf)) {
                 int dw, dh;
                 SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
@@ -798,7 +806,8 @@ static void *fb_thread(void *unused)
     }
     win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
                            (int)s_fb_width * 2, (int)s_fb_height * 2,
-                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+                           | fb_start_flags());
     ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
                                             | SDL_RENDERER_PRESENTVSYNC) : NULL;
     if (win && !ren)

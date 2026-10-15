@@ -55,6 +55,7 @@
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
+#include "launcher.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -456,6 +457,10 @@ static void install_thread_dump(void)
 }
 #endif
 
+/* The command line, for the launcher's --launcher / --no-launcher. */
+static int s_argc;
+static char **s_argv;
+
 #ifdef _WIN32
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
                    LPSTR lpCmdLine, int nCmdShow)
@@ -471,6 +476,12 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
     (void)hPrevInstance;
     (void)lpCmdLine;
     (void)nCmdShow;
+
+    /* The launcher (launcher.c): saved settings into the environment, after
+     * a settings window unless it is turned off. Runs before the defaults
+     * below so its choices take their place. */
+    if (!rsc2_launcher(s_argc, s_argv))
+        return 0;
 
     /* Runtime options this title needs, as defaults (an explicit value in
      * the environment wins, including RECOMP_X=0 to turn one off).
@@ -756,8 +767,8 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
 /* Console entry point (for debugging -- lets you see printf output) */
 int main(int argc, char **argv)
 {
-    (void)argc;
-    (void)argv;
+    s_argc = argc;
+    s_argv = argv;
 #ifdef _WIN32
     return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
 #else
