@@ -347,6 +347,8 @@ static struct {
     uint32_t zeta_offset, zstencil_clear;
     uint32_t cull_enable, cull_face, front_face;
     uint32_t dot_mapping, other_input;  /* texture-shader dot products */
+    uint32_t poff_enable;               /* polygon offset: 1 point, 2 line, 4 fill */
+    float    poff_factor, poff_units;   /* SET_POLYGON_OFFSET_SCALE_FACTOR / _BIAS */
 } s_gpu;
 
 /* Unhandled methods, ranked. The interesting output is not that something was
@@ -2973,6 +2975,14 @@ static void vk_state(Nv2aVkState *v)
     v->cull_enable = s_gpu.cull_enable;
     v->cull_face = s_gpu.cull_face;
     v->front_face = s_gpu.front_face;
+    /* The offset that applies to this primitive type (NV2A SETUPRASTER
+     * POFFSET{POINT,LINE,FILL}ENABLE). */
+    if (s_gpu.poff_enable & (v->topology == 2 ? 1u : v->topology == 1 ? 2u : 4u)) {
+        v->poff_factor = s_gpu.poff_factor;
+        v->poff_units = s_gpu.poff_units;
+    } else {
+        v->poff_factor = v->poff_units = 0.0f;
+    }
     v->rc = &s_gpu.rc;
     v->use_rc = s_gpu.rc_seen && !no_rc;
     v->alpha_test = s_gpu.alpha_test;
@@ -4779,6 +4789,13 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case 0x0370: s_gpu.st_op_fail = param; break;  /* STENCIL_OP_FAIL */
     case 0x0374: s_gpu.st_op_zfail = param; break; /* STENCIL_OP_ZFAIL */
     case 0x0378: s_gpu.st_op_zpass = param; break; /* STENCIL_OP_ZPASS */
+    case 0x0330: case 0x0334: case 0x0338: {       /* POLY_OFFSET_*_ENABLE */
+        uint32_t bit = 1u << ((method - 0x0330) / 4);
+        s_gpu.poff_enable = param ? (s_gpu.poff_enable | bit) : (s_gpu.poff_enable & ~bit);
+        break;
+    }
+    case 0x0384: memcpy(&s_gpu.poff_factor, &param, 4); break; /* POLYGON_OFFSET_SCALE_FACTOR */
+    case 0x0388: memcpy(&s_gpu.poff_units, &param, 4); break;  /* POLYGON_OFFSET_BIAS */
     case 0x0398: memcpy(&s_gpu.zclip_max, &param, 4); break; /* SET_CLIP_MAX */
     case 0x035C: s_gpu.depth_mask = param; break; /* DEPTH_MASK */
     case 0x0308: s_gpu.cull_enable = param; break;/* CULL_FACE_ENABLE */
