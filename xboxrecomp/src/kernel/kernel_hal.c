@@ -167,6 +167,69 @@ void xbox_IrqlDumpHolders(void)
     fflush(stderr);
 }
 
+/* The dispatch lock: one processor's worth of DISPATCH_LEVEL.
+ *
+ * On the console a thread at DISPATCH_LEVEL cannot be interrupted by a DPC:
+ * there is one CPU, and DPCs only run once it drops below DISPATCH. Titles
+ * and the XDK lean on that -- XInputGetState raises to DISPATCH and reads the
+ * pad's device object, while the USB stack's DPC rewrites the same object.
+ * Here DPCs run on the timer thread whenever it ticks, in parallel with
+ * guest threads, so the two met: a pad handle read half-way through its
+ * set-up (0xCCCCCCCC in XInputGetState, a garbage transfer length in the
+ * USB string-descriptor copy). Now crossing up to DISPATCH takes this lock
+ * and crossing back releases it, for guest threads and for the DPC context
+ * (xbox_IrqlEnterInterrupt(2)) alike, so they exclude each other as they do
+ * on one CPU. Interrupt handlers (above DISPATCH) are left out: on hardware
+ * they still run while a thread is at DISPATCH.
+ *
+ * Bounded: a raise with no matching lower (see [IRQLBUG]) would otherwise
+ * hold it for good, so a waiter gives up after 50 ms, says so, and runs
+ * anyway. RECOMP_DISPATCH_LOCK=0 turns it off. */
+static volatile LONG s_disp_owner;
+static RECOMP_TLS int t_disp_count;
+static RECOMP_TLS int t_isr_depth;
+static int s_disp_on = -1;
+static volatile LONG s_disp_timeouts;
+
+static void dispatch_acquire(void)
+{
+    LONG me = (LONG)GetCurrentThreadId();
+    ULONGLONG start;
+
+    if (s_disp_on < 0) {
+        const char *e = getenv("RECOMP_DISPATCH_LOCK");
+        s_disp_on = !(e && e[0] == '0');
+    }
+    if (!s_disp_on || t_isr_depth)
+        return;
+    if (t_disp_count) {
+        t_disp_count++;
+        return;
+    }
+    start = GetTickCount64();
+    while (InterlockedCompareExchange(&s_disp_owner, me, 0) != 0) {
+        if (GetTickCount64() - start > 50) {
+            if (InterlockedIncrement(&s_disp_timeouts) <= 10) {
+                fprintf(stderr, "  [IRQL] tid %lu waited 50 ms for DISPATCH_LEVEL "
+                        "(held by tid %ld); going ahead\n",
+                        (unsigned long)me, (long)s_disp_owner);
+                fflush(stderr);
+            }
+            return;
+        }
+        Sleep(0);
+    }
+    t_disp_count = 1;
+}
+
+static void dispatch_release(void)
+{
+    if (!t_disp_count)
+        return;
+    if (--t_disp_count == 0)
+        InterlockedExchange(&s_disp_owner, 0);
+}
+
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 {
     int was = (old_level >= DISPATCH_LEVEL);
@@ -176,6 +239,10 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     if (now == was)
         return;
 
+    if (now)
+        dispatch_acquire();
+    else
+        dispatch_release();
     d = now ? InterlockedIncrement(&g_irql_raised_count)
             : InterlockedDecrement(&g_irql_raised_count);
     InterlockedIncrement(&s_transitions);
@@ -212,6 +279,8 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
 int xbox_IrqlEnterInterrupt(int level)
 {
     int saved = (int)g_current_irql;
+    if (level > DISPATCH_LEVEL)
+        t_isr_depth++;          /* an ISR: not under the dispatch lock */
     if (g_current_irql != (KIRQL)level) {
         irql_track(g_current_irql, (KIRQL)level, IRQL_CALLER());
         g_current_irql = (KIRQL)level;
@@ -222,11 +291,14 @@ int xbox_IrqlEnterInterrupt(int level)
 
 void xbox_IrqlLeaveInterrupt(int saved)
 {
+    int isr = t_isr_depth > 0 && g_current_irql > DISPATCH_LEVEL;
     if (g_current_irql != (KIRQL)saved) {
         irql_track(g_current_irql, (KIRQL)saved, IRQL_CALLER());
         g_current_irql = (KIRQL)saved;
         irql_publish();
     }
+    if (isr)
+        t_isr_depth--;
 }
 
 /*
