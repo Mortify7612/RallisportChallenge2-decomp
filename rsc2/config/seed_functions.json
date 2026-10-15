@@ -1,0 +1,121 @@
+[
+ {
+  "start": "0x000702A1",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0031BE51",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00096100",
+  "note": "unresolved-call stub with a reachable reference (first from 0x0009618A); decodes as a function body."
+ },
+ {
+  "start": "0x0009B810",
+  "note": "unresolved-call stub with a reachable reference (first from 0x0009B839); decodes as a function body."
+ },
+ {
+  "start": "0x0009F090",
+  "note": "unresolved-call stub with a reachable reference (first from 0x0009F1DF); decodes as a function body."
+ },
+ {
+  "start": "0x000A0460",
+  "note": "unresolved-call stub with a reachable reference (first from 0x000A04CA); decodes as a function body."
+ },
+ {
+  "start": "0x000A0EA0",
+  "note": "unresolved-call stub with a reachable reference (first from 0x000A0DC0); decodes as a function body."
+ },
+ {
+  "start": "0x000A108D",
+  "note": "unresolved-call stub with a reachable reference (first from 0x000A116F); decodes as a function body."
+ },
+ {
+  "start": "0x000A222F",
+  "note": "unresolved-call stub with a reachable reference (first from 0x000A2248); decodes as a function body."
+ },
+ {
+  "start": "0x00162909",
+  "note": "unresolved-call stub with a reachable reference (first from 0x0016280B); decodes as a function body."
+ },
+ {
+  "start": "0x0016296E",
+  "note": "unresolved-call stub with a reachable reference (first from 0x0016283A); decodes as a function body."
+ },
+ {
+  "start": "0x001A3AA0",
+  "note": "unresolved-call stub with a reachable reference (first from 0x000465AD); decodes as a function body."
+ },
+ {
+  "start": "0x002240B0",
+  "note": "unresolved-call stub with a reachable reference (first from 0x002245B7); decodes as a function body."
+ },
+ {
+  "start": "0x000B00A0",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000B1750",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000B6010",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x000BA030",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002DB000",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00376AE4",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x003773DF",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x002383E0",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x0034A350",
+  "observed": true,
+  "note": "PsCreateSystemThreadEx StartContext1 observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00352D60",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00238610",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x00378885",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ },
+ {
+  "start": "0x001AF6A0",
+  "observed": true,
+  "note": "Indirect-call target observed at runtime; decodes as a function body."
+ }
+]
