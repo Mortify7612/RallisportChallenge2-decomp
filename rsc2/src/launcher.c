@@ -12,7 +12,8 @@
  * skip it, and it never shows for headless runs (RECOMP_FB_WINDOW=0) or
  * input replays (RSC2_INPUT_REPLAY), which must not wait on a window.
  *
- * The window is SDL2 with text from stb_truetype and an embedded Noto Sans.
+ * The window is SDL2 with text from stb_truetype and an embedded Noto Sans
+ * (generated headers, rsc2/cmake/embed_bin.cmake).
  * Mouse, keyboard and controller all drive it. Windows builds have no SDL2
  * yet: there the saved settings still apply and the window is skipped.
  */
@@ -318,12 +319,8 @@ static int launcher_window(void) { return 1; }
 #define STBTT_STATIC
 #include "stb_truetype.h"
 
-static const unsigned char k_font_regular[] = {
-#embed "NotoSans-Regular.ttf"
-};
-static const unsigned char k_font_bold[] = {
-#embed "NotoSans-Bold.ttf"
-};
+#include "font_Regular.h"     /* k_font_Regular: assets/fonts/NotoSans-Regular.ttf */
+#include "font_Bold.h"        /* k_font_Bold */
 
 /* Layout in logical units; the renderer's pixels per unit is s_px. */
 #define WIN_W 1000
@@ -821,9 +818,9 @@ static int launcher_window(void)
     SDL_GetRendererOutputSize(s_ren, &ow, &oh);
     SDL_GetWindowSize(win, &ww, &wh);
     s_px = ww > 0 ? (float)ow / (float)ww : 1.0f;
-    if (!font_init(&s_body, k_font_regular, 16) || !font_init(&s_bold, k_font_bold, 16)
-            || !font_init(&s_title, k_font_bold, 32) || !font_init(&s_small, k_font_regular, 13)
-            || !font_init(&s_smallb, k_font_bold, 12)) {
+    if (!font_init(&s_body, k_font_Regular, 16) || !font_init(&s_bold, k_font_Bold, 16)
+            || !font_init(&s_title, k_font_Bold, 32) || !font_init(&s_small, k_font_Regular, 13)
+            || !font_init(&s_smallb, k_font_Bold, 12)) {
         fprintf(stderr, "[LAUNCHER] font setup failed -- starting the game\n");
         result = 1;
     }

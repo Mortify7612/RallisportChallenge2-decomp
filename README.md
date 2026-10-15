@@ -31,8 +31,9 @@ repository either.
 
 ## Building (Linux)
 
-Needs CMake 3.20+, Ninja, GCC 15 or newer (the launcher uses `#embed`),
-Python 3, SDL2, the Vulkan headers and loader, `glslc` and glslang.
+Needs CMake 3.20+, Ninja, a C11 compiler (GCC or Clang), Python 3, SDL2
+2.0.18+, OpenSSL, libepoxy, the Vulkan headers and loader, `glslc` and
+glslang.
 
 1. Put your game files in `RalliSport2/` and copy its `default.xbe` to
    `xboxrecomp/game_files/default.xbe`.

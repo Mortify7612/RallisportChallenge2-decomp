@@ -124,13 +124,24 @@ if(MSVC)
     target_compile_options(${PROJECT_NAME} PRIVATE /bigobj)
 endif()
 
-# The launcher embeds its font (#embed) and uses stb_truetype; SDL2 comes in
-# through the xboxrecomp targets on POSIX hosts.
+# The launcher embeds its fonts (generated headers, so any C compiler builds
+# it) and uses stb_truetype; SDL2 comes in through the xboxrecomp targets on
+# POSIX hosts.
+set(RSC2_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/rsc2_gen)
+file(MAKE_DIRECTORY ${RSC2_GEN_DIR})
+foreach(font Regular Bold)
+    add_custom_command(
+        OUTPUT ${RSC2_GEN_DIR}/font_${font}.h
+        COMMAND ${CMAKE_COMMAND} -DIN=${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/NotoSans-${font}.ttf
+                -DOUT=${RSC2_GEN_DIR}/font_${font}.h -DNAME=k_font_${font}
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bin.cmake
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/NotoSans-${font}.ttf
+                ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_bin.cmake
+        COMMENT "embed NotoSans-${font}.ttf")
+endforeach()
+target_sources(${PROJECT_NAME} PRIVATE ${RSC2_GEN_DIR}/font_Regular.h ${RSC2_GEN_DIR}/font_Bold.h)
 set_source_files_properties(src/launcher.c PROPERTIES
-    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb"
-    COMPILE_OPTIONS "--embed-dir=${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts"
-    OBJECT_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/NotoSans-Regular.ttf;${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/NotoSans-Bold.ttf")
+    INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb;${RSC2_GEN_DIR}")
 if(NOT WIN32)
     find_package(SDL2 REQUIRED)
     target_link_libraries(${PROJECT_NAME} PRIVATE SDL2::SDL2)
