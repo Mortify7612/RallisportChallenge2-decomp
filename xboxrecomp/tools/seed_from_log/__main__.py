@@ -61,6 +61,9 @@ LOG_PATTERNS = [
     # always a function -- the gates below decide, which is what they are for.
     (re.compile(r"PsCreateSystemThreadEx.*?ctx1=(0x[0-9A-Fa-f]+)"),
      "PsCreateSystemThreadEx StartContext1 observed at runtime"),
+    # A lifter stub ran: a call target the disassembler never found.
+    (re.compile(r"\[STUB\] unresolved call target (0x[0-9A-Fa-f]+) reached"),
+     "Unresolved-call stub reached at runtime"),
     # Generic kernel-bridge complaint about an address it could not dispatch.
     (re.compile(r"not found in dispatch.*?(0x[0-9A-Fa-f]{6,8})"),
      "Address the kernel bridge could not dispatch"),

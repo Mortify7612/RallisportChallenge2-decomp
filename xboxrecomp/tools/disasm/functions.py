@@ -10,6 +10,7 @@ Implements multi-pass function detection with confidence scoring:
 """
 
 import bisect
+import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -648,6 +649,47 @@ class FunctionDetector:
         added = self._pass_cond_branch_orphans(bodies, starts) or added
         return added
 
+    _PAD_SELF = re.compile(r"^(lea\s+(\w+),\s*\[\2(\s*\+\s*0)?\]|mov\s+(\w+),\s*\4)$")
+
+    def _only_padding_between(self, end: int, target: int,
+                              body: tuple = None) -> bool:
+        """True when nothing but alignment padding lies in [end, target).
+
+        MSVC pads between functions with int3, nop, and the multi-byte no-ops
+        it prefers -- `lea ecx, [ecx]`, `lea esp, [esp]`, `mov edi, edi` -- so
+        the next function begins a few bytes after the previous one's ret.
+        It also parks a function's switch table right after its body, so a run
+        of dwords that all point back into `body` (start, end) counts too:
+        RalliSport Challenge 2's 0x001AC2C0 follows five of them.
+        """
+        addr = end
+        steps = 0
+        while addr < target and steps < 64:
+            insn = self.engine.instructions.get(addr)
+            if insn is None:
+                if body and addr + 4 <= target:
+                    data = self.image.read_va(addr, 4) if hasattr(self.image, "read_va") else None
+                    if data is None:
+                        sec = self.image.get_section_at_va(addr)
+                        raw = self.image.get_section_data(sec) if sec else None
+                        off = addr - sec.virtual_addr if sec else 0
+                        data = raw[off:off + 4] if raw else None
+                    if data and len(data) == 4:
+                        word = int.from_bytes(data, "little")
+                        if body[0] <= word < body[1]:
+                            addr += 4
+                            steps += 1
+                            continue
+                return False
+            m = insn.mnemonic.lower()
+            if m not in ("int3", "nop"):
+                text = f"{m} {insn.op_str}".strip().replace("dword ptr ", "")
+                if not self._PAD_SELF.match(text):
+                    return False
+            addr += insn.size
+            steps += 1
+        return addr == target
+
     def _pass_data_ptr_targets(self, sections: List[SectionInfo]) -> bool:
         """
         A code pointer stored in a data section is a function whose address is
@@ -708,6 +750,26 @@ class FunctionDetector:
                 if in_code_section(value):
                     targets.add(value)
 
+        # Data islands inside code sections too. XDK libraries keep their own
+        # tables in their own section: XPP opens with the USB class drivers'
+        # dispatch tables (0x00376860..0x00376AE4 in RalliSport Challenge 2),
+        # and the callbacks named only there -- 0x00377E31, 0x00378885 -- were
+        # reached by indirect calls with no body behind them. Only aligned words
+        # that no detected function covers are read: a word inside a function
+        # is an instruction stream, and its "pointers" are immediates already
+        # seen by the immediate pass.
+        for sec in sections:
+            data = self.image.get_section_data(sec)
+            if not data:
+                continue
+            for off in range(0, len(data) - 3, 4):
+                va = sec.virtual_addr + off
+                if inside_a_function(va):
+                    continue
+                value = int.from_bytes(data[off:off + 4], "little")
+                if in_code_section(value) and value != va:
+                    targets.add(value)
+
         # Alias entries, not candidates.
         #
         # Registering these as function starts measurably hurt: Half-Life 2
@@ -763,8 +825,17 @@ class FunctionDetector:
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
                     continue
-                if not self.engine.probes_as_function_body(target,
-                                                           max_insns=64):
+                # A table entry pointing exactly at where the previous body
+                # ends -- right after its ret -- is a function start on that
+                # evidence alone; the probe's 64-instruction window is too
+                # short for one that runs a while before its first ret.
+                # RalliSport Challenge 2's vtable entry 0x001BD6C0 follows
+                # sub_001BD070's `ret 4` and is ~600 bytes long.
+                j2 = bisect.bisect_right(starts, target) - 1
+                follows_body = j2 >= 0 and self._only_padding_between(
+                    bounds[j2][1], target, bounds[j2])
+                if not (follows_body or self.engine.probes_as_function_body(
+                        target, max_insns=64)):
                     continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)

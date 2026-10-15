@@ -193,6 +193,38 @@ extern RECOMP_TLS uint32_t g_fs_base;
 
 extern RECOMP_TLS uint32_t g_seh_ebp;
 
+/* EFLAGS as pushfd shows it and popfd restores it.
+ *
+ * The arithmetic flags (CF PF ZF SF OF) are not stored anywhere -- the lifter
+ * rebuilds each from the instruction that last set it -- so pushfd builds them
+ * the same way and only the rest comes from here: IF and the reserved bit 1,
+ * DF, AC and ID. popfd writes those back.
+ *
+ * ID (bit 21) is the one that matters. The canonical "is cpuid available"
+ * probe, in the CRT and in zlib's inffas32.asm among others, flips it through
+ * pushfd/popfd and checks it stuck. With pushfd/popfd lifted to nothing the
+ * probe's pops took the stack instead, and inflate_fast ran off with a
+ * corrupt frame. */
+extern RECOMP_TLS uint32_t g_eflags_shadow;
+#define RECOMP_EFLAGS_SHADOW_MASK 0x00240602u /* ID AC DF IF bit1 */
+
+/* cpuid as the console's CPU answers it: a 733 MHz Pentium III-class
+ * "Coppermine" (family 6, model 8) with FPU, TSC, CX8, CMOV,
+ * MMX, FXSR and SSE. Leaf 0 reports the highest standard leaf (2) and
+ * "GenuineIntel"; leaves the CPU does not define answer zero. */
+#define RECOMP_CPUID() do { \
+    uint32_t _leaf = g_eax; \
+    if (_leaf == 0) { \
+        g_eax = 2; g_ebx = 0x756E6547u; g_edx = 0x49656E69u; g_ecx = 0x6C65746Eu; \
+    } else if (_leaf == 1) { \
+        g_eax = 0x00000683u; g_ebx = 0; g_ecx = 0; g_edx = 0x0383F9FFu; \
+    } else if (_leaf == 2) { \
+        g_eax = 0x03020101u; g_ebx = 0; g_ecx = 0; g_edx = 0x0C040843u; \
+    } else { \
+        g_eax = 0; g_ebx = 0; g_ecx = 0; g_edx = 0; \
+    } \
+} while (0)
+
 /* ---- non-local jumps (setjmp / longjmp) --------------------------------
  *
  * A recompiled function is a real C function, so restoring the guest esp is
@@ -397,6 +429,8 @@ void recomp_trace_exit(const char *name, uint32_t va);
 #define RECOMP_TRACE_EXIT(name, va) recomp_trace_exit((name), (va))
 void recomp_trace_esp(const char *name, const char *tag);
 #define RECOMP_TRACE_ESP(name, tag) recomp_trace_esp((name), (tag))
+void recomp_trace_bb(uint32_t va, uint32_t ebp);
+#define RECOMP_TRACE_BB(va, ebp) recomp_trace_bb((va), (ebp))
 
 
 /* ================================================================
@@ -1175,6 +1209,20 @@ static inline int32_t MMX_CVT_F2I(float v, int truncate)
                     : _mm_cvtss_si32(_mm_set_ss(v));
 #else
     double rounded = truncate ? trunc((double)v) : nearbyint((double)v);
+    if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
+        return (int32_t)0x80000000u;       /* integer indefinite */
+    return (int32_t)rounded;
+#endif
+}
+
+/* CVTSD2SI / CVTTSD2SI, the double-precision forms of the above. */
+static inline int32_t SSE_CVT_D2I(double v, int truncate)
+{
+#if defined(_M_IX86) || defined(_M_X64) || defined(__i386__) || defined(__x86_64__)
+    return truncate ? _mm_cvttsd_si32(_mm_set_sd(v))
+                    : _mm_cvtsd_si32(_mm_set_sd(v));
+#else
+    double rounded = truncate ? trunc(v) : nearbyint(v);
     if (!(rounded >= -2147483648.0 && rounded <= 2147483647.0))
         return (int32_t)0x80000000u;       /* integer indefinite */
     return (int32_t)rounded;

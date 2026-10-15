@@ -1384,6 +1384,10 @@ class FunctionTranslator:
                 cc = m[3:]
             elif m.startswith("cmov") and len(m) > 4:
                 cc = m[4:]
+            elif m == "lahf":
+                # lahf builds AH's CF bit from the "jb" condition, so after
+                # add/sub it reads _cf exactly like a jb would.
+                cc = "b"
             if (cc in FunctionTranslator._CARRY_CC
                     and (last_setter in CF_TRACKED
                          or last_setter in ("inc", "dec")
@@ -2495,6 +2499,14 @@ class FunctionTranslator:
                 # otherwise produce `loc_X:` immediately before `}` and fail to
                 # compile. The null statement costs nothing and is always valid.
                 lines.append(f"loc_{bb.start:08X}: ;")
+                # Block trace for the differential replay: the registers as
+                # each labelled block starts, compared against the original
+                # run single-stepped (RECOMP_SNAPSHOT_BB). ebp is passed in
+                # because the lifted function keeps it in a local.
+                if start in self.trace_functions:
+                    has_ebp = any("uint32_t ebp" in ln for ln in lines)
+                    lines.append(f"    RECOMP_TRACE_BB(0x{bb.start:08X}u, "
+                                 f"{'ebp' if has_ebp else 'g_ebp'});")
 
             # Inherit agreed state, including compatible CMP/TEST snapshots
             # whose source operands differ between predecessor paths. The
@@ -3181,11 +3193,27 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
+            # A stub reached at run time is a function that silently did
+            # nothing -- the body exists in the XBE and was not lifted.
+            # Saying so, once per address, turns "the movie decodes wrong"
+            # into the address to seed. tools.seed_from_log reads this line.
+            stub_lines += [
+                "#include <stdio.h>",
+                "static void recomp_stub_hit(volatile int *seen, uint32_t va)",
+                "{",
+                "    if (*seen) return;",
+                "    *seen = 1;",
+                '    fprintf(stderr, "[STUB] unresolved call target 0x%08X reached '
+                '(not lifted; seed it)\\n", va);',
+                "}",
+                "",
+            ]
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ static volatile int s; "
+                    f"recomp_stub_hit(&s, 0x{addr:08X}u); g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")

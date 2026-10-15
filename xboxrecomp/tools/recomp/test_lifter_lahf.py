@@ -49,3 +49,17 @@ class FpuUnorderedTest(unittest.TestCase):
         self.assertNotIn(">", ja)
         self.assertIn("g_fp_cmp == 2", jb)
         self.assertIn("g_fp_cmp == 2", jp)
+
+
+class LahfAfterAddDeclaresCfTest(unittest.TestCase):
+    """lahf after add reads _cf for AH's carry bit, so the function has to
+    declare it -- it used to be left undeclared and the C did not compile."""
+
+    def test_lahf_counts_as_a_carry_reader(self):
+        from .translator import FunctionTranslator
+        add = Instruction(0, 2, "add", "byte ptr [esi], bh", "003e")
+        lahf = Instruction(2, 1, "lahf", "", "9f")
+        self.assertTrue(FunctionTranslator._function_needs_cf([add, lahf]))
+        # A lahf after a setter whose CF is not in _cf needs no declaration.
+        cmp = Instruction(0, 3, "ucomiss", "xmm0, xmm4", "0f2ec4")
+        self.assertFalse(FunctionTranslator._function_needs_cf([cmp, lahf]))

@@ -1684,6 +1684,22 @@ class Lifter:
                 "  /* rdtsc */",
             ]
 
+        # ── EFLAGS restore ──
+        # The tracked arithmetic flags are gone after it either way (popfd is
+        # in _FLAGS_UNDEFINED); what survives is the shadow pushfd reads back,
+        # which is where the cpuid probe's toggled ID bit has to land.
+        if m == "popfd":
+            return ["{ uint32_t _efl; POP32(esp, _efl);",
+                    "  g_eflags_shadow = (_efl & RECOMP_EFLAGS_SHADOW_MASK) | 0x202u; }"
+                    " /* popfd */"]
+
+        # ── CPU identification ──
+        # The console's Pentium III, from RECOMP_CPUID in recomp_types.h. An
+        # unlifted cpuid left eax..edx as they were, so a feature probe read
+        # its own leaf number back as the feature mask.
+        if m == "cpuid":
+            return ["RECOMP_CPUID(); /* cpuid */"]
+
         # ── Bit scan ──
         # Index of the lowest (bsf) or highest (bsr) set bit. When the source
         # is zero the destination is left untouched and ZF is set; that is the
@@ -1825,7 +1841,11 @@ class Lifter:
             r = ops[1].reg
             if r in ("al", "bl", "cl", "dl", "ah", "bh", "ch", "dh"):
                 src = f"SX8({src})"
-            elif r in ("ax", "bx", "cx", "dx", "si", "di"):
+            # bp and sp too: `movsx ebx, bp` lifted as a plain LO16 -- a zero
+            # extension -- and Bink's IDCT keeps a coefficient in bp, so every
+            # negative one came out near 65536 and the movies decoded into
+            # bright and dark 8x8 blocks.
+            elif r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
                 src = f"SX16({src})"
         return [_fmt_operand_write(ops[0], src)]
 
@@ -3291,16 +3311,24 @@ class Lifter:
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(float)(int32_t){src}") + " /* cvtsi2ss */"]
+        # cvtss2si rounds by MXCSR (round-to-nearest-even unless the title
+        # changes it); only the cvtt forms truncate. Both give 0x80000000 for
+        # NaN and out-of-range values. A C cast truncates always (and is
+        # undefined out of range): RalliSport Challenge 2 indexes with
+        # cvtss2si, and every value with a fraction of .5 or more came out
+        # one lower than on the console.
         if m in ("cvtss2si", "cvttss2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                t = "1" if m == "cvttss2si" else "0"
+                return [_fmt_operand_write(ops[0], f"MMX_CVT_F2I({_sse_read(ops[1])}, {t})") + f" /* {m} */"]
         if m == "cvtsi2sd":
             if nops >= 2:
                 src = _fmt_operand_read(ops[1])
                 return [_sse_write(ops[0], f"(double)(int32_t){src}") + " /* cvtsi2sd */"]
         if m in ("cvtsd2si", "cvttsd2si"):
             if nops >= 2:
-                return [_fmt_operand_write(ops[0], f"(int32_t){_sse_read(ops[1])}") + f" /* {m} */"]
+                t = "1" if m == "cvttsd2si" else "0"
+                return [_fmt_operand_write(ops[0], f"SSE_CVT_D2I({_sse_read(ops[1])}, {t})") + f" /* {m} */"]
         if m == "cvtss2sd":
             if nops >= 2:
                 return [_sse_write(ops[0], f"(double){_sse_read(ops[1])}") + " /* cvtss2sd */"]
@@ -3790,6 +3818,39 @@ class Lifter:
                         f"{_fmt_operand_read(ops[0])};"
                         f" /* fldcw {insn.op_str} */"]
             return [f"/* fldcw {insn.op_str} - no source operand */"]
+        if m in ("ficom", "ficomp") and ops and ops[0].type == "mem":
+            # Compare st(0) with a 16/32-bit integer in memory (status word).
+            ty = "int16_t" if "word ptr" in insn.op_str and "dword" not in insn.op_str else "int32_t"
+            rd = "MEM16" if ty == "int16_t" else "MEM32"
+            pop = " fp_pop();" if m == "ficomp" else ""
+            return [f"g_fp_cmp = RECOMP_FCMP(fp_top(), (double)({ty}){rd}({_fmt_mem(ops[0])}));"
+                    f" g_fp_cc = RECOMP_FCMP_CC(g_fp_cmp);{pop} /* {m} {insn.op_str} */"]
+        if m == "ffreep":
+            return [f"fp_pop(); /* ffreep {insn.op_str} */"]
+        if m == "fnclex":
+            return ["/* fnclex: exception flags are not modelled */"]
+        if m.startswith("fcmov"):
+            # FCMOVcc st(0), st(i): copy st(i) into st(0) when the EFLAGS
+            # condition holds. The flags come from FCOMI/FUCOMI (g_fp_cmp:
+            # -1 below, 0 equal, 1 above, 2 unordered -> CF, ZF, PF as the
+            # hardware sets them). These were emitted as a comment, so the
+            # move never happened: RalliSport Challenge 2 grows every bounding
+            # box with `fcomi; fcmovnbe; fstp` and its boxes stayed at their
+            # inverted initial value, which culled everything they enclosed.
+            cond = {
+                "fcmovb":   "(g_fp_cmp == -1 || g_fp_cmp == 2)",
+                "fcmove":   "(g_fp_cmp == 0 || g_fp_cmp == 2)",
+                "fcmovbe":  "(g_fp_cmp != 1)",
+                "fcmovu":   "(g_fp_cmp == 2)",
+                "fcmovnb":  "(g_fp_cmp == 0 || g_fp_cmp == 1)",
+                "fcmovne":  "(g_fp_cmp == -1 || g_fp_cmp == 1)",
+                "fcmovnbe": "(g_fp_cmp == 1)",
+                "fcmovnu":  "(g_fp_cmp != 2)",
+            }.get(m)
+            mm = re.search(r"st\((\d)\)\s*$", insn.op_str)
+            if cond and mm:
+                i = int(mm.group(1))
+                return [f"if {cond} fp_top() = fp_st({i}); /* {m} {insn.op_str} */"]
         if m == "fldz":
             return [f"fp_push(0.0); /* fldz */"]
         if m == "fld1":
@@ -3896,6 +3957,26 @@ def lift_basic_block(lifter, bb, flag_state=None):
             stmts.append("eax = (eax & 0xFFFF00FFu) | ((uint32_t)("
                          + " | ".join(bits + ["0x02u"])
                          + f") << 8); /* lahf ({last_flag_setter}) */")
+            i += 1
+            continue
+
+        # PUSHFD pushes EFLAGS. The arithmetic flags have no storage -- each
+        # is rebuilt from the instruction that last set it, through the same
+        # conditions lahf and the jcc forms use -- and the rest (IF, DF, AC,
+        # ID) comes from g_eflags_shadow, which popfd writes. It used to lift
+        # to nothing, so the `pushfd; pop eax` of the cpuid-availability probe
+        # popped a stack slot instead, and everything after ran with esp 4 off.
+        if curr.mnemonic == "pushfd":
+            bits = []
+            if last_flag_setter:
+                for jcc, bit in (("jb", 0x001), ("jp", 0x004), ("je", 0x040),
+                                 ("js", 0x080), ("jo", 0x800)):
+                    probe = _make_condition(jcc, last_flag_setter, last_flag_ops)
+                    if probe:
+                        bits.append(f"(({probe[0]}) ? 0x{bit:03X}u : 0u)")
+            stmts.append("PUSH32(esp, (g_eflags_shadow & RECOMP_EFLAGS_SHADOW_MASK)"
+                         + "".join(" | " + b for b in bits)
+                         + f"); /* pushfd ({last_flag_setter or 'no tracked setter'}) */")
             i += 1
             continue
 
