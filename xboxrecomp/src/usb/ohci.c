@@ -547,6 +547,14 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
 
     if (pad < 0)
         return TD_CC_NOERROR;   /* no device at that address: ignore */
+    {
+        /* A descriptor whose buffer pointers make no sense: either the
+         * driver set it up oddly or this thread read it half-written. */
+        static unsigned odd;
+        if (((cbp && be < cbp) || (cbp && be - cbp >= 0x2000u)) && odd++ < 40)
+            fprintf(stderr, "  [OHCI%d] odd TD %08X info %08X cbp %08X next %08X be %08X dp %u ep %u\n",
+                    hc->index, td, info, cbp, rd32(td + 8), be, dp, endpoint);
+    }
 
     if (s_trace) {
         static unsigned n;

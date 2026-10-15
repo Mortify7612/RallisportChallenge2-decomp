@@ -83,6 +83,16 @@ static void *g_mirror_views[XBOX_NUM_MIRRORS] = {0};
  * question. */
 static void *g_span_base = NULL;
 static size_t g_span_size = 0;
+
+/* Hand back [host, host+len) from the guest-space reservation, just before a
+ * window is mapped there (the mapping refuses to replace anything). A range
+ * outside the reservation is left alone. */
+static void span_carve(uintptr_t host, size_t len)
+{
+    uintptr_t lo = (uintptr_t)g_span_base;
+    if (g_span_base && host >= lo && host + len <= lo + g_span_size)
+        VirtualFree((LPVOID)host, len, MEM_RELEASE);
+}
 static void *g_tiled_view = NULL;
 
 /* Contiguous / physical memory window (see MemoryLayoutInit).
@@ -2039,21 +2049,33 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * above 4 GB, which is why Half-Life 2 (768 MB) never saw it. Doing
          * this on Windows needs placeholder reservations (VirtualAlloc2). */
 #ifndef _WIN32
-        /* The reservation asks for the whole 4 GB guest space, though only
-         * base + mirrors stay reserved: the windows above them (contiguous
-         * memory at 0x80000000, the tiled and MMIO apertures) are mapped at
-         * fixed host addresses during this init, and a span sized to the
-         * mirrors alone could be placed with a library inside that range.
-         * That happened once a launcher loaded SDL and the Vulkan driver
-         * before boot -- libc landed at guest 0xD18xxxxx, the contiguous
-         * window failed with error 8, and the first physical allocation
-         * faulted. The tail is released at once for those mappings. */
+        /* The whole 4 GB guest space stays reserved (no access) for the life
+         * of the process, and each window is carved out of it as it is
+         * mapped (span_carve). Two reasons:
+         * - a span sized to the mirrors alone could be placed with a library
+         *   where the windows go -- after a launcher loaded SDL and the
+         *   Vulkan driver before boot, libc sat at guest 0xD18xxxxx and the
+         *   contiguous window failed with error 8;
+         * - released holes are where the host puts what it maps next: thread
+         *   heaps, driver buffers, libraries all landed between the guest's
+         *   windows, so a stray guest pointer read or corrupted host memory
+         *   instead of faulting (a glibc heap abort, garbage in the USB
+         *   stack's transfer lengths). Reserved, it faults where the bad
+         *   access is. */
         size_t full = (size_t)1 << 32;
         g_span_size = g_memory_size * (size_t)(1 + XBOX_NUM_MIRRORS);
-        g_span_base = VirtualAlloc(NULL, g_span_size > full ? g_span_size : full,
-                                   MEM_RESERVE, PAGE_NOACCESS);
-        if (g_span_base && g_span_size < full)
-            VirtualFree((char *)g_span_base + g_span_size, full - g_span_size, MEM_RELEASE);
+        if (g_span_size < full)
+            g_span_size = full;
+        g_span_base = VirtualAlloc(NULL, g_span_size, MEM_RESERVE, PAGE_NOACCESS);
+#ifndef _WIN32
+        {
+            /* The POSIX VirtualAlloc maps a reservation readable and
+             * writable; make the holes fault, as unmapped Xbox addresses do. */
+            DWORD old;
+            if (g_span_base)
+                VirtualProtect(g_span_base, g_span_size, PAGE_NOACCESS, &old);
+        }
+#endif
         if (g_span_base) {
             VirtualFree(g_span_base, g_memory_size, MEM_RELEASE);
             g_memory_base = MapViewOfFileEx(g_mapping_handle,
@@ -2540,6 +2562,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         g_contig_mapping = CreateFileMappingW(
             INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
             0, (DWORD)XBOX_CONTIG_SIZE, NULL);
+        span_carve(contig_native, XBOX_CONTIG_SIZE);
         g_contig_memory = g_contig_mapping
             ? MapViewOfFileEx(g_contig_mapping, FILE_MAP_ALL_ACCESS,
                               0, 0, XBOX_CONTIG_SIZE, (LPVOID)contig_native)
@@ -2582,6 +2605,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t nv2a_native = XBOX_NV2A_BASE + g_memory_offset;
+        span_carve(nv2a_native, XBOX_NV2A_SIZE);
         g_nv2a_memory = VirtualAlloc(
             (LPVOID)nv2a_native,
             XBOX_NV2A_SIZE,
@@ -2627,6 +2651,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      */
     {
         uintptr_t mcpx_native = XBOX_MCPX_BASE + g_memory_offset;
+        span_carve(mcpx_native, XBOX_MCPX_SIZE);
         g_mcpx_memory = VirtualAlloc(
             (LPVOID)mcpx_native,
             XBOX_MCPX_SIZE,
@@ -2719,6 +2744,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     {
         uintptr_t flash_native = XBOX_FLASH_BASE + g_memory_offset;
 
+        span_carve(flash_native, XBOX_FLASH_SIZE);
         g_flash_memory = VirtualAlloc(
             (LPVOID)flash_native,
             XBOX_FLASH_SIZE,
@@ -2756,6 +2782,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         uintptr_t kernel_native = XBOX_KERNEL_BASE + g_memory_offset;
         /* Already committed if the contiguous window above succeeded -
          * 0x80010000 sits inside it - so just use that storage. */
+        if (!g_contig_memory)
+            span_carve(kernel_native, KERNEL_PAGE_SIZE);
         g_kernel_memory = g_contig_memory
             ? (void *)kernel_native
             : VirtualAlloc((LPVOID)kernel_native, KERNEL_PAGE_SIZE,
@@ -2890,6 +2918,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          */
         if (tiled_size > XBOX_CONTIG_SIZE)
             tiled_size = XBOX_CONTIG_SIZE;
+        if (g_contig_mapping)
+            span_carve(tiled_native, tiled_size);
         g_tiled_view = g_contig_mapping
             ? MapViewOfFileEx(
                 g_contig_mapping,
