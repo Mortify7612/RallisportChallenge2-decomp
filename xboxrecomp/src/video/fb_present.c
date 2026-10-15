@@ -598,6 +598,14 @@ int xbox_FramebufferDumpBmp(const char *path)
 
 static int sdl_to_vk(SDL_Keycode k);
 
+/* RECOMP_WIDESCREEN=1: the title draws 4:3-sized frames anamorphic, shown
+ * at 16:9. */
+static int fb_wide(void)
+{
+    const char *v = getenv("RECOMP_WIDESCREEN");
+    return v && *v && strcmp(v, "0") != 0 && s_fb_width * 3 == s_fb_height * 4;
+}
+
 /* RECOMP_VIDEO_RECORD=<file>: every frame the title presents, at its own
  * resolution, piped to ffmpeg (H.264 in Matroska, which stays playable if
  * the process ends without closing it). Written from this thread when a new
@@ -614,8 +622,9 @@ static void video_frame(const uint32_t *px)
             char cmd[1024];
             snprintf(cmd, sizeof cmd,
                      "ffmpeg -loglevel error -y -f rawvideo -pix_fmt bgr0 -s %ux%u -r 60"
-                     " -i - -c:v libx264 -preset ultrafast -crf 16 -pix_fmt yuv420p"
-                     " -f matroska '%s'", s_fb_width, s_fb_height, path);
+                     " -i - -c:v libx264 -preset ultrafast -crf 16 -pix_fmt yuv420p%s"
+                     " -f matroska '%s'", s_fb_width, s_fb_height,
+                     fb_wide() ? " -aspect 16:9" : "", path);
             s_video = popen(cmd, "w");
             {
                 /* <file>.frames: the title's frame number of each video
@@ -785,7 +794,7 @@ static void *fb_thread(void *unused)
         if (vkinst) {
             VkSurfaceKHR surf = 0;
             win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                   (int)s_fb_width * 2, (int)s_fb_height * 2,
+                                   fb_wide() ? 1280 : (int)s_fb_width * 2, fb_wide() ? 720 : (int)s_fb_height * 2,
                                    SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
                                    | SDL_WINDOW_VULKAN | fb_start_flags());
             if (win && SDL_Vulkan_CreateSurface(win, (VkInstance)vkinst, &surf)) {
@@ -805,7 +814,7 @@ static void *fb_thread(void *unused)
         }
     }
     win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                           (int)s_fb_width * 2, (int)s_fb_height * 2,
+                           fb_wide() ? 1280 : (int)s_fb_width * 2, fb_wide() ? 720 : (int)s_fb_height * 2,
                            SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
                            | fb_start_flags());
     ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
@@ -820,7 +829,8 @@ static void *fb_thread(void *unused)
         s_fb_running = 0;
         return NULL;
     }
-    SDL_RenderSetLogicalSize(ren, (int)s_fb_width, (int)s_fb_height);
+    SDL_RenderSetLogicalSize(ren, fb_wide() ? (int)s_fb_height * 16 / 9 : (int)s_fb_width,
+                             (int)s_fb_height);
     {
         SDL_RendererInfo info;
         vsync = SDL_GetRendererInfo(ren, &info) == 0

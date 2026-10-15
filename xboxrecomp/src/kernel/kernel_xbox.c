@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdlib.h>
 #include <string.h>
 
 /* ============================================================================
@@ -145,9 +146,20 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         break;
 
     case XC_VIDEO:
-        /* NTSC with widescreen and HDTV support enabled */
+        /* The dashboard's TV settings. The EEPROM keeps them in the upper
+         * half -- XAPI's XGetVideoFlags returns (value >> 16) & 0x5F -- so
+         * the old 0x03 here read as a plain 4:3 SDTV. RECOMP_WIDESCREEN=1
+         * says 16:9: the title renders its 640x480 frame anamorphic, and the
+         * window shows it stretched to 16:9 as a widescreen TV would.
+         * RECOMP_VIDEO_FLAGS=<hex> sets the raw value (480p 0x80000, 720p
+         * 0x20000, 1080i 0x40000, letterbox 0x100000). */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            const char *raw = getenv("RECOMP_VIDEO_FLAGS");
+            const char *wide = getenv("RECOMP_WIDESCREEN");
+            ULONG v = (wide && *wide && strcmp(wide, "0") != 0) ? XC_VIDEO_FLAGS_WIDESCREEN : 0;
+            if (raw && *raw)
+                v = (ULONG)strtoul(raw, NULL, 16);
+            *(PULONG)Value = v;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

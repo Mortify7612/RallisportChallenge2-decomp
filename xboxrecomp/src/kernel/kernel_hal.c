@@ -909,6 +909,16 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         *Result = AV_PACK_HDTV
                 | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
                 | AV_REFRESH_60Hz;
+        /* This is AV_QUERY_AV_CAPABILITIES (6) in the real kernel, which
+         * also carries the dashboard's TV settings -- the XC_VIDEO flags,
+         * widescreen 0x00010000 and the HDTV modes. D3D checks a mode the
+         * title asks for against them: without them a widescreen request
+         * failed device creation, and the title hung retrying it. */
+        {
+            ULONG flags = 0, type, len;
+            if (xbox_ExQueryNonVolatileSetting(XC_VIDEO, &type, &flags, sizeof flags, &len) >= 0)
+                *Result |= flags & 0xFFFF0000u & ~(ULONG)AV_REFRESH_50Hz;
+        }
         break;
 
     case AV_OPTION_QUERY_MODE:
