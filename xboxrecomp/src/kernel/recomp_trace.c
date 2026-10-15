@@ -419,9 +419,12 @@ static void snapb_exit(uint32_t va)
  * frame, for chasing objects that drop out (tree pop-in). Binary records:
  *   u32 'TTF0', u32 frame, u32 kind, u32 n, u32 extra, then n entries of
  *   { u32 inst, f32 dist, f32 weight, u8 lod, u8 type, u16 pad }
- * kind 1: sub_0010F0D0's output as sub_00273E70 receives it (extra = the
- *         call's 3rd and 4th arguments, packed 16:16);
+ * kind 1: sub_0010F0D0's output as sub_00273E70 walks it -- 24-byte
+ *         records at the renderer object's +0x10 (its 6th argument), the
+ *         count at +0xC (extra = the count slot, 5th argument);
  * kind 2: the render buckets at sub_00273890's entry (type = record type);
+ * kinds 5-8: sub_00273E70's four lists (obj+0x22A60, +0x2125C, +0x1B258,
+ *         +0x12254), as it returns;
  * kind 9: a mark (F9 in the window; extra = the mark count).
  * Needs trace hooks on 0x0010F0D0, 0x00273360 and 0x00273890. */
 volatile int g_recomp_user_mark;
@@ -449,7 +452,7 @@ static void tt_entry(const uint8_t *m, uint32_t rec, uint32_t type)
     memcpy(&e.w, m + rec + 0x14, 4);
     e.lod = m[rec + 8];
     e.type = (uint8_t)type;
-    e.pad = 0;
+    e.pad = (uint16_t)(m[rec + 0x12] | m[rec + 9] << 8);   /* byte 0x12, byte 9 */
     fwrite(&e, sizeof e, 1, s_tt);
 }
 
@@ -474,7 +477,7 @@ static void tree_trace(uint32_t va)
         const uint32_t *sp = (const uint32_t *)(m + g_esp);
         if (sp[0] != 0x002743D1u)            /* only sub_00273E70's call */
             return;
-        s_tt_out = sp[2];
+        s_tt_out = sp[6];       /* records: the renderer object's +0x10 */
         s_tt_a3 = sp[3];
         s_tt_a4 = sp[4];
         s_tt_cnt = sp[5];
@@ -486,6 +489,20 @@ static void tree_trace(uint32_t va)
         tt_hdr(1, n > 4096 ? 4096 : n, *(const uint32_t *)(m + s_tt_cnt));
         for (i = 0; i < n && i < 4096; i++)
             tt_entry(m, s_tt_out + 24 * i, 0);
+        {
+            /* kinds 5-8: the four lists sub_00273E70 sorts the records
+             * into (count at -4, 24-byte records). */
+            static const uint32_t lists[4] = { 0x22A60u, 0x2125Cu, 0x1B258u, 0x12254u };
+            int l;
+            for (l = 0; l < 4; l++) {
+                uint32_t base = s_tt_obj + lists[l], c = *(const uint32_t *)(m + base - 4);
+                if (c > 4096)
+                    c = 0;
+                tt_hdr(5 + (uint32_t)l, c, lists[l]);
+                for (i = 0; i < c; i++)
+                    tt_entry(m, base + 24 * i, (uint32_t)l);
+            }
+        }
         s_tt_cnt = 0;
     } else if (va == 0x00273890u) {
         uint32_t obj = g_eax, nb = *(const uint32_t *)(m + obj + 8), i, total = 0;

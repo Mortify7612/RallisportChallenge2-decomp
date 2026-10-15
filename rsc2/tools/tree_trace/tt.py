@@ -7,8 +7,8 @@ def read(path):
         ents = []
         if i + 16 * n > len(d): break
         for k in range(n):
-            inst, dist, w, lod, typ, _ = struct.unpack_from('<IffBBH', d, i); i += 16
-            ents.append((inst, dist, w, lod, typ))
+            inst, dist, w, lod, typ, pad = struct.unpack_from('<IffBBH', d, i); i += 16
+            ents.append((inst, dist, w, lod, typ, pad))
         out.append((frame, kind, extra, ents))
     return out
 if __name__ == '__main__':
