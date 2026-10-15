@@ -24,6 +24,13 @@
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
+/* The Vulkan renderer (kernel/nv2a_vk.c): when it is up, it presents into
+ * this window itself and GDI stands down. RECOMP_VK_PRESENT=0 keeps GDI. */
+extern void *nv2a_vk_instance_handle(void);
+extern int   nv2a_vk_attach_hwnd(void *hinstance, void *hwnd);
+extern void  nv2a_vk_set_window_size(int w, int h);
+static volatile LONG s_vk_window;
+
 static volatile LONG s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
 static uint32_t     *s_rgb;           /* converted 32-bit copy for GDI */
@@ -146,6 +153,11 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_CLOSE:
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
+        return 0;
+
+    case WM_SIZE:
+        if (s_vk_window)
+            nv2a_vk_set_window_size(LOWORD(l), HIWORD(l));
         return 0;
 
     case WM_KEYDOWN:
@@ -274,7 +286,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         wc.lpszClassName = "XboxRecompFramebuffer";
         RegisterClassA(&wc);
     }
-    r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
+    {
+        const char *vp = getenv("RECOMP_VK_PRESENT");
+        if (!(vp && strcmp(vp, "0") == 0) && nv2a_vk_instance_handle())
+            s_vk_window = 1;
+    }
+    r.left = 0; r.top = 0;
+    r.right = (LONG)s_fb_width * (s_vk_window ? 2 : 1);
+    r.bottom = (LONG)s_fb_height * (s_vk_window ? 2 : 1);
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -286,6 +305,17 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         return 0;
     }
     hdc = GetDC(hwnd);
+    if (s_vk_window) {
+        RECT cr;
+        GetClientRect(hwnd, &cr);
+        nv2a_vk_set_window_size(cr.right - cr.left, cr.bottom - cr.top);
+        if (!nv2a_vk_attach_hwnd(GetModuleHandleA(NULL), hwnd)) {
+            fprintf(stderr, "  [FBWIN] Vulkan surface failed -- GDI\n");
+            s_vk_window = 0;
+        } else {
+            fprintf(stderr, "  [FBWIN] window open, presented by Vulkan\n");
+        }
+    }
 
     memset(&bi, 0, sizeof(bi));
     bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
@@ -314,10 +344,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             if (s_present[idx])
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
-        } else if (s_fb_va && s_fb_pitch && s_rgb) {
+            if (!s_vk_window)
+                StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
+                              0, 0, (int)s_fb_width, (int)s_fb_height,
+                              s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+        } else if (s_fb_va && s_fb_pitch && s_rgb && !s_vk_window) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
@@ -390,11 +421,458 @@ void xbox_FramebufferWindowStart(void)
         InterlockedExchange(&s_fb_running, 0);
 }
 
-#else
-void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
-void xbox_FramebufferWindowStart(void) {}
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
-void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
-void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
+#else /* !_WIN32 -- SDL2 */
+
+/* The same window on POSIX hosts, through SDL2.
+ *
+ * Everything the Win32 version promises holds here too: frames are copied at
+ * the flip and the window only ever shows a finished one; key state is kept
+ * per Win32 virtual-key code, so src/input's keyboard mapping needs no second
+ * copy; the title bar carries the title name, FPS and draw count; and
+ * RECOMP_FB_DUMP / RECOMP_FB_WINDOW_DUMP_EVERY dump what the window shows.
+ *
+ * Additions a desktop window wants: it scales to whatever size it is dragged
+ * to (aspect kept, nearest-neighbour off), F11 toggles fullscreen, and closing
+ * it ends the process -- there is nothing left to look at, and a title with
+ * no window would otherwise keep running headless until killed.
+ *
+ * All SDL video calls stay on the window thread. */
+#include <SDL.h>
+#include <SDL_vulkan.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+
+extern ptrdiff_t xbox_GetMemoryOffset(void);
+
+/* The Vulkan renderer (kernel/nv2a_vk.c), when it is up: the window is then
+ * a Vulkan surface it presents to, at its own resolution, and this thread
+ * only runs the window. RECOMP_VK_PRESENT=0 keeps the SDL renderer. */
+extern void *nv2a_vk_instance_handle(void);
+extern void  nv2a_vk_set_surface(uint64_t surface);
+extern void  nv2a_vk_set_window_size(int w, int h);
+
+static volatile int  s_fb_running;
+static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
+static uint32_t     *s_rgb;
+static uint32_t     *s_present[2];
+static volatile int  s_present_idx = -1;
+static volatile unsigned char s_key_down[256];
+static char          s_title[48] = "Xbox Recomp";
+static volatile int  s_flips, s_frame_draws;
+
+static void fb_convert_rows(uint32_t *dst_base, const uint8_t *src, uint32_t pitch)
+{
+    uint32_t bpp = pitch / s_fb_width, x, y;
+    for (y = 0; y < s_fb_height; y++) {
+        const uint8_t *row = src + (size_t)y * pitch;
+        uint32_t *dst = dst_base + (size_t)y * s_fb_width;
+        if (bpp == 4) {
+            memcpy(dst, row, (size_t)s_fb_width * 4);
+        } else if (bpp == 2) {
+            const uint16_t *q = (const uint16_t *)row;
+            for (x = 0; x < s_fb_width; x++) {
+                uint16_t v = q[x];
+                uint32_t r = (uint32_t)((v >> 11) & 0x1F) * 255u / 31u;
+                uint32_t g = (uint32_t)((v >>  5) & 0x3F) * 255u / 63u;
+                uint32_t b = (uint32_t)( v        & 0x1F) * 255u / 31u;
+                dst[x] = (r << 16) | (g << 8) | b;
+            }
+        } else {
+            memset(dst, 0, (size_t)s_fb_width * 4);
+        }
+    }
+}
+
+void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
+{
+    const char *pin = getenv("RECOMP_FB_VA");
+    s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
+    if (pitch)
+        s_fb_pitch = pitch;
+}
+
+void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
+{
+    int next;
+    if (!s_fb_running || !fb_va || !pitch || getenv("RECOMP_FB_VA"))
+        return;
+    next = (__atomic_load_n(&s_present_idx, __ATOMIC_ACQUIRE) == 0) ? 1 : 0;
+    if (!s_present[next]) {
+        s_present[next] = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+        if (!s_present[next])
+            return;
+    }
+    fb_convert_rows(s_present[next],
+                    (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset()),
+                    pitch);
+    __atomic_store_n(&s_present_idx, next, __ATOMIC_RELEASE);  /* whole frame */
+}
+
+void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
+{
+    int i;
+    for (i = 0; i < max_chars && i < 47 && name[i]; i++)
+        s_title[i] = (char)(name[i] < 0x80 ? name[i] : '?');
+    if (i)
+        s_title[i] = 0;
+}
+
+void xbox_FramebufferWindowFrameStats(uint32_t draws)
+{
+    __atomic_add_fetch(&s_flips, 1, __ATOMIC_RELAXED);
+    __atomic_store_n(&s_frame_draws, (int)draws, __ATOMIC_RELAXED);
+}
+
+int xbox_FramebufferKeyDown(int vk)
+{
+    if ((unsigned)vk > 255)
+        return 0;
+    return s_key_down[vk] != 0;
+}
+
+/* SDL key -> Win32 virtual-key code: letters and digits are their uppercase
+ * ASCII, the rest by table. 0 for keys with no counterpart. */
+static int sdl_to_vk(SDL_Keycode k)
+{
+    if (k >= SDLK_a && k <= SDLK_z) return 'A' + (int)(k - SDLK_a);
+    if (k >= SDLK_0 && k <= SDLK_9) return '0' + (int)(k - SDLK_0);
+    if (k >= SDLK_KP_1 && k <= SDLK_KP_9) return 0x61 + (int)(k - SDLK_KP_1);
+    if (k >= SDLK_F1 && k <= SDLK_F12) return 0x70 + (int)(k - SDLK_F1);
+    switch (k) {
+    case SDLK_KP_0:      return 0x60;
+    case SDLK_RETURN:
+    case SDLK_KP_ENTER:  return 0x0D;
+    case SDLK_BACKSPACE: return 0x08;
+    case SDLK_TAB:       return 0x09;
+    case SDLK_ESCAPE:    return 0x1B;
+    case SDLK_SPACE:     return 0x20;
+    case SDLK_LEFT:      return 0x25;
+    case SDLK_UP:        return 0x26;
+    case SDLK_RIGHT:     return 0x27;
+    case SDLK_DOWN:      return 0x28;
+    case SDLK_LSHIFT: case SDLK_RSHIFT: return 0x10;
+    case SDLK_LCTRL:  case SDLK_RCTRL:  return 0x11;
+    case SDLK_LALT:   case SDLK_RALT:   return 0x12;
+    default:             return 0;
+    }
+}
+
+int xbox_FramebufferDumpBmp(const char *path)
+{
+    FILE *f;
+    uint32_t row = ((s_fb_width * 3u) + 3u) & ~3u;
+    uint32_t img = row * s_fb_height, total = 54u + img, y, x;
+    uint8_t hdr[54], *line;
+
+    if (!s_rgb)
+        return -1;
+    f = fopen(path, "wb");
+    if (!f)
+        return -1;
+    memset(hdr, 0, sizeof(hdr));
+    hdr[0] = 'B'; hdr[1] = 'M';
+    memcpy(hdr + 2, &total, 4);
+    hdr[10] = 54; hdr[14] = 40;
+    memcpy(hdr + 18, &s_fb_width, 4);
+    memcpy(hdr + 22, &s_fb_height, 4);
+    hdr[26] = 1; hdr[28] = 24;
+    memcpy(hdr + 34, &img, 4);
+    fwrite(hdr, 1, sizeof(hdr), f);
+    line = (uint8_t *)calloc(1, row);
+    for (y = 0; line && y < s_fb_height; y++) {
+        const uint32_t *src = s_rgb + (size_t)(s_fb_height - 1 - y) * s_fb_width;
+        for (x = 0; x < s_fb_width; x++) {
+            line[x * 3 + 0] = (uint8_t)(src[x] & 0xFF);
+            line[x * 3 + 1] = (uint8_t)((src[x] >> 8) & 0xFF);
+            line[x * 3 + 2] = (uint8_t)((src[x] >> 16) & 0xFF);
+        }
+        fwrite(line, 1, row, f);
+    }
+    free(line);
+    fclose(f);
+    fprintf(stderr, "  [FBWIN] wrote %s (%ux%u)\n", path, s_fb_width, s_fb_height);
+    return 0;
+}
+
+static int sdl_to_vk(SDL_Keycode k);
+
+/* RECOMP_VIDEO_RECORD=<file>: every frame the title presents, at its own
+ * resolution, piped to ffmpeg (H.264 in Matroska, which stays playable if
+ * the process ends without closing it). Written from this thread when a new
+ * flip arrives, so a frame this loop misses is missing from the video too. */
+static FILE *s_video, *s_video_idx;
+extern uint32_t nv2a_pb_presented_frames(void);
+static void video_frame(const uint32_t *px)
+{
+    static int init;
+    if (!init) {
+        const char *path = getenv("RECOMP_VIDEO_RECORD");
+        init = 1;
+        if (path && *path) {
+            char cmd[1024];
+            snprintf(cmd, sizeof cmd,
+                     "ffmpeg -loglevel error -y -f rawvideo -pix_fmt bgr0 -s %ux%u -r 60"
+                     " -i - -c:v libx264 -preset ultrafast -crf 16 -pix_fmt yuv420p"
+                     " -f matroska '%s'", s_fb_width, s_fb_height, path);
+            s_video = popen(cmd, "w");
+            {
+                /* <file>.frames: the title's frame number of each video
+                 * frame, for lining the video up with frame-numbered logs. */
+                char ip[1024];
+                snprintf(ip, sizeof ip, "%s.frames", path);
+                s_video_idx = fopen(ip, "w");
+            }
+            fprintf(stderr, "  [FBWIN] recording video to %s%s\n", path,
+                    s_video ? "" : " -- ffmpeg failed to start");
+        }
+    }
+    if (s_video && s_video_idx) {
+        fprintf(s_video_idx, "%u\n", nv2a_pb_presented_frames());
+        fflush(s_video_idx);
+    }
+    if (s_video && fwrite(px, 4, (size_t)s_fb_width * s_fb_height, s_video)
+                       != (size_t)s_fb_width * s_fb_height) {
+        pclose(s_video);
+        s_video = NULL;
+    }
+}
+
+static void video_close(void)
+{
+    if (s_video) {
+        pclose(s_video);
+        s_video = NULL;
+    }
+}
+
+/* Host game controllers (src/input/xinput_device.c): opened, closed and
+ * read on this thread, which is the one pumping SDL's events. */
+extern void xbox_InputSdlInit(void);
+extern void xbox_InputSdlEvent(const SDL_Event *ev);
+extern void xbox_InputSdlPoll(void);
+
+/* One round of window events; returns the window's new drawable size
+ * through *resized when it changed. */
+static void fb_events(SDL_Window *win, int *resized)
+{
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_QUIT) {
+            fprintf(stderr, "  [FBWIN] window closed -- exiting\n");
+            fflush(stderr);
+            video_close();
+            _Exit(0);
+        } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
+            int vk = sdl_to_vk(ev.key.keysym.sym);
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F10
+                    && !ev.key.repeat) {
+                /* The renderer's flight recorder (RECOMP_VK_FLIGHT). */
+                extern void xbox_FlightDumpRequest(void);
+                xbox_FlightDumpRequest();
+            }
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F11
+                    && !ev.key.repeat) {
+                Uint32 fs = SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP;
+                SDL_SetWindowFullscreen(win, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+            }
+            if (vk) {
+                s_key_down[vk] = ev.type == SDL_KEYDOWN;
+                if (ev.type == SDL_KEYDOWN && !ev.key.repeat
+                        && getenv("RECOMP_KEY_TRACE"))
+                    fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)vk);
+            }
+        } else if (ev.type == SDL_CONTROLLERDEVICEADDED
+                   || ev.type == SDL_CONTROLLERDEVICEREMOVED) {
+            xbox_InputSdlEvent(&ev);
+        } else if (ev.type == SDL_WINDOWEVENT
+                   && ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+            /* Leaving with a key held would leave it held for ever. */
+            memset((void *)s_key_down, 0, sizeof s_key_down);
+        } else if (ev.type == SDL_WINDOWEVENT
+                   && (ev.window.event == SDL_WINDOWEVENT_SIZE_CHANGED
+                       || ev.window.event == SDL_WINDOWEVENT_RESIZED)) {
+            if (resized)
+                *resized = 1;
+        }
+    }
+    xbox_InputSdlPoll();
+}
+
+/* The window while Vulkan presents into it: events, the title bar and the
+ * dumps (from the frame copied at the flip, as before). */
+static void *fb_vk_loop(SDL_Window *win)
+{
+    Uint32 t0 = 0;
+    int f0 = 0, frames = 0;
+    const char *dump = getenv("RECOMP_FB_DUMP");
+    const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
+    int period = every ? atoi(every) : 0;
+
+    while (s_fb_running) {
+        int resized = 0, idx;
+        fb_events(win, &resized);
+        if (resized) {
+            int dw, dh;
+            SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
+            nv2a_vk_set_window_size(dw, dh);
+        }
+        idx = __atomic_load_n(&s_present_idx, __ATOMIC_ACQUIRE);
+        {
+            /* Only when a new frame came in: this loop now runs every 4 ms. */
+            static int copied_flip = -1;
+            int f = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
+            if (idx >= 0 && s_present[idx] && f != copied_flip) {
+                memcpy(s_rgb, s_present[idx], (size_t)s_fb_width * s_fb_height * 4);
+                copied_flip = f;
+                video_frame(s_rgb);
+            }
+        }
+        frames++;
+        if (dump && period > 0 && frames % period == 0)
+            xbox_FramebufferDumpBmp(dump);
+        {
+            Uint32 now = SDL_GetTicks();
+            if (now - t0 >= 1000) {
+                int f = s_flips;
+                char tb[128];
+                snprintf(tb, sizeof tb, "%s | FPS: %.1f | Vulkan", s_title,
+                         t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0);
+                SDL_SetWindowTitle(win, tb);
+                t0 = now; f0 = f;
+            }
+        }
+        /* 4 ms: this loop also reads the controllers, and a 16 ms sleep
+         * here added up to a frame of input lag. */
+        SDL_Delay(4);
+    }
+    SDL_DestroyWindow(win);
+    return NULL;
+}
+
+static void *fb_thread(void *unused)
+{
+    SDL_Window *win;
+    SDL_Renderer *ren;
+    SDL_Texture *tex;
+    Uint32 t0 = 0;
+    int f0 = 0, frames = 0;
+    const char *dump = getenv("RECOMP_FB_DUMP");
+    const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
+    int period = every ? atoi(every) : 0;
+    int vsync = 0;
+
+    (void)unused;
+    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+        fprintf(stderr, "  [FBWIN] SDL video init failed: %s\n", SDL_GetError());
+        s_fb_running = 0;
+        return NULL;
+    }
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+    xbox_InputSdlInit();
+    {
+        const char *vp = getenv("RECOMP_VK_PRESENT");
+        void *vkinst = (vp && strcmp(vp, "0") == 0) ? NULL : nv2a_vk_instance_handle();
+        if (vkinst) {
+            VkSurfaceKHR surf = 0;
+            win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                   (int)s_fb_width * 2, (int)s_fb_height * 2,
+                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+                                   | SDL_WINDOW_VULKAN);
+            if (win && SDL_Vulkan_CreateSurface(win, (VkInstance)vkinst, &surf)) {
+                int dw, dh;
+                SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
+                nv2a_vk_set_window_size(dw, dh);
+                nv2a_vk_set_surface((uint64_t)(uintptr_t)surf);
+                s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+                fprintf(stderr, "  [FBWIN] window open, presented by Vulkan (%dx%d, SDL %s)\n",
+                        dw, dh, SDL_GetCurrentVideoDriver());
+                return fb_vk_loop(win);
+            }
+            fprintf(stderr, "  [FBWIN] Vulkan surface failed (%s) -- SDL renderer\n",
+                    SDL_GetError());
+            if (win)
+                SDL_DestroyWindow(win);
+        }
+    }
+    win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                           (int)s_fb_width * 2, (int)s_fb_height * 2,
+                           SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
+    ren = win ? SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED
+                                            | SDL_RENDERER_PRESENTVSYNC) : NULL;
+    if (win && !ren)
+        ren = SDL_CreateRenderer(win, -1, 0);
+    tex = ren ? SDL_CreateTexture(ren, SDL_PIXELFORMAT_ARGB8888,
+                                  SDL_TEXTUREACCESS_STREAMING,
+                                  (int)s_fb_width, (int)s_fb_height) : NULL;
+    if (!tex) {
+        fprintf(stderr, "  [FBWIN] window/renderer creation failed: %s\n", SDL_GetError());
+        s_fb_running = 0;
+        return NULL;
+    }
+    SDL_RenderSetLogicalSize(ren, (int)s_fb_width, (int)s_fb_height);
+    {
+        SDL_RendererInfo info;
+        vsync = SDL_GetRendererInfo(ren, &info) == 0
+             && (info.flags & SDL_RENDERER_PRESENTVSYNC);
+    }
+    s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+    fprintf(stderr, "  [FBWIN] framebuffer window open (%ux%u, SDL %s)\n",
+            s_fb_width, s_fb_height, SDL_GetCurrentVideoDriver());
+
+    while (s_fb_running) {
+        int idx;
+        fb_events(win, NULL);
+
+        idx = __atomic_load_n(&s_present_idx, __ATOMIC_ACQUIRE);
+        if (idx >= 0 && s_present[idx]) {
+            memcpy(s_rgb, s_present[idx], (size_t)s_fb_width * s_fb_height * 4);
+        } else if (s_fb_va && s_fb_pitch) {
+            /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory. */
+            fb_convert_rows(s_rgb, (const uint8_t *)((uintptr_t)s_fb_va
+                                                     + xbox_GetMemoryOffset()),
+                            s_fb_pitch);
+        }
+        SDL_UpdateTexture(tex, NULL, s_rgb, (int)s_fb_width * 4);
+        SDL_SetRenderDrawColor(ren, 0, 0, 0, 255);
+        SDL_RenderClear(ren);
+        SDL_RenderCopy(ren, tex, NULL, NULL);
+        SDL_RenderPresent(ren);   /* paced by vsync where available */
+
+        frames++;
+        if (dump && period > 0 && frames % period == 0)
+            xbox_FramebufferDumpBmp(dump);
+        {
+            Uint32 now = SDL_GetTicks();
+            if (now - t0 >= 1000) {
+                int f = s_flips;
+                char tb[128];
+                snprintf(tb, sizeof tb, "%s | FPS: %.1f | draws: %d", s_title,
+                         t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0, s_frame_draws);
+                SDL_SetWindowTitle(win, tb);
+                t0 = now; f0 = f;
+            }
+        }
+        if (!vsync)
+            SDL_Delay(16);
+    }
+    SDL_DestroyTexture(tex);
+    SDL_DestroyRenderer(ren);
+    SDL_DestroyWindow(win);
+    return NULL;
+}
+
+void xbox_FramebufferWindowStart(void)
+{
+    pthread_t th;
+    if (!getenv("RECOMP_FB_WINDOW"))
+        return;
+    if (__atomic_exchange_n(&s_fb_running, 1, __ATOMIC_ACQ_REL) != 0)
+        return;
+    if (pthread_create(&th, NULL, fb_thread, NULL) == 0)
+        pthread_detach(th);
+    else
+        s_fb_running = 0;
+}
 #endif

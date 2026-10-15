@@ -11,4 +11,9 @@ target_include_directories(xbox_video PUBLIC
 target_link_libraries(xbox_video PUBLIC xbox_d3d8)
 if(WIN32)
     target_link_libraries(xbox_video PUBLIC mfplat mfreadwrite mfuuid mf ole32)
+else()
+    # The framebuffer window (fb_present.c) is SDL2 on POSIX hosts.
+    find_package(SDL2 REQUIRED)
+    find_package(Threads REQUIRED)
+    target_link_libraries(xbox_video PUBLIC SDL2::SDL2 Threads::Threads)
 endif()
