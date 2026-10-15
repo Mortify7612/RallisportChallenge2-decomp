@@ -118,6 +118,9 @@ enum {
 #ifndef STATUS_OBJECT_NAME_NOT_FOUND
 #define STATUS_OBJECT_NAME_NOT_FOUND    ((NTSTATUS)0xC0000034L)
 #endif
+#ifndef STATUS_OBJECT_NAME_INVALID
+#define STATUS_OBJECT_NAME_INVALID      ((NTSTATUS)0xC0000033L)
+#endif
 #ifndef STATUS_OBJECT_NAME_COLLISION
 #define STATUS_OBJECT_NAME_COLLISION    ((NTSTATUS)0xC0000035L)
 #endif
@@ -685,6 +688,20 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
 NTSTATUS __stdcall xbox_NtSetInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass);
+
+/* FileRenameInformation for an open file, with the new name already
+ * translated to a host path. NtSetInformationFile cannot take it directly:
+ * the guest structure carries a 32-bit string pointer, so the bridge decodes
+ * it and calls this. */
+NTSTATUS xbox_RenameOpenFile(HANDLE FileHandle, const xbox_host_char *new_host_path,
+                             BOOLEAN ReplaceIfExists);
+
+/* FileRenameInformation for an open file, with the new name already
+ * translated to a host path. NtSetInformationFile cannot take it directly:
+ * the guest structure carries a 32-bit string pointer, so the bridge decodes
+ * it and calls this. */
+NTSTATUS xbox_RenameOpenFile(HANDLE FileHandle, const xbox_host_char *new_host_path,
+                             BOOLEAN ReplaceIfExists);
 
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,

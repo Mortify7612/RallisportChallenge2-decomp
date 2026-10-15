@@ -99,6 +99,11 @@ static DWORD xbox_access_to_win32(ACCESS_MASK Access)
     if (Access & XBOX_FILE_WRITE_ATTRIBUTES)  result |= FILE_WRITE_ATTRIBUTES;
     if (Access & XBOX_SYNCHRONIZE)            result |= SYNCHRONIZE;
     if (Access & XBOX_DELETE)                  result |= DELETE;
+    /* A handle that can write can also be renamed on the console -- titles
+     * write a temp file and rename it into place (RalliSport Challenge 2's Z:
+     * cache) -- and Win32 only renames through a handle holding DELETE. */
+    if (result & (FILE_WRITE_DATA | FILE_APPEND_DATA))
+        result |= DELETE;
     if (result == 0 || result == SYNCHRONIZE)
         result |= GENERIC_READ;
     return result;
@@ -110,7 +115,10 @@ static DWORD xbox_share_to_win32(ULONG Share)
     DWORD result = 0;
     if (Share & 0x01) result |= FILE_SHARE_READ;
     if (Share & 0x02) result |= FILE_SHARE_WRITE;
-    if (Share & 0x04) result |= FILE_SHARE_DELETE;
+    /* Always shareable for delete: renaming one handle must not be refused
+     * because another handle on the same file is open. */
+    result |= FILE_SHARE_DELETE;
+    (void)0;
     return result;
 }
 
@@ -470,10 +478,34 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
         case XboxFileDispositionInformation: {
             PXBOX_FILE_DISPOSITION_INFORMATION info = (PXBOX_FILE_DISPOSITION_INFORMATION)FileInformation;
             FILE_DISPOSITION_INFO fdi;
-            fdi.DeleteFile = info->DeleteFile;
-            if (!SetFileInformationByHandle(FileHandle, FileDispositionInfo, &fdi, sizeof(fdi)))
-                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
-                         "SetFileDispositionInfo failed: err=%u", GetLastError());
+            /* The console's FAT driver removes the name at once; Win32's
+             * default keeps it until the last handle closes, and needs a
+             * handle with DELETE access besides. RalliSport Challenge 2
+             * deletes its stale Z: cache file and then renames the fresh copy
+             * onto the same name: with the delete refused (no DELETE access)
+             * or merely pending, the rename collided and the title stopped on
+             * its loading screen. So: a DELETE handle of our own (every handle
+             * shares delete), and POSIX semantics where the host has them. */
+            HANDLE dh = ReOpenFile(FileHandle, DELETE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0);
+            HANDLE use = dh != INVALID_HANDLE_VALUE ? dh : FileHandle;
+            BOOL ok = FALSE;
+#ifdef FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            if (info->DeleteFile) {
+                FILE_DISPOSITION_INFO_EX fdx;
+                fdx.Flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+                ok = SetFileInformationByHandle(use, FileDispositionInfoEx, &fdx, sizeof(fdx));
+            }
+#endif
+            if (!ok) {
+                fdi.DeleteFile = info->DeleteFile;
+                ok = SetFileInformationByHandle(use, FileDispositionInfo, &fdi, sizeof(fdi));
+            }
+            if (!ok)
+                fprintf(stderr, "  [FILE] delete disposition failed (error %lu)\n",
+                        (unsigned long)GetLastError());
+            if (dh != INVALID_HANDLE_VALUE)
+                CloseHandle(dh);
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -486,7 +518,11 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             at.dwHighDateTime = info->LastAccessTime.HighPart;
             wt.dwLowDateTime = info->LastWriteTime.LowPart;
             wt.dwHighDateTime = info->LastWriteTime.HighPart;
-            SetFileTime(FileHandle, &ct, &at, &wt);
+            /* Accepted and ignored by default, as on POSIX, so the two hosts
+             * agree on what a title sees afterwards. RECOMP_SET_FILE_TIMES=1
+             * applies them. */
+            if (getenv("RECOMP_SET_FILE_TIMES"))
+                SetFileTime(FileHandle, &ct, &at, &wt);
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -501,6 +537,36 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
+}
+
+NTSTATUS xbox_RenameOpenFile(HANDLE FileHandle, const xbox_host_char *new_host_path,
+                             BOOLEAN ReplaceIfExists)
+{
+    /* Rename through the handle (FileRenameInfo). Handles opened for writing
+     * carry DELETE access for this (xbox_access_to_win32), and every handle
+     * shares delete, so the open handle does not stand in the way. */
+    size_t len = wcslen(new_host_path);
+    size_t bytes = sizeof(FILE_RENAME_INFO) + (len + 1) * sizeof(WCHAR);
+    FILE_RENAME_INFO *fri = (FILE_RENAME_INFO *)calloc(1, bytes);
+    NTSTATUS st = STATUS_SUCCESS;
+
+    if (!fri)
+        return STATUS_NO_MEMORY;
+    fri->ReplaceIfExists = ReplaceIfExists ? TRUE : FALSE;
+    fri->RootDirectory = NULL;
+    fri->FileNameLength = (DWORD)(len * sizeof(WCHAR));
+    memcpy(fri->FileName, new_host_path, (len + 1) * sizeof(WCHAR));
+    if (!SetFileInformationByHandle(FileHandle, FileRenameInfo, fri, (DWORD)bytes)) {
+        DWORD err = GetLastError();
+        fprintf(stderr, "  [FILE] rename via handle failed (error %lu)\n",
+                (unsigned long)err);
+        st = err == ERROR_ALREADY_EXISTS || err == ERROR_FILE_EXISTS
+           ? STATUS_OBJECT_NAME_COLLISION
+           : err == ERROR_ACCESS_DENIED ? STATUS_ACCESS_DENIED
+           : STATUS_UNSUCCESSFUL;
+    }
+    free(fri);
+    return st;
 }
 
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
@@ -1053,6 +1119,23 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             /* Setting file times is non-essential for the game; accept it. */
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
+        case XboxFileAllocationInformation: {
+            /* LARGE_INTEGER AllocationSize -- same layout on both sides. NT
+             * truncates a file whose allocation drops below its end; growing
+             * the allocation is only a reservation, which a host file system
+             * makes on its own. RalliSport Challenge 2 sets it before copying
+             * a disc archive into the Z: cache. */
+            const LARGE_INTEGER *alloc = (const LARGE_INTEGER *)FileInformation;
+            struct stat st;
+            if (fstat(fd, &st) != 0)
+                return STATUS_UNSUCCESSFUL;
+            if (alloc->QuadPart < (LONGLONG)st.st_size
+                    && ftruncate(fd, (off_t)alloc->QuadPart) != 0)
+                return STATUS_UNSUCCESSFUL;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = 0;
+            return STATUS_SUCCESS;
+        }
         default:
             /* stderr, not xbox_log: WARN is filtered out by default, and an
              * unimplemented info class is exactly the kind of silent gap that
@@ -1064,6 +1147,25 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
             fflush(stderr);
             return STATUS_NOT_IMPLEMENTED;
     }
+}
+
+NTSTATUS xbox_RenameOpenFile(HANDLE FileHandle, const xbox_host_char *new_host_path,
+                             BOOLEAN ReplaceIfExists)
+{
+    const char *old = w32_handle_path(FileHandle);
+    struct stat st;
+
+    if (!old || !new_host_path)
+        return STATUS_INVALID_HANDLE;
+    if (!ReplaceIfExists && stat(new_host_path, &st) == 0)
+        return STATUS_OBJECT_NAME_COLLISION;
+    if (rename(old, new_host_path) != 0) {
+        fprintf(stderr, "  [FILE] rename %s -> %s failed: %s\n",
+                old, new_host_path, strerror(errno));
+        return errno == ENOENT ? STATUS_OBJECT_PATH_NOT_FOUND : STATUS_UNSUCCESSFUL;
+    }
+    w32_handle_set_path(FileHandle, new_host_path);
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(

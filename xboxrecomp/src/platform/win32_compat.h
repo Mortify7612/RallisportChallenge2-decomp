@@ -127,6 +127,8 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 HANDLE      w32_open_handle(int fd, const char *host_path);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
+/* After a rename: the path the handle now names. FALSE if h is not a file. */
+BOOL        w32_handle_set_path(HANDLE h, const char *host_path);
 
 /* ---- Events ----------------------------------------------------------- */
 HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialState, LPCSTR name);
@@ -305,6 +307,16 @@ int   MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption, UINT type);
 #define VK_DOWN      0x28
 #define VK_INSERT    0x2D
 #define VK_DELETE    0x2E
+#define VK_NUMPAD0   0x60
+#define VK_NUMPAD1   0x61
+#define VK_NUMPAD2   0x62
+#define VK_NUMPAD3   0x63
+#define VK_NUMPAD4   0x64
+#define VK_NUMPAD5   0x65
+#define VK_NUMPAD6   0x66
+#define VK_NUMPAD7   0x67
+#define VK_NUMPAD8   0x68
+#define VK_NUMPAD9   0x69
 #define VK_MULTIPLY  0x6A
 #define VK_ADD       0x6B
 #define VK_SUBTRACT  0x6D

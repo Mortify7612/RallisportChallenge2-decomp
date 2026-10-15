@@ -321,9 +321,188 @@ static void xbox_update_tick_count(void)
  * Both Xbox and Windows return LARGE_INTEGER.
  * ============================================================================ */
 
+/* ============================================================================
+ * Frame-locked guest clock (RECOMP_FRAME_CLOCK)
+ *
+ * The title times its simulation with the TSC, the performance counter and
+ * KeTickCount, so every run sees slightly different frame lengths -- and a
+ * rally car's physics turns microseconds into a different line through a
+ * corner. Replaying recorded input (RECOMP_PAD_REPLAY) needs the same game
+ * time on the same frame, so in this mode the guest's clocks advance exactly
+ * one frame period per presented frame (xbox_GuestClockFlip, from the
+ * executor's FLIP_STALL). Within a frame time moves in coarse steps and
+ * stops short of the next frame; when the title stops presenting for long
+ * (a load), real time flows again so no timeout can hang, and the gap is
+ * folded into the base so frames after it are again exactly one period apart.
+ *
+ * On with RECOMP_FRAME_CLOCK=1, and by default whenever input is recorded or
+ * replayed. Off: the guest sees the host's clock, as before.
+ * ============================================================================ */
+#define GC_PERIOD_NS   16666667ull      /* 1/60 s */
+#define GC_STEP_NS     50000ull         /* in-frame: per read, per thread */
+#define GC_STALL_NS    100000000ull     /* no flip for this long: time flows */
+#define GC_STALL_RATE  8ull             /* ... at 1/8 speed, rounded to frames */
+
+static int gc_mode = -1;
+static volatile uint64_t gc_flip_real;  /* host ns at the last flip */
+static volatile uint64_t gc_base;       /* guest ns at that flip */
+static volatile uint64_t gc_last;       /* latest value handed out */
+static volatile uint32_t gc_frame;      /* flips seen by the clock */
+#if defined(_MSC_VER)
+#define GC_TLS __declspec(thread)
+#else
+#define GC_TLS __thread
+#endif
+static GC_TLS uint32_t gc_t_frame;      /* this thread: frame of its reads */
+static GC_TLS uint64_t gc_t_reads;      /* ... how many in that frame     */
+static GC_TLS uint64_t gc_t_last;       /* ... and the last value it saw  */
+
+static uint64_t gc_real_ns(void)
+{
+    static LARGE_INTEGER freq;
+    LARGE_INTEGER now;
+    if (freq.QuadPart == 0)
+        QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)now.QuadPart / (uint64_t)freq.QuadPart * 1000000000ull
+         + (uint64_t)now.QuadPart % (uint64_t)freq.QuadPart * 1000000000ull
+           / (uint64_t)freq.QuadPart;
+}
+
+static int gc_enabled(void)
+{
+    if (gc_mode < 0) {
+        const char *e = getenv("RECOMP_FRAME_CLOCK");
+        if (e && *e)
+            gc_mode = strcmp(e, "0") != 0;
+        else
+            gc_mode = (getenv("RECOMP_PAD_RECORD") && *getenv("RECOMP_PAD_RECORD"))
+                   || (getenv("RECOMP_PAD_REPLAY") && *getenv("RECOMP_PAD_REPLAY"));
+        if (gc_mode)
+            fprintf(stderr, "  [CLOCK] frame-locked guest clock (60 Hz)\n");
+    }
+    return gc_mode;
+}
+
+/* Guest nanoseconds since the clock started. */
+uint64_t xbox_GuestClockNs(void)
+{
+    static uint64_t origin;
+    uint64_t real, g;
+    if (!origin)
+        origin = gc_real_ns() - 1;
+    real = gc_real_ns() - origin;
+    if (!gc_enabled() || !gc_flip_real) {
+        g = real;                                 /* before the first frame */
+    } else {
+        uint64_t e = real - (gc_flip_real - origin);
+        if (real < gc_flip_real - origin)
+            e = 0;
+        uint32_t f = __atomic_load_n(&gc_frame, __ATOMIC_ACQUIRE);
+        if (gc_t_frame != f) {
+            gc_t_frame = f;
+            gc_t_reads = 0;
+        }
+        if (e < GC_STALL_NS) {
+            /* Within a frame each read moves this thread's clock one small
+             * step: a spin on the clock still ends, and the title's own reads
+             * see the same values every run -- real elapsed time would put
+             * them wherever the scheduler happened to. */
+            uint64_t q = ++gc_t_reads * GC_STEP_NS;
+            if (q > GC_PERIOD_NS - GC_STEP_NS)
+                q = GC_PERIOD_NS - GC_STEP_NS;
+            g = gc_base + q;
+        } else {
+            /* A load: keep time moving so nothing spinning on it hangs, but
+             * slowly, so how long the load really took barely shows. */
+            g = gc_base + (GC_PERIOD_NS - GC_STEP_NS)
+              + (e - GC_STALL_NS) / GC_STALL_RATE;
+        }
+    }
+    if (g < gc_t_last)                         /* monotonic per thread */
+        g = gc_t_last;
+    gc_t_last = g;
+    if (g > __atomic_load_n(&gc_last, __ATOMIC_ACQUIRE))
+        __atomic_store_n(&gc_last, g, __ATOMIC_RELEASE);
+    return g;
+}
+
+/* What ticks the clock: the executor's flips by default; a title that can
+ * name its own once-a-frame call (xbox_GuestClockGameFrame) takes over, and
+ * then the GPU thread falling behind or catching up -- a shader compile, a
+ * texture upload -- no longer shows in the game's time at all. */
+static volatile int gc_game_driven;
+static void gc_tick(void);
+
+void xbox_GuestClockFlip(void)
+{
+    if (!gc_enabled() || gc_game_driven)
+        return;
+    gc_tick();
+}
+
+void xbox_GuestClockGameFrame(void)
+{
+    if (!gc_enabled())
+        return;
+    if (!gc_game_driven) {
+        gc_game_driven = 1;
+        fprintf(stderr, "  [CLOCK] ticked by the game's own frame loop\n");
+    }
+    gc_tick();
+}
+
+/* A frame went by: guest time moves to the next frame boundary. */
+static void gc_tick(void)
+{
+    static uint64_t origin_seen;
+    uint64_t real;
+    (void)origin_seen;
+    xbox_GuestClockNs();                       /* establishes the origin */
+    real = gc_real_ns();
+    if (!gc_flip_real) {
+        gc_base = xbox_GuestClockNs();
+    } else {
+        uint64_t e = real - gc_flip_real;
+        uint64_t next = gc_base + GC_PERIOD_NS;
+        if (e >= GC_STALL_NS) {
+            /* A stall: what it added, rounded to whole frames -- a load a few
+             * milliseconds longer or shorter than last run then gives the
+             * game the same time, and the same frame starts the race. */
+            uint64_t add = (GC_PERIOD_NS - GC_STEP_NS)
+                         + (e - GC_STALL_NS) / GC_STALL_RATE;
+            /* Up to the next whole frame: nothing handed out during the
+             * stall can exceed gc_base + add, so this stays monotonic
+             * without consulting what other threads happened to read. */
+            uint64_t frames = (add + GC_PERIOD_NS - 1) / GC_PERIOD_NS;
+            next = gc_base + (frames ? frames : 1) * GC_PERIOD_NS;
+        }
+        {
+            static int trace = -1;
+            if (trace < 0)
+                trace = getenv("RECOMP_CLOCK_TRACE") != NULL;
+            if (trace && e >= 40000000ull)
+                fprintf(stderr, "  [CLOCK] %llu ms between frames (frame %llu)\n",
+                        (unsigned long long)(e / 1000000ull), (unsigned long long)(gc_base / GC_PERIOD_NS));
+        }
+        gc_base = next;
+    }
+    gc_flip_real = real;
+    __atomic_add_fetch(&gc_frame, 1, __ATOMIC_RELEASE);
+}
+
 LARGE_INTEGER __stdcall xbox_KeQueryPerformanceCounter(void)
 {
     LARGE_INTEGER counter;
+    if (gc_enabled()) {
+        static LARGE_INTEGER freq;
+        uint64_t ns = xbox_GuestClockNs();
+        if (freq.QuadPart == 0)
+            QueryPerformanceFrequency(&freq);
+        counter.QuadPart = (LONGLONG)(ns / 1000000000ull * (uint64_t)freq.QuadPart
+                         + ns % 1000000000ull * (uint64_t)freq.QuadPart / 1000000000ull);
+        return counter;
+    }
     QueryPerformanceCounter(&counter);
     return counter;
 }
@@ -1033,6 +1212,12 @@ uint64_t xbox_ReadTimeStampCounter(void)
     static LARGE_INTEGER freq;
     static LARGE_INTEGER origin;
     LARGE_INTEGER now;
+
+    if (gc_enabled()) {
+        uint64_t ns = xbox_GuestClockNs();
+        return ns / 1000000000ull * XBOX_TSC_HZ
+             + ns % 1000000000ull * XBOX_TSC_HZ / 1000000000ull;
+    }
 
     if (freq.QuadPart == 0) {
         QueryPerformanceFrequency(&freq);

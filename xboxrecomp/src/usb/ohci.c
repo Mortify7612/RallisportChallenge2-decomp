@@ -498,6 +498,9 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * again, forever. */
 static uint32_t bus_resolve(uint32_t addr)
 {
+    uint32_t va;
+    if (xbox_PhysUntag(addr, &va))
+        return va;
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())
@@ -639,6 +642,16 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * engine-rev rumble on the Crash countdown and then paused with the
          * pad unresponsive. */
         moved = len;
+        /* Rumble reaches the pad either way the driver sends it: as an
+         * interrupt OUT on endpoint 2, or as the data stage of a HID
+         * SET_REPORT (21 09) on the control pipe. Hand both to the host. */
+        if (len >= 6 && (endpoint != 0
+                         || (g_setup_pending && g_setup.bmRequestType == 0x21
+                             && g_setup.bRequest == 0x09))) {
+            const uint8_t *p = guest_ptr(cbp, (uint32_t)len);
+            if (p)
+                usb_gamepad_rumble(pad, p, len);
+        }
         if (endpoint == 0) {
             g_setup_pending = 0;
             s_n_out_ep0++;
@@ -1278,7 +1291,7 @@ void xbox_OhciInit(void)
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 
-#if defined(_WIN32)
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
     /* The registers have to fault to be answered. The MCPX aperture is mapped
      * as plain committed memory, so both blocks are made inaccessible here and
      * the title's VEH routes the faults back to xbox_OhciHandleMmio.
@@ -1314,7 +1327,7 @@ void xbox_OhciInit(void)
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
-#if defined(_WIN32)
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
     {
         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
@@ -1342,7 +1355,7 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
 
 int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 {
-#if defined(_WIN32)
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
     OhciController *hc = hc_for(xbox_va);
     int ok;
 

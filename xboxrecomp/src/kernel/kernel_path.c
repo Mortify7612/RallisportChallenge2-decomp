@@ -482,6 +482,8 @@ translate:
 
 #include <unistd.h>
 #include <stdlib.h>
+#include <strings.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <errno.h>
@@ -553,6 +555,74 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
              s_game_dir, s_save_dir);
 }
 
+/* Resolve the components of path after its first `keep` bytes against the
+ * file system without regard to case, in place.
+ *
+ * FATX and the disc's file system are case-insensitive, and titles rely on
+ * it: RalliSport Challenge 2 ships Locale/English next to Locale/french and
+ * asks for both however its tables spell them. On Windows that is free; on
+ * Linux an exact-case miss is ERROR_FILE_NOT_FOUND. Each component that does
+ * not exist as written is replaced by a directory entry that matches it
+ * ignoring case. Resolution stops at the first component with no match at
+ * all, which leaves the rest as given -- the right result for a file the
+ * title is about to create. */
+static void resolve_case_insensitive(char *path, size_t keep)
+{
+    struct stat st;
+    char *comp, *slash;
+
+    if (stat(path, &st) == 0 || keep >= strlen(path))
+        return;
+    comp = path + keep;
+    while (*comp == '/')
+        comp++;
+    while (*comp) {
+        char saved;
+        slash = strchr(comp, '/');
+        saved = slash ? *slash : '\0';
+        if (slash)
+            *slash = '\0';
+        if (stat(path, &st) != 0) {
+            DIR *d;
+            struct dirent *de;
+            int found = 0;
+            /* comp[-1] is the separator before this component */
+            comp[-1] = '\0';
+            d = opendir(comp - 1 == path ? "/" : path);
+            comp[-1] = '/';
+            if (d) {
+                while ((de = readdir(d)) != NULL) {
+                    if (strcasecmp(de->d_name, comp) == 0
+                            && strlen(de->d_name) == strlen(comp)) {
+                        memcpy(comp, de->d_name, strlen(comp));
+                        found = 1;
+                        break;
+                    }
+                }
+                closedir(d);
+            }
+            if (!found) {
+                if (slash)
+                    *slash = saved;
+                return;
+            }
+        }
+        if (!slash)
+            return;
+        *slash = saved;
+        comp = slash + 1;
+    }
+}
+
+/* What the last translation produced, for xbox_LastHostPath. */
+static void xbox_remember_host_path(const char *p)
+{
+    size_t i;
+    for (i = 0; p && p[i] && i < MAX_PATH - 1; i++)
+        s_last_host_path_shared[i] = (wchar_t)(unsigned char)p[i];
+    s_last_host_path_shared[i] = 0;
+}
+
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size)
 {
     const char* remainder = NULL;
@@ -590,6 +660,12 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     return TRUE;
 
 translate:
+    /* Same as the Win32 backend: the [FILE] line the bridge prints after the
+     * open is paired with this one. */
+    if (g_xbox_path_hook)
+        g_xbox_path_hook(xbox_path);
+    fprintf(stderr, "  [PATH] %s\n", xbox_path);
+    fflush(stderr);
     {
         char remainder_posix[MAX_PATH];
         snprintf(remainder_posix, sizeof(remainder_posix), "%s", remainder);
@@ -616,7 +692,12 @@ translate:
                 host_path_buf[--n] = '\0';
         }
 
+        /* Everything up to and including the base directory is the host's
+         * own and spelled as configured; only the title's part is folded. */
+        resolve_case_insensitive(host_path_buf, strlen(base_dir));
+
         XBOX_TRACE(XBOX_LOG_PATH, "%s -> %s", xbox_path, host_path_buf);
+        xbox_remember_host_path(host_path_buf);
         return TRUE;
     }
 }

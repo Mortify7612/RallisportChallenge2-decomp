@@ -327,6 +327,88 @@ DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 HANDLE GetCurrentThread(void)   { return t_self_obj ? (HANDLE)t_self_obj : PSEUDO_CURRENT_THREAD; }
 HANDLE GetCurrentProcess(void)  { return PSEUDO_CURRENT_PROCESS; }
 
+/* Live-object registry.
+ *
+ * A HANDLE here is the w32_object's address, and Win32 code -- the kernel HLE
+ * above all -- passes along values that are not handles: a guest dispatcher
+ * object's address that has no host shadow, a token not yet resolved. On
+ * Windows such a value makes the call fail with ERROR_INVALID_HANDLE; here it
+ * was dereferenced, so a stray guest pointer took the process down inside
+ * pthread_mutex_lock (RalliSport Challenge 2's D3D, waiting on a KEVENT it
+ * builds itself). Every handle is checked against the set of live objects
+ * first, which keeps that failure where Windows puts it. Open addressing,
+ * tombstones on free; objects are created far more often than destroyed. */
+#define W32_LIVE_BITS 16
+#define W32_LIVE_SIZE (1u << W32_LIVE_BITS)
+#define W32_LIVE_DEAD ((w32_object *)(uintptr_t)1)
+static w32_object     *s_live[W32_LIVE_SIZE];
+static pthread_mutex_t s_live_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static size_t live_hash(const void *p)
+{
+    uint64_t x = (uint64_t)(uintptr_t)p;
+    x ^= x >> 17;
+    x *= 0x9E3779B97F4A7C15ull;
+    return (size_t)(x >> (64 - W32_LIVE_BITS));
+}
+
+static void live_insert(w32_object *o)
+{
+    size_t i = live_hash(o), n;
+    pthread_mutex_lock(&s_live_lock);
+    for (n = 0; n < W32_LIVE_SIZE; n++, i = (i + 1) & (W32_LIVE_SIZE - 1)) {
+        if (!s_live[i] || s_live[i] == W32_LIVE_DEAD) {
+            s_live[i] = o;
+            break;
+        }
+    }
+    if (n == W32_LIVE_SIZE) {
+        static int warned;
+        if (!warned++)
+            fprintf(stderr, "[win32_compat] handle registry full: "
+                            "handle validation degraded\n");
+    }
+    pthread_mutex_unlock(&s_live_lock);
+}
+
+static void live_remove(w32_object *o)
+{
+    size_t i = live_hash(o), n;
+    pthread_mutex_lock(&s_live_lock);
+    for (n = 0; n < W32_LIVE_SIZE && s_live[i]; n++, i = (i + 1) & (W32_LIVE_SIZE - 1)) {
+        if (s_live[i] == o) {
+            s_live[i] = W32_LIVE_DEAD;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&s_live_lock);
+}
+
+/* The object behind h, or NULL (last error ERROR_INVALID_HANDLE) when h is
+ * not a live object of this layer. */
+static w32_object s_process_heap;   /* static, so never registered */
+
+static w32_object *obj_of(HANDLE h)
+{
+    size_t i, n;
+    w32_object *o = (w32_object *)h;
+    if (!o)
+        return NULL;
+    if (o == &s_process_heap)
+        return o;
+    i = live_hash(o);
+    pthread_mutex_lock(&s_live_lock);
+    for (n = 0; n < W32_LIVE_SIZE && s_live[i]; n++, i = (i + 1) & (W32_LIVE_SIZE - 1)) {
+        if (s_live[i] == o) {
+            pthread_mutex_unlock(&s_live_lock);
+            return o;
+        }
+    }
+    pthread_mutex_unlock(&s_live_lock);
+    SetLastError(6u /* ERROR_INVALID_HANDLE */);
+    return NULL;
+}
+
 static w32_object *obj_alloc(w32_kind kind)
 {
     w32_object *o = (w32_object *)calloc(1, sizeof(w32_object));
@@ -335,6 +417,7 @@ static w32_object *obj_alloc(w32_kind kind)
     pthread_mutex_init(&o->lock, NULL);
     pthread_cond_init(&o->cond, NULL);
     pthread_cond_init(&o->gate, NULL);
+    live_insert(o);
     return o;
 }
 
@@ -353,6 +436,7 @@ static void obj_release(w32_object *o)
     pthread_mutex_destroy(&o->lock);
     pthread_cond_destroy(&o->cond);
     pthread_cond_destroy(&o->gate);
+    live_remove(o);
     free(o);
 }
 
@@ -367,14 +451,28 @@ HANDLE w32_open_handle(int fd, const char *host_path)
 
 int w32_handle_fd(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     return (o && o->kind == K_FILE) ? o->fd : -1;
 }
 
 const char *w32_handle_path(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
+}
+
+BOOL w32_handle_set_path(HANDLE h, const char *host_path)
+{
+    w32_object *o = obj_of(h);
+    char *dup;
+    if (!o || o->kind != K_FILE || !host_path)
+        return FALSE;
+    dup = strdup(host_path);
+    if (!dup)
+        return FALSE;
+    free(o->file_path);
+    o->file_path = dup;
+    return TRUE;
 }
 
 BOOL CloseHandle(HANDLE h)
@@ -382,7 +480,12 @@ BOOL CloseHandle(HANDLE h)
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
         h == INVALID_HANDLE_VALUE)
         return TRUE;
-    obj_release((w32_object *)h);
+    {
+        w32_object *o = obj_of(h);
+        if (!o)
+            return FALSE;
+        obj_release(o);
+    }
     return TRUE;
 }
 
@@ -394,7 +497,8 @@ BOOL DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc, PHANDLE dst,
     if (src == PSEUDO_CURRENT_THREAD)  src = GetCurrentThread();
     if (src == PSEUDO_CURRENT_PROCESS) { *dst = src; return TRUE; }
     if (src == PSEUDO_CURRENT_THREAD || !src) { *dst = src; return TRUE; }
-    w32_object *o = (w32_object *)src;
+    w32_object *o = obj_of(src);
+    if (!o) return FALSE;
     InterlockedIncrement(&o->refcount);
     *dst = src;
     if (options & DUPLICATE_CLOSE_SOURCE)
@@ -514,7 +618,12 @@ DWORD WaitForSingleObject(HANDLE h, DWORD ms)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS)
         return WAIT_OBJECT_0;
-    return wait_single((w32_object *)h, ms);
+    {
+        w32_object *o = obj_of(h);
+        if (!o)
+            return WAIT_FAILED;
+        return wait_single(o, ms);
+    }
 }
 
 DWORD WaitForSingleObjectEx(HANDLE h, DWORD ms, BOOL alertable)
@@ -539,6 +648,11 @@ DWORD WaitForMultipleObjectsEx(DWORD count, const HANDLE *handles, BOOL waitAll,
     struct timespec ts;
     int timed = (ms != INFINITE);
     if (timed) deadline_from_ms(ms, &ts);
+
+    for (DWORD i = 0; i < count; i++)
+        if (handles[i] != PSEUDO_CURRENT_THREAD && handles[i] != PSEUDO_CURRENT_PROCESS
+                && !obj_of(handles[i]))
+            return WAIT_FAILED;
 
     for (;;) {
         if (alertable && drain_apcs() > 0)
@@ -586,7 +700,7 @@ HANDLE CreateEventW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, BOOL initialStat
 
 BOOL SetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -597,7 +711,7 @@ BOOL SetEvent(HANDLE h)
 
 BOOL ResetEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 0;
@@ -607,7 +721,7 @@ BOOL ResetEvent(HANDLE h)
 
 BOOL PulseEvent(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     if (!o || o->kind != K_EVENT) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->signaled = 1;
@@ -637,7 +751,7 @@ HANDLE CreateSemaphoreW(LPSECURITY_ATTRIBUTES sa, LONG initial, LONG maximum, LP
 
 BOOL ReleaseSemaphore(HANDLE h, LONG releaseCount, PLONG previousCount)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     if (!o || o->kind != K_SEM) return FALSE;
     pthread_mutex_lock(&o->lock);
     if (previousCount) *previousCount = (LONG)o->sem_count;
@@ -667,7 +781,7 @@ HANDLE CreateMutexW(LPSECURITY_ATTRIBUTES sa, BOOL initialOwner, LPCWSTR name)
 
 BOOL ReleaseMutex(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     if (!o || o->kind != K_MUTEX) {
         SetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
@@ -764,7 +878,7 @@ VOID ExitThread(DWORD exitCode)
 
 BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     if (!o || o->kind != K_THREAD || !exitCode) return FALSE;
     pthread_mutex_lock(&o->lock);
     *exitCode = o->exited ? o->exit_code : STILL_ACTIVE;
@@ -774,7 +888,7 @@ BOOL GetExitCodeThread(HANDLE h, LPDWORD exitCode)
 
 DWORD ResumeThread(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -788,7 +902,7 @@ DWORD SuspendThread(HANDLE h)
 {
     /* True mid-run suspension is not supported on POSIX; only the
      * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     if (!o || o->kind != K_THREAD) return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
@@ -799,7 +913,7 @@ DWORD SuspendThread(HANDLE h)
 
 BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     if (!o || o->kind != K_THREAD) return FALSE;
     pthread_cancel(o->thread);
     pthread_mutex_lock(&o->lock);
@@ -813,14 +927,14 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 
 BOOL SetThreadPriority(HANDLE h, int priority)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_of(h);
     if (o && o->kind == K_THREAD) o->priority = priority;
     return TRUE;   /* real RT priorities need privileges; tracked only */
 }
 
 int GetThreadPriority(HANDLE h)
 {
-    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_of(h);
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
 }
 
@@ -828,7 +942,7 @@ VOID SwitchToThread(void) { sched_yield(); }
 
 DWORD QueueUserAPC(PAPCFUNC func, HANDLE thread, ULONG_PTR data)
 {
-    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)thread;
+    w32_object *o = (thread == PSEUDO_CURRENT_THREAD) ? t_self_obj : obj_of(thread);
     if (!o || o->kind != K_THREAD) return 0;
     pthread_mutex_lock(&o->lock);
     DWORD ok = 0;
@@ -923,7 +1037,7 @@ BOOL CreateTimerQueueTimer(PHANDLE newTimer, HANDLE timerQueue,
 BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG period)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
+    w32_object *o = obj_of(timer);
     if (!o || o->kind != K_TIMER) return FALSE;
     o->timer_due    = dueTime;
     o->timer_period = period;
@@ -933,7 +1047,7 @@ BOOL ChangeTimerQueueTimer(HANDLE timerQueue, HANDLE timer, ULONG dueTime, ULONG
 BOOL DeleteTimerQueueTimer(HANDLE timerQueue, HANDLE timer, HANDLE completionEvent)
 {
     (void)timerQueue;
-    w32_object *o = (w32_object *)timer;
+    w32_object *o = obj_of(timer);
     if (!o || o->kind != K_TIMER) return FALSE;
     o->timer_cancel = 1;
     if (completionEvent) SetEvent(completionEvent);
@@ -980,7 +1094,7 @@ HANDLE CreateWaitableTimerW(LPSECURITY_ATTRIBUTES sa, BOOL manualReset, LPCWSTR 
 BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
                       PTIMERAPCROUTINE completion, PVOID arg, BOOL resume)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     (void)completion; (void)arg; (void)resume;
     if (!o || o->kind != K_WAITABLE_TIMER || !dueTime) return FALSE;
     pthread_mutex_lock(&o->lock);
@@ -1012,7 +1126,7 @@ BOOL SetWaitableTimer(HANDLE h, const LARGE_INTEGER *dueTime, LONG period,
 
 BOOL CancelWaitableTimer(HANDLE h)
 {
-    w32_object *o = (w32_object *)h;
+    w32_object *o = obj_of(h);
     if (!o || o->kind != K_WAITABLE_TIMER) return FALSE;
     pthread_mutex_lock(&o->lock);
     o->waitable_triggered = 0;
@@ -1025,7 +1139,7 @@ BOOL CancelWaitableTimer(HANDLE h)
 /* Heap (thin wrapper over malloc; the single process heap)              */
 /* ===================================================================== */
 
-static w32_object s_process_heap = { .kind = K_HEAP };
+static w32_object s_process_heap = { .kind = K_HEAP };  /* see obj_of */
 
 HANDLE GetProcessHeap(void)                       { return (HANDLE)&s_process_heap; }
 HANDLE HeapCreate(DWORD o, SIZE_T i, SIZE_T m)    { (void)o;(void)i;(void)m; return (HANDLE)&s_process_heap; }
@@ -1640,7 +1754,7 @@ HANDLE CreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
 LPVOID MapViewOfFileEx(HANDLE mapping, DWORD access, DWORD offHigh, DWORD offLow,
                        SIZE_T count, LPVOID baseAddr)
 {
-    w32_object *o = (w32_object *)mapping;
+    w32_object *o = obj_of(mapping);
     if (!o || o->kind != K_FILEMAP) { SetLastError(ERROR_INVALID_HANDLE); return NULL; }
 
     off_t  off = ((off_t)offHigh << 32) | offLow;
@@ -1912,8 +2026,156 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
 }
 
+#if defined(__linux__) && defined(__x86_64__)
+#include <ucontext.h>
+
+/* Vectored exception handlers over sigaction.
+ *
+ * A hardware fault arrives as a signal; it is translated to the
+ * EXCEPTION_RECORD/CONTEXT pair a Win32 VEH expects, the handlers run in
+ * order, and one returning EXCEPTION_CONTINUE_EXECUTION has its CONTEXT
+ * (an advanced Rip, an MMIO read's destination register) written back into
+ * the ucontext, which is what resumes the faulting thread. When every handler
+ * declines, the default disposition is restored and the fault re-executes,
+ * so the process still dies with the signal and a core dump.
+ *
+ * Registration is not thread-safe against a concurrent fault: handlers are
+ * installed during boot, before guest code runs. */
+#define VEH_MAX 16
+static PVECTORED_EXCEPTION_HANDLER s_veh[VEH_MAX];
+static int s_veh_count;
+static int s_veh_installed;
+
+static const int s_veh_gregs[16] = {
+    REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
+    REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15,
+};
+
+static DWORD veh_code(int sig, int si_code)
+{
+    switch (sig) {
+    case SIGSEGV: case SIGBUS: return EXCEPTION_ACCESS_VIOLATION;
+    case SIGILL:               return EXCEPTION_ILLEGAL_INSTRUCTION;
+    case SIGTRAP:              return EXCEPTION_SINGLE_STEP;
+    case SIGFPE:
+        switch (si_code) {
+        case FPE_INTDIV: return EXCEPTION_INT_DIVIDE_BY_ZERO;
+        case FPE_FLTDIV: return EXCEPTION_FLT_DIVIDE_BY_ZERO;
+        case FPE_FLTOVF: return EXCEPTION_FLT_OVERFLOW;
+        case FPE_FLTUND: return EXCEPTION_FLT_UNDERFLOW;
+        case FPE_FLTRES: return EXCEPTION_FLT_INEXACT_RESULT;
+        default:         return EXCEPTION_FLT_INVALID_OPERATION;
+        }
+    }
+    return EXCEPTION_ACCESS_VIOLATION;
+}
+
+static void veh_signal(int sig, siginfo_t *si, void *ucv)
+{
+    ucontext_t *uc = (ucontext_t *)ucv;
+    greg_t *g = uc->uc_mcontext.gregs;
+    EXCEPTION_RECORD rec;
+    CONTEXT ctx;
+    EXCEPTION_POINTERS ep;
+    uint64_t *r = &ctx.Rax;
+    int i, saved_errno = errno;
+
+    memset(&rec, 0, sizeof(rec));
+    rec.ExceptionCode = veh_code(sig, si->si_code);
+    rec.ExceptionAddress = (PVOID)(uintptr_t)g[REG_RIP];
+    if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        /* Page-fault error code bit 1: the access was a write. */
+        rec.NumberParameters = 2;
+        rec.ExceptionInformation[0] = (g[REG_ERR] & 2) ? 1 : 0;
+        rec.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
+    }
+
+    for (i = 0; i < 16; i++)
+        r[i] = (uint64_t)g[s_veh_gregs[i]];
+    ctx.Rip = (uint64_t)g[REG_RIP];
+    ctx.EFlags = (uint32_t)g[REG_EFL];
+
+    ep.ExceptionRecord = &rec;
+    ep.ContextRecord = &ctx;
+
+    for (i = 0; i < s_veh_count; i++) {
+        if (s_veh[i] && s_veh[i](&ep) == EXCEPTION_CONTINUE_EXECUTION) {
+            int k;
+            for (k = 0; k < 16; k++)
+                g[s_veh_gregs[k]] = (greg_t)r[k];
+            g[REG_RIP] = (greg_t)ctx.Rip;
+            g[REG_EFL] = (greg_t)((g[REG_EFL] & ~0xFFFFFFFFLL) | ctx.EFlags);
+            errno = saved_errno;
+            return;
+        }
+    }
+
+    /* Nobody took it: re-fault under the default action. */
+    signal(sig, SIG_DFL);
+    errno = saved_errno;
+}
+
+/* A stack overflow faults on the stack it overflowed, so the handler needs
+ * one of its own. Only the calling (boot) thread gets it; other threads still
+ * reach the handler for every fault but a stack overflow on them. */
+static void veh_install(void)
+{
+    /* SIGTRAP is EXCEPTION_SINGLE_STEP: a handler that unprotects a page to
+     * let one trapped write through sets TF and re-protects on the step
+     * (the AC'97 and watch handlers in xbox_memory_layout.c). */
+    static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP };
+    struct sigaction sa;
+    stack_t ss;
+    size_t k;
+
+    ss.ss_size = 256 * 1024;
+    ss.ss_sp = malloc(ss.ss_size);
+    ss.ss_flags = 0;
+    if (ss.ss_sp)
+        sigaltstack(&ss, NULL);
+
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = veh_signal;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    for (k = 0; k < sizeof(sigs) / sizeof(sigs[0]); k++)
+        sigaction(sigs[k], &sa, NULL);
+    s_veh_installed = 1;
+}
+
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
-{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to sigaction */
+{
+    if (!Handler || s_veh_count >= VEH_MAX)
+        return NULL;
+    if (!s_veh_installed)
+        veh_install();
+    if (First) {
+        memmove(&s_veh[1], &s_veh[0], (size_t)s_veh_count * sizeof(s_veh[0]));
+        s_veh[0] = Handler;
+    } else {
+        s_veh[s_veh_count] = Handler;
+    }
+    s_veh_count++;
+    return (PVOID)Handler;
+}
+
+ULONG RemoveVectoredExceptionHandler(PVOID h)
+{
+    int i;
+    for (i = 0; i < s_veh_count; i++) {
+        if ((PVOID)s_veh[i] == h) {
+            memmove(&s_veh[i], &s_veh[i + 1],
+                    (size_t)(s_veh_count - i - 1) * sizeof(s_veh[0]));
+            s_veh_count--;
+            return 1;
+        }
+    }
+    return 0;
+}
+#else
+PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
+{ (void)First; (void)Handler; return NULL; }   /* TODO: wire to Mach exceptions */
 ULONG RemoveVectoredExceptionHandler(PVOID h) { (void)h; return 1; }
+#endif
 
 #endif /* !_WIN32 */

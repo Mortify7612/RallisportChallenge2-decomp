@@ -28,8 +28,14 @@
 
 #include <stdint.h>
 
+/* Win32, and Linux x86-64 where the sigaction VEH in win32_compat.c hands
+ * handlers the same CONTEXT fields. */
+#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
 #if defined(_WIN32)
 #include <windows.h>
+#else
+#include "win32_compat.h"
+#endif
 
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
@@ -186,7 +192,105 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
         ctx->Rip += prefix + 1 + mlen;
         return 1;
 
+    /* ALU r, r/m: the register is the destination and the device the
+     * source -- `ecx &= MEM32(base + off)`. 0B OR, 23 AND, 03 ADD, 2B SUB,
+     * 33 XOR, 3B CMP (no write); the 8-bit forms one below each. */
+    case 0x02: case 0x03: case 0x0A: case 0x0B: case 0x22: case 0x23:
+    case 0x2A: case 0x2B: case 0x32: case 0x33: case 0x3A: case 0x3B: {
+        uint64_t m, r, res, mask, *dst;
+        int kind = op[0] & 0xF8, cf = 0;
+        if ((op[0] & 1) == 0) size = 1;
+        mlen = mmio_modrm_len(op + 1, rex_b);
+        reg  = ((op[1] >> 3) & 7) | (rex_r ? 8 : 0);
+        mask = size < 8 ? (1ULL << (size * 8)) - 1 : ~0ULL;
+        m    = rd(dev, off, size) & mask;
+        dst  = mmio_ctx_reg(ctx, reg);
+        r    = *dst & mask;
+        switch (kind) {
+        case 0x00: res = r + m; cf = (res & mask) < r; break;   /* ADD */
+        case 0x08: res = r | m; break;                          /* OR  */
+        case 0x20: res = r & m; break;                          /* AND */
+        case 0x28: case 0x38: res = r - m; cf = r < m; break;   /* SUB CMP */
+        default:   res = r ^ m; break;                          /* XOR */
+        }
+        res &= mask;
+        mmio_set_flags(ctx, res, size, cf);
+        if (kind != 0x38) {
+            if (size == 1)      *dst = (*dst & ~0xFFULL)   | res;
+            else if (size == 2) *dst = (*dst & ~0xFFFFULL) | res;
+            else                *dst = res;          /* 32-bit clears high */
+        }
+        ctx->Rip += prefix + 1 + mlen;
+        return 1;
+    }
+
+    /* GCC folds `MEM32(x) & mask` into TEST with an immediate and
+     * `MEM32(x) |= bit` into an ALU op on memory, so a lifted driver reaches
+     * a device through these as often as through MOV. */
+    case 0xF6: case 0xF7: {                          /* TEST r/m, imm (/0)  */
+        uint64_t imm;
+        int ilen;
+        if (((op[1] >> 3) & 7) != 0)
+            return 0;
+        if (op[0] == 0xF6) size = 1;
+        mlen = mmio_modrm_len(op + 1, rex_b);
+        ilen = size == 1 ? 1 : size == 2 ? 2 : 4;
+        imm = ilen == 1 ? op[1 + mlen]
+            : ilen == 2 ? *(const uint16_t *)(op + 1 + mlen)
+            : (uint64_t)(int64_t)*(const int32_t *)(op + 1 + mlen);
+        mmio_set_flags(ctx, rd(dev, off, size) & imm, size, 0);
+        ctx->Rip += prefix + 1 + mlen + ilen;
+        return 1;
+    }
+
+    case 0x80: case 0x81: case 0x83: {               /* ALU r/m, imm        */
+        int ext = (op[1] >> 3) & 7, ilen, cf = 0;
+        uint64_t imm, m, r, mask;
+        if (ext == 2 || ext == 3)                    /* ADC/SBB need CF in  */
+            return 0;
+        if (op[0] == 0x80) size = 1;
+        mlen = mmio_modrm_len(op + 1, rex_b);
+        ilen = op[0] == 0x81 ? (size == 2 ? 2 : 4) : 1;
+        if (op[0] == 0x81)
+            imm = size == 2 ? *(const uint16_t *)(op + 1 + mlen)
+                : (uint64_t)(int64_t)*(const int32_t *)(op + 1 + mlen);
+        else if (op[0] == 0x83)
+            imm = (uint64_t)(int64_t)(int8_t)op[1 + mlen];
+        else
+            imm = op[1 + mlen];
+        mask = size < 8 ? (1ULL << (size * 8)) - 1 : ~0ULL;
+        m = rd(dev, off, size) & mask;
+        imm &= mask;
+        switch (ext) {
+        case 0:  r = m + imm; cf = (r & mask) < m; break;
+        case 1:  r = m | imm; break;
+        case 4:  r = m & imm; break;
+        case 5: case 7: r = m - imm; cf = m < imm; break;
+        default: r = m ^ imm; break;
+        }
+        mmio_set_flags(ctx, r & mask, size, cf);
+        if (ext != 7)
+            wr(dev, off, r & mask, size);
+        ctx->Rip += prefix + 1 + mlen + ilen;
+        return 1;
+    }
+
     case 0x0F:
+        if (op[1] == 0xBE || op[1] == 0xBF) {        /* MOVSX r, r/m8|16    */
+            int s2 = (op[1] == 0xBE) ? 1 : 2;
+            uint64_t v, *dst;
+            int64_t sv;
+            mlen = mmio_modrm_len(op + 2, rex_b);
+            reg  = ((op[2] >> 3) & 7) | (rex_r ? 8 : 0);
+            v    = rd(dev, off, s2);
+            sv   = s2 == 1 ? (int64_t)(int8_t)v : (int64_t)(int16_t)v;
+            dst  = mmio_ctx_reg(ctx, reg);
+            if (has66)      *dst = (*dst & ~0xFFFFULL) | ((uint64_t)sv & 0xFFFF);
+            else if (rex_w) *dst = (uint64_t)sv;
+            else            *dst = (uint64_t)sv & 0xFFFFFFFFULL;
+            ctx->Rip += prefix + 2 + mlen;
+            return 1;
+        }
         if (op[1] == 0xB6 || op[1] == 0xB7) {        /* MOVZX r32, r/m8|16   */
             int s = (op[1] == 0xB6) ? 1 : 2;
             mlen  = mmio_modrm_len(op + 2, rex_b);
@@ -202,5 +306,5 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-#endif /* _WIN32 */
+#endif /* _WIN32 || linux x86-64 */
 #endif /* MMIO_DECODE_H */

@@ -454,9 +454,95 @@ static RECOMP_TLS int g_is_spawned_thread = 0;
  * path is the rare one. */
 static RECOMP_TLS uint32_t g_thread_stack_top = 0;
 
+/* The guest's view of a spawned thread: a KTHREAD-shaped block in guest
+ * memory that ObReferenceObjectByHandle hands back for the thread's handle.
+ *
+ * XAPI reads it directly. GetExitCodeThread references the handle, then takes
+ * Header.SignalState (+4) as "has it finished" and ETHREAD.ExitStatus
+ * (+0x120) as the code -- STILL_ACTIVE otherwise. The bridge used to answer
+ * every reference with a NULL object, so the read landed on guest page 0 and
+ * a thread never finished: RalliSport Challenge 2 starts each stage load on a
+ * thread and polls GetExitCodeThread for exit code 1, and sat on its LOADING
+ * screen forever with the loader long gone.
+ *
+ * Only what XAPI reads is kept: the dispatcher header's type and signal state,
+ * and the exit status. Waits on thread handles still go to the host thread. */
+#define GUEST_THREAD_OBJ_SIZE   0x140u
+#define GUEST_THREAD_EXIT_OFF   0x120u
+#define GUEST_THREAD_OBJ_MAX    256
+static struct { HANDLE host; uint32_t obj; } s_thread_objs[GUEST_THREAD_OBJ_MAX];
+static SRWLOCK s_thread_objs_lock = SRWLOCK_INIT;
+static RECOMP_TLS uint32_t g_thread_obj = 0;   /* this thread's, if spawned */
+
+static uint32_t guest_thread_obj_new(void)
+{
+    uint32_t obj = xbox_HeapAlloc(GUEST_THREAD_OBJ_SIZE, 16);
+    if (obj) {
+        memset((void *)XBOX_TO_NATIVE(obj), 0, GUEST_THREAD_OBJ_SIZE);
+        BRIDGE_MEM8(obj + 0) = 6;                         /* ThreadObject */
+        BRIDGE_MEM8(obj + 2) = (uint8_t)(GUEST_THREAD_OBJ_SIZE / 4);
+    }
+    return obj;
+}
+
+static void guest_thread_obj_bind(HANDLE host, uint32_t obj)
+{
+    int i;
+    if (!host || !obj)
+        return;
+    AcquireSRWLockExclusive(&s_thread_objs_lock);
+    for (i = 0; i < GUEST_THREAD_OBJ_MAX; i++)
+        if (!s_thread_objs[i].host) {
+            s_thread_objs[i].host = host;
+            s_thread_objs[i].obj = obj;
+            break;
+        }
+    ReleaseSRWLockExclusive(&s_thread_objs_lock);
+}
+
+static uint32_t guest_thread_obj_find(HANDLE host)
+{
+    uint32_t obj = 0;
+    int i;
+    if (!host)
+        return 0;
+    AcquireSRWLockShared(&s_thread_objs_lock);
+    for (i = 0; i < GUEST_THREAD_OBJ_MAX; i++)
+        if (s_thread_objs[i].host == host) {
+            obj = s_thread_objs[i].obj;
+            break;
+        }
+    ReleaseSRWLockShared(&s_thread_objs_lock);
+    return obj;
+}
+
+static void guest_thread_obj_unbind(HANDLE host)
+{
+    int i;
+    if (!host)
+        return;
+    AcquireSRWLockExclusive(&s_thread_objs_lock);
+    for (i = 0; i < GUEST_THREAD_OBJ_MAX; i++)
+        if (s_thread_objs[i].host == host)
+            s_thread_objs[i].host = NULL;   /* the block itself is left: a
+                                             * reference may still hold it */
+    ReleaseSRWLockExclusive(&s_thread_objs_lock);
+}
+
+/* The calling thread is finishing: publish its exit status, then signal. */
+static void guest_thread_obj_exit(uint32_t status)
+{
+    if (!g_thread_obj)
+        return;
+    BRIDGE_MEM32(g_thread_obj + GUEST_THREAD_EXIT_OFF) = status;
+    __atomic_store_n((uint32_t *)XBOX_TO_NATIVE(g_thread_obj + 4), 1u,
+                     __ATOMIC_SEQ_CST);
+    g_thread_obj = 0;
+}
+
 struct bridge_thread_start {
     recomp_func_t fn;
-    uint32_t ctx1, ctx2, stack_top;
+    uint32_t ctx1, ctx2, stack_top, obj;
 };
 
 static void bridge_write_handle(uint32_t handle_va, HANDLE h);
@@ -490,6 +576,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
     g_is_spawned_thread = 1;
     g_esp = s->stack_top;
     g_thread_stack_top = s->stack_top;
+    g_thread_obj = s->obj;
     {
         uint32_t tib = xbox_AllocThreadTib();
         if (tib)
@@ -506,6 +593,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 
     fprintf(stderr, "  [KERNEL] worker thread returned (eax=0x%08X)\n", g_eax);
     fflush(stderr);
+    guest_thread_obj_exit(g_eax);
     /* The routine returned instead of calling PsTerminateSystemThread; the
      * stack is still ours to give back. */
     xbox_FreeThreadStack(g_thread_stack_top);
@@ -518,16 +606,24 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
+    uint32_t obj;
 
     if (!s) return NULL;
     s->fn = fn; s->ctx1 = ctx1; s->ctx2 = ctx2; s->stack_top = stack_top;
+    s->obj = guest_thread_obj_new();
+    obj = s->obj;
 
     th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
-    if (!th) free(s);
-    /* Record the game thread so a host-tick-driven title's watchdog can sample
-     * it via xbox_thread_debug_handle. Harmless for default-model titles: they
-     * spawn workers too, but never read it back. See kernel_thread.c. */
-    else xbox_set_game_thread(th);
+    if (!th) {
+        free(s);
+    } else {
+        guest_thread_obj_bind(th, obj);
+        /* Record the game thread so a host-tick-driven title's watchdog can
+         * sample it via xbox_thread_debug_handle. Harmless for default-model
+         * titles: they spawn workers too, but never read it back. See
+         * kernel_thread.c. */
+        xbox_set_game_thread(th);
+    }
     return th;
 }
 
@@ -683,6 +779,7 @@ static void bridge_NtClose(void)
     if (raw_handle && raw_handle != 0xDEAD0001u && raw_handle != 0xBEEF0010u) {
         HANDLE h = bridge_take_handle(raw_handle);
         if (h && h != INVALID_HANDLE_VALUE) {
+            guest_thread_obj_unbind(h);
 #ifdef _WIN32
             xbox_dir_context_drop(h);
 #endif
@@ -695,6 +792,17 @@ static void bridge_NtClose(void)
 /* ── MmAllocateContiguousMemory (ordinal 165) ─────────────
  * PVOID MmAllocateContiguousMemory(ULONG NumberOfBytes)
  */
+/* RECOMP_MEM_TRACE: every contiguous / system-memory allocation and free, and
+ * every physical-address query, with the caller. Overlapping or aliased
+ * buffers are a whole class of corruption that only shows up far from where it
+ * starts; this is the ledger to check a suspect address against. */
+static int mem_trace_on(void)
+{
+    static int on = -1;
+    if (on < 0) on = getenv("RECOMP_MEM_TRACE") != NULL;
+    return on;
+}
+
 static void bridge_MmAllocateContiguousMemory(void)
 {
     uint32_t size = STACK_ARG(0);
@@ -705,9 +813,10 @@ static void bridge_MmAllocateContiguousMemory(void)
      * hands the hardware. See xbox_ContiguousAlloc. */
     uint32_t xbox_va = xbox_ContiguousAlloc(size, 4096);
 
-    if (KERNEL_LOG_ON_HALF()) {
-        fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u → Xbox VA 0x%08X\n",
-                size, xbox_va);
+    xbox_DspAckNoteAlloc(g_xbox_kernel_caller, size, xbox_va);
+    if (KERNEL_LOG_ON_HALF() || mem_trace_on()) {
+        fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemory: size=%u -> Xbox VA 0x%08X (from 0x%08X)\n",
+                size, xbox_va, g_xbox_kernel_caller);
         fflush(stderr);
     }
 
@@ -743,6 +852,9 @@ static void bridge_MmAllocateSystemMemory(void)
         return;
     }
     xbox_va = xbox_HeapAlloc(size, 4096);
+    if (mem_trace_on())
+        fprintf(stderr, "  [MEM] MmAllocateSystemMemory(%u) -> 0x%08X from 0x%08X\n",
+                size, xbox_va, g_xbox_kernel_caller);
     if (xbox_va)
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
     else
@@ -790,7 +902,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
          * are "allocated" but full of garbage. */
         memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
 
-        if (KERNEL_LOG_ON_HALF()) {
+        if (KERNEL_LOG_ON_HALF() || mem_trace_on()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
                     "pinned phys 0x%08X -> Xbox VA 0x%08X (zeroed)\n",
                     size, low, xbox_va);
@@ -801,11 +913,12 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
     }
 
     if (align < 4096) align = 4096;
-    xbox_va = xbox_ContiguousAlloc(size, align);
+    xbox_va = xbox_ContiguousAllocRange(size, align, low, high);
 
-    if (KERNEL_LOG_ON_HALF()) {
-        fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u align=%u → Xbox VA 0x%08X\n",
-                size, align, xbox_va);
+    xbox_DspAckNoteAlloc(g_xbox_kernel_caller, size, xbox_va);
+    if (KERNEL_LOG_ON_HALF() || mem_trace_on()) {
+        fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u low=0x%08X high=0x%08X align=%u -> Xbox VA 0x%08X (from 0x%08X)\n",
+                size, low, high, align, xbox_va, g_xbox_kernel_caller);
         fflush(stderr);
     }
 
@@ -819,6 +932,9 @@ static void bridge_MmFreeContiguousMemory(void)
 {
     extern int xbox_ContiguousFree(uint32_t addr);
     uint32_t addr = STACK_ARG(0);
+    if (mem_trace_on())
+        fprintf(stderr, "  [MEM] MmFreeContiguousMemory(0x%08X) from 0x%08X\n",
+                addr, g_xbox_kernel_caller);
     /* Contiguous blocks come from their own arena, not the heap: passing
      * them to xbox_HeapFree found nothing, so none ever came back. */
     if (!xbox_ContiguousFree(addr))
@@ -1856,6 +1972,12 @@ static void bridge_MmGetPhysicalAddress(void)
      * are static and driven by guest CPU state, and nothing in tests/ can
      * reach them. */
     g_eax = (uint32_t)xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)addr);
+    if (mem_trace_on()) {
+        static unsigned n;
+        if (n++ < 400)
+            fprintf(stderr, "  [MEM] MmGetPhysicalAddress(0x%08X) = 0x%08X from 0x%08X\n",
+                    addr, g_eax, g_xbox_kernel_caller);
+    }
 }
 
 /* ── MmSetAddressProtect (ordinal 182) ───────────────────── */
@@ -1954,6 +2076,7 @@ static void bridge_PsTerminateSystemThread(void)
         /* The normal exit for a worker, and therefore the one that has to
          * return the stack -- ExitThread never comes back to bridge_thread_main
          * to do it. */
+        guest_thread_obj_exit(exit_status);
         xbox_FreeThreadStack(g_thread_stack_top);
         g_thread_stack_top = 0;
         ExitThread(exit_status);
@@ -2263,6 +2386,18 @@ static void kernel_vblank_tick(void)
         return;
 
     now = (long long)GetTickCount64();
+
+    /* With the interrupt registers modelled (nv2a_irq.c) the line follows
+     * the sources: the CRTC's vblank every 16 ms, the PTIMER alarm whenever
+     * it is due, raised while anything enabled is pending. */
+    if (xbox_Nv2aIrqEnabled()) {
+        if (now >= next_ms) {
+            next_ms = now + 16;
+            xbox_Nv2aIrqRaiseVblank();
+        }
+        if (!xbox_GetConnectedInterrupt(NV2A_VECTOR) || !xbox_Nv2aIrqTick())
+            return;
+    } else {
     if (now < next_ms)
         return;
     next_ms = now + 16;                       /* ~60 Hz */
@@ -2272,6 +2407,7 @@ static void kernel_vblank_tick(void)
 
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PCRTC_INTR_0) |= NV2A_PCRTC_INTR_VBLANK;
     BRIDGE_MEM32(XBOX_NV2A_REG_BASE + NV2A_PMC_INTR_0)   |= NV2A_PMC_INTR_PCRTC;
+    }
 
     {
         static unsigned n;
@@ -2281,11 +2417,34 @@ static void kernel_vblank_tick(void)
                     claimed < 0 ? "not callable" :
                     claimed ? "claimed it" : "declined it");
         fflush(stderr);
+        /* RECOMP_VBLANK_STATS: how the ISR answers over time. A frame loop
+         * that blocks on the vblank event stalls the moment the ISR stops
+         * claiming -- typically because a DPC it queued never ran and the
+         * interrupt it masked was never unmasked -- and that shows here as
+         * the claimed count stopping while ticks continue. */
+        {
+            static int stats = -1;
+            static unsigned c_claim, c_decl, c_none;
+            static long long last;
+            if (stats < 0) stats = getenv("RECOMP_VBLANK_STATS") != NULL;
+            if (stats) {
+                if (claimed > 0) c_claim++; else if (claimed == 0) c_decl++; else c_none++;
+                if (now - last >= 5000) {
+                    extern unsigned long g_dpc_runs;
+                    last = now;
+                    fprintf(stderr, "  [NV2A] vblank stats: %u claimed, %u declined, "
+                            "%u not callable; DPCs run %lu\n",
+                            c_claim, c_decl, c_none, g_dpc_runs);
+                }
+            }
+        }
     }
 }
 
 /* Run whatever is queued. Called from the timer thread, which has the guest
  * stack and TIB that a deferred routine needs. */
+unsigned long g_dpc_runs;   /* RECOMP_VBLANK_STATS */
+
 static void kernel_drain_dpcs(void)
 {
     for (;;) {
@@ -2302,8 +2461,10 @@ static void kernel_drain_dpcs(void)
         if (d.dpc)
             BRIDGE_MEM8(d.dpc + 2) = 0;
         LeaveCriticalSection(&g_dpc_lock);
-        if (d.dpc)
+        if (d.dpc) {
             kernel_run_dpc(d.dpc, d.arg1, d.arg2);
+            g_dpc_runs++;
+        }
     }
 }
 
@@ -2570,7 +2731,9 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         long long now;
         int i;
 
-        Sleep(10);
+        /* 2 ms when the PTIMER alarm is modelled: D3D's synthesised vblank
+         * is a 16.68 ms alarm, and a 10 ms tick fires it up to 10 ms late. */
+        Sleep(xbox_Nv2aIrqEnabled() ? 2 : 10);
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();
@@ -3437,9 +3600,10 @@ static void bridge_NtReadFile(void)
          * early looks identical to one that never started -- until you can
          * see where each one landed. */
         if (poff)
-            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u st=0x%08X  %02X %02X %02X %02X\n",
+            fprintf(stderr, "  [READ] from=0x%08X ev=%08X apc=%08X @%lld want=%u got=%u -> %08X..%08X st=0x%08X  %02X %02X %02X %02X\n",
                     g_xbox_kernel_caller, STACK_ARG(1), STACK_ARG(2),
                     (long long)off.QuadPart, length, got,
+                    buffer_va, buffer_va + length,
                     (uint32_t)ios.Status,
                     got > 0 ? p[0] : 0, got > 1 ? p[1] : 0,
                     got > 2 ? p[2] : 0, got > 3 ? p[3] : 0);
@@ -3540,6 +3704,67 @@ static void bridge_NtSetInformationFile(void)
     if (!bridge_buf_ok(info_va, length, "NtSetInformationFile")) {
         bridge_write_iostatus(ios_va, (NTSTATUS)0xC0000005, 0);
         g_eax = 0xC0000005u;                 /* STATUS_ACCESS_VIOLATION */
+        return;
+    }
+    if (infoclass == 10u /* FileRenameInformation */) {
+        /* Guest layout: BOOLEAN ReplaceIfExists (padded to 4); HANDLE
+         * RootDirectory; OBJECT_STRING FileName = { USHORT Length, USHORT
+         * MaximumLength, 32-bit Buffer }. The string pointer is a guest VA,
+         * which is why the native NtSetInformationFile cannot be handed this
+         * structure as it is. A name relative to RootDirectory is joined to
+         * that directory's host path; an absolute one goes through the same
+         * translation an open does. */
+        uint32_t replace = BRIDGE_MEM8(info_va + 0);
+        uint32_t root    = BRIDGE_MEM32(info_va + 4);
+        uint32_t len     = BRIDGE_MEM16(info_va + 8);
+        uint32_t buf_va  = BRIDGE_MEM32(info_va + 12);
+        char name[MAX_PATH];
+        xbox_host_char host[MAX_PATH * 2];
+        NTSTATUS st;
+
+        if (!buf_va || len == 0 || len >= sizeof(name)
+                || !bridge_buf_ok(buf_va, len, "FileRenameInformation")) {
+            bridge_write_iostatus(ios_va, STATUS_OBJECT_NAME_INVALID, 0);
+            g_eax = (uint32_t)STATUS_OBJECT_NAME_INVALID;
+            return;
+        }
+        {
+            const char *src = (const char *)XBOX_TO_NATIVE(buf_va);
+            if (src)
+                memcpy(name, src, len);
+            name[src ? len : 0] = 0;
+        }
+#if defined(_WIN32)
+        (void)root;
+        st = xbox_translate_path(name, host, MAX_PATH * 2)
+           ? xbox_RenameOpenFile(handle, host, (BOOLEAN)replace)
+           : STATUS_OBJECT_PATH_NOT_FOUND;
+#else
+        /* An absolute name wins over RootDirectory: RalliSport Challenge 2
+         * renames its Z: cache file to "z:\\misc.fa" with a root handle set. */
+        if (name[0] == '\\' || (name[0] && name[1] == ':'))
+            root = 0;
+        if (root) {
+            const char *dir = w32_handle_path(bridge_resolve_handle(root));
+            char *p;
+            if (!dir) {
+                st = STATUS_INVALID_HANDLE;
+                goto rename_done;
+            }
+            snprintf(host, sizeof(host), "%s/%s", dir, name);
+            for (p = host + strlen(dir); *p; p++)
+                if (*p == '\\') *p = '/';
+            st = xbox_RenameOpenFile(handle, host, (BOOLEAN)replace);
+        } else {
+            st = xbox_translate_path(name, host, sizeof(host))
+               ? xbox_RenameOpenFile(handle, host, (BOOLEAN)replace)
+               : STATUS_OBJECT_PATH_NOT_FOUND;
+        }
+rename_done:
+#endif
+        fprintf(stderr, "  [FILE] rename -> %s status=0x%08X\n", name, (uint32_t)st);
+        bridge_write_iostatus(ios_va, st, 0);
+        g_eax = (uint32_t)st;
         return;
     }
     g_eax = (uint32_t)xbox_NtSetInformationFile(handle, &ios,
@@ -3943,7 +4168,16 @@ static void bridge_ObReferenceObjectByHandle(void)
     uint32_t handle = STACK_ARG(0);
     uint32_t obj_type = STACK_ARG(1);
     uint32_t object_ptr = STACK_ARG(2);
-    if (object_ptr) BRIDGE_MEM32(object_ptr) = 0;
+    uint32_t obj = 0;
+    (void)obj_type;
+    /* Threads the bridge spawned have a guest object (see
+     * guest_thread_obj_new); everything else still gets NULL. */
+    if ((handle & 0xFF000000u) == BRIDGE_HANDLE_TAG) {
+        uint32_t i = handle & BRIDGE_HANDLE_MASK;
+        if (i > 0 && i < BRIDGE_HANDLE_MAX)
+            obj = guest_thread_obj_find(s_handle_table[i]);
+    }
+    if (object_ptr) BRIDGE_MEM32(object_ptr) = obj;
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 

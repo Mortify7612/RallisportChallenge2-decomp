@@ -30,6 +30,7 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
     find_package(Threads REQUIRED)
-    target_link_libraries(platform PUBLIC Threads::Threads)
+    # libm: _clearfp/_controlfp sit on <fenv.h>.
+    target_link_libraries(platform PUBLIC Threads::Threads m)
     target_compile_options(platform PRIVATE -Wall -Wextra -Wno-unused-parameter -O2)
 endif()
