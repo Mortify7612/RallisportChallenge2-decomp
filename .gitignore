@@ -1,0 +1,27 @@
+# Game data: not in this repository. Bring your own copy (see README.md).
+/RalliSport2/
+xboxrecomp/game_files/
+*.xbe
+*.iso
+*.xiso
+
+# Generated from the game binary by rsc2/regen.sh
+rsc2/src/recomp/
+xboxrecomp/tools/*/output/
+
+# Builds, run outputs, local tooling
+rsc2/build/
+rsc2/build-*/
+xboxrecomp/build/
+xboxrecomp/build-*/
+/third_party/
+/work/
+/.venv/
+/.xboxrecomp-upstream.git/
+rsc2/screenshots/
+rsc2/tools/replay32/replay32
+__pycache__/
+*.log
+run*.err
+run*.out
+gdb*.txt
