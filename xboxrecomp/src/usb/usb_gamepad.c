@@ -507,18 +507,149 @@ static void pad_live_poll(unsigned long t)
     fclose(f);
 }
 
-static void pad_script_apply(int pad, uint8_t *out)
+/* Milliseconds since the title first asked for a report: the clock the
+ * script, the recorder and the replay all share. */
+static unsigned long pad_clock(void)
 {
     static unsigned long t0;
-    unsigned long now, t;
+    unsigned long now = (unsigned long)GetTickCount();
+    if (!t0)
+        t0 = now ? now : 1;
+    return now - t0;
+}
+
+/* RECOMP_PAD_RECORD=<file>: every change of every pad's report, as
+ *   <ms> <pad> <36 hex digits: report bytes 2..19> <frame>
+ * -- buttons, analog buttons and both sticks exactly as the title saw them,
+ * and the number of frames the title had presented when it changed.
+ * RECOMP_PAD_REPLAY=<file> plays such a recording back: once the title has
+ * presented that many frames, that pad reports those bytes (a host pad and
+ * the keyboard are ignored for it). Frames, not milliseconds: a load that
+ * runs faster or a hitch no longer shifts every later input -- timed by the
+ * wall, a replay drifted further from the run it recorded the longer it
+ * went. Recordings without the frame column replay by milliseconds. */
+#define PAD_REC_BYTES 18
+
+/* nv2a_pb_exec.c: frames the title has presented. */
+extern uint32_t nv2a_pb_presented_frames(void);
+
+static void pad_record(int pad, const uint8_t *out)
+{
+    static int on = -1;
+    static FILE *f;
+    static uint8_t last[USB_GAMEPAD_MAX][PAD_REC_BYTES];
+    static int have[USB_GAMEPAD_MAX];
+    int i;
+
+    if (on < 0) {
+        const char *path = getenv("RECOMP_PAD_RECORD");
+        on = 0;
+        if (path && *path) {
+            f = fopen(path, "w");
+            if (f) {
+                on = 1;
+                fprintf(stderr, "  PAD: recording input to %s\n", path);
+            } else {
+                fprintf(stderr, "  PAD: cannot write %s\n", path);
+            }
+        }
+    }
+    if (!on || pad < 0 || pad >= USB_GAMEPAD_MAX)
+        return;
+    if (have[pad] && !memcmp(last[pad], out + 2, PAD_REC_BYTES))
+        return;
+    memcpy(last[pad], out + 2, PAD_REC_BYTES);
+    have[pad] = 1;
+    fprintf(f, "%lu %d ", pad_clock(), pad);
+    for (i = 0; i < PAD_REC_BYTES; i++)
+        fprintf(f, "%02X", out[2 + i]);
+    fprintf(f, " %u\n", nv2a_pb_presented_frames());
+    fflush(f);                  /* a killed run keeps what it recorded */
+}
+
+typedef struct {
+    unsigned long at;           /* frame, or ms when the file has no frames */
+    uint8_t pad;
+    uint8_t b[PAD_REC_BYTES];
+} PadFrame;
+
+static void pad_replay(int pad, uint8_t *out)
+{
+    static int on = -1, by_frame;
+    static PadFrame *fr;
+    static int n, cur[USB_GAMEPAD_MAX];
+    unsigned long t;
+    int i;
+
+    if (on < 0) {
+        const char *path = getenv("RECOMP_PAD_REPLAY");
+        FILE *f;
+        char line[256];
+        int cap = 0;
+        on = 0;
+        if (!path || !*path || !(f = fopen(path, "r")))
+            return;
+        while (fgets(line, sizeof line, f)) {
+            PadFrame p;
+            unsigned long at, frame;
+            int pd, k, got;
+            char hex[64];
+            got = sscanf(line, "%lu %d %63s %lu", &at, &pd, hex, &frame);
+            if (n == 0)
+                by_frame = got == 4;
+            if (by_frame && got == 4)
+                at = frame;
+            if (got < 3
+                || strlen(hex) != PAD_REC_BYTES * 2 || pd < 0 || pd >= USB_GAMEPAD_MAX)
+                continue;
+            p.at = at;
+            p.pad = (uint8_t)pd;
+            for (k = 0; k < PAD_REC_BYTES; k++) {
+                unsigned v;
+                sscanf(hex + 2 * k, "%2x", &v);
+                p.b[k] = (uint8_t)v;
+            }
+            if (n == cap) {
+                PadFrame *g = (PadFrame *)realloc(fr, sizeof *fr * (size_t)(cap ? cap * 2 : 1024));
+                if (!g)
+                    break;
+                fr = g;
+                cap = cap ? cap * 2 : 1024;
+            }
+            fr[n++] = p;
+        }
+        fclose(f);
+        for (i = 0; i < USB_GAMEPAD_MAX; i++)
+            cur[i] = -1;
+        on = n > 0;
+        fprintf(stderr, "  PAD: replaying %d input change(s) from %s, timed by %s\n",
+                n, path, by_frame ? "frames" : "milliseconds");
+    }
+    if (!on || pad < 0 || pad >= USB_GAMEPAD_MAX)
+        return;
+    t = by_frame ? nv2a_pb_presented_frames() : pad_clock();
+    /* The next change for this pad that is due -- one per report, so changes
+     * recorded within the same frame (a quick tap) are each seen by a poll
+     * rather than collapsed into the last of them. */
+    for (i = cur[pad] + 1; i < n && fr[i].at <= t; i++)
+        if (fr[i].pad == pad) {
+            cur[pad] = i;
+            break;
+        }
+    if (cur[pad] >= 0)
+        memcpy(out + 2, fr[cur[pad]].b, PAD_REC_BYTES);
+    else
+        memset(out + 2, 0, PAD_REC_BYTES);
+}
+
+static void pad_script_apply(int pad, uint8_t *out)
+{
+    unsigned long t;
     int i, j;
 
     if (s_script_len < 0)
         pad_script_load();
-    now = (unsigned long)GetTickCount();
-    if (!t0)
-        t0 = now;
-    t = now - t0;
+    t = pad_clock();
     pad_live_poll(t);
     if (s_script_len == 0)
         return;
@@ -556,6 +687,22 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+void usb_gamepad_rumble(int pad, const uint8_t *data, int len)
+{
+    XBOX_VIBRATION vib;
+    if (len < 6 || data[1] < 6)
+        return;
+    vib.wLeftMotorSpeed  = (WORD)(data[2] | (data[3] << 8));
+    vib.wRightMotorSpeed = (WORD)(data[4] | (data[5] << 8));
+    if (getenv("RECOMP_RUMBLE_TRACE")) {
+        static unsigned n;
+        if (n++ < 200)
+            fprintf(stderr, "  [RUMBLE] pad %d left %04X right %04X\n", pad,
+                    vib.wLeftMotorSpeed, vib.wRightMotorSpeed);
+    }
+    xbox_InputSetState((DWORD)pad, &vib);
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;
@@ -563,8 +710,11 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     uint8_t synth = synthetic_buttons();
     int i;
 
+    static unsigned long s_reports[USB_GAMEPAD_MAX];
     if (max < 20)
         return 0;
+    if (pad >= 0 && pad < USB_GAMEPAD_MAX)
+        s_reports[pad]++;
     memset(out, 0, 20);
     out[0] = 0;
     out[1] = 20;
@@ -595,11 +745,15 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
                 DWORD rc = xbox_InputGetState(0, &probe);
                 last = now;
                 fprintf(stderr, "  [INPUT] kbd_env=%d window_has_RETURN=%d "
-                        "InputGetState=%lu buttons=0x%04X\n",
+                        "InputGetState=%lu buttons=0x%04X A=%u RT=%u LX=%d"
+                        " reports(pad0)=%lu\n",
                         getenv("RECOMP_KEYBOARD") ? 1 : 0,
                         xbox_FramebufferKeyDown(0x0D),
                         (unsigned long)rc,
-                        rc == 0 ? probe.Gamepad.wButtons : 0);
+                        rc == 0 ? probe.Gamepad.wButtons : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[0] : 0,
+                        rc == 0 ? probe.Gamepad.bAnalogButtons[7] : 0,
+                        rc == 0 ? probe.Gamepad.sThumbLX : 0, s_reports[0]);
                 fflush(stderr);
             }
         }
@@ -611,6 +765,8 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out);
+        pad_replay(pad, out);
+        pad_record(pad, out);
         return 20;
     }
 
@@ -628,5 +784,7 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     out[18] = (uint8_t)(g->sThumbRY & 0xFF);
     out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
     pad_script_apply(pad, out);
+    pad_replay(pad, out);
+    pad_record(pad, out);
     return 20;
 }
