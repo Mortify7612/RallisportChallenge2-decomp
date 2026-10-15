@@ -415,8 +415,100 @@ static void snapb_exit(uint32_t va)
     ReleaseSRWLockExclusive(&s_snapb_lock);
 }
 
+/* RECOMP_TREE_TRACE=<file>: RalliSport Challenge 2's object culling, every
+ * frame, for chasing objects that drop out (tree pop-in). Binary records:
+ *   u32 'TTF0', u32 frame, u32 kind, u32 n, u32 extra, then n entries of
+ *   { u32 inst, f32 dist, f32 weight, u8 lod, u8 type, u16 pad }
+ * kind 1: sub_0010F0D0's output as sub_00273E70 receives it (extra = the
+ *         call's 3rd and 4th arguments, packed 16:16);
+ * kind 2: the render buckets at sub_00273890's entry (type = record type);
+ * kind 9: a mark (F9 in the window; extra = the mark count).
+ * Needs trace hooks on 0x0010F0D0, 0x00273360 and 0x00273890. */
+volatile int g_recomp_user_mark;
+static FILE *s_tt;
+static int s_tt_on = -1;
+static uint32_t s_tt_out, s_tt_cnt, s_tt_a3, s_tt_a4, s_tt_obj;
+
+static void tt_hdr(uint32_t kind, uint32_t n, uint32_t extra)
+{
+    extern uint32_t nv2a_pb_presented_frames(void);
+    uint32_t h[5];
+    h[0] = 0x30465454u;     /* "TTF0" */
+    h[1] = nv2a_pb_presented_frames();
+    h[2] = kind;
+    h[3] = n;
+    h[4] = extra;
+    fwrite(h, 4, 5, s_tt);
+}
+
+static void tt_entry(const uint8_t *m, uint32_t rec, uint32_t type)
+{
+    struct { uint32_t inst; float dist, w; uint8_t lod, type; uint16_t pad; } e;
+    e.inst = *(const uint32_t *)(m + rec);
+    memcpy(&e.dist, m + rec + 4, 4);
+    memcpy(&e.w, m + rec + 0x14, 4);
+    e.lod = m[rec + 8];
+    e.type = (uint8_t)type;
+    e.pad = 0;
+    fwrite(&e, sizeof e, 1, s_tt);
+}
+
+static void tree_trace(uint32_t va)
+{
+    const uint8_t *m;
+    static int marks;
+    if (s_tt_on < 0) {
+        const char *f = getenv("RECOMP_TREE_TRACE");
+        s_tt = f && *f ? fopen(f, "wb") : NULL;
+        s_tt_on = s_tt != NULL;
+    }
+    if (!s_tt_on)
+        return;
+    m = (const uint8_t *)xbox_GetMemoryOffset();
+    if (g_recomp_user_mark != marks) {
+        marks = g_recomp_user_mark;
+        tt_hdr(9, 0, (uint32_t)marks);
+        fprintf(stderr, "[TREETRACE] mark %d\n", marks);
+    }
+    if (va == 0x0010F0D0u) {
+        const uint32_t *sp = (const uint32_t *)(m + g_esp);
+        if (sp[0] != 0x002743D1u)            /* only sub_00273E70's call */
+            return;
+        s_tt_out = sp[2];
+        s_tt_a3 = sp[3];
+        s_tt_a4 = sp[4];
+        s_tt_cnt = sp[5];
+        s_tt_obj = g_esi;       /* sub_00273E70 keeps the count at esi+0xc */
+    } else if (va == 0x00273360u && s_tt_cnt) {
+        uint32_t n = *(const uint32_t *)(m + s_tt_obj + 0xC), i;
+        tt_hdr(3, 0, s_tt_a3);
+        tt_hdr(4, 0, s_tt_a4);
+        tt_hdr(1, n > 4096 ? 4096 : n, *(const uint32_t *)(m + s_tt_cnt));
+        for (i = 0; i < n && i < 4096; i++)
+            tt_entry(m, s_tt_out + 24 * i, 0);
+        s_tt_cnt = 0;
+    } else if (va == 0x00273890u) {
+        uint32_t obj = g_eax, nb = *(const uint32_t *)(m + obj + 8), i, total = 0;
+        for (i = 0; i < nb && i < 256; i++) {
+            uint32_t b = obj + 24 * i + 24;
+            uint32_t beg = *(const uint32_t *)(m + b), end = *(const uint32_t *)(m + b + 4);
+            if (beg && end > beg)
+                total += (end - beg) / 12;
+        }
+        tt_hdr(2, total, obj);
+        for (i = 0; i < nb && i < 256; i++) {
+            uint32_t b = obj + 24 * i + 24, it;
+            uint32_t beg = *(const uint32_t *)(m + b), end = *(const uint32_t *)(m + b + 4);
+            for (it = beg; beg && it + 12 <= end; it += 12)
+                tt_entry(m, *(const uint32_t *)(m + it), *(const uint32_t *)(m + it + 4));
+        }
+        fflush(s_tt);
+    }
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
+    tree_trace(va);
     /* RECOMP_DUMP_BUCKETS: RalliSport Challenge 2's render buckets at the
      * entry of sub_00273890 (eax = renderer): bucket i at eax+24*i+24 holds
      * [begin, end) of 12-byte items, each pointing at a 24-byte record. */

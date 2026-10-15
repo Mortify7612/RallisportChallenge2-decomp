@@ -668,6 +668,15 @@ static void fb_events(SDL_Window *win, int *resized)
 {
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
+        if (ev.type == SDL_CONTROLLERBUTTONDOWN
+                && (ev.cbutton.button == SDL_CONTROLLER_BUTTON_GUIDE
+                    || ev.cbutton.button == SDL_CONTROLLER_BUTTON_MISC1)) {
+            /* The controller's Guide button: the same mark as F9. */
+            extern volatile int g_recomp_user_mark;
+            extern void xbox_FlightDumpRequest(void);
+            g_recomp_user_mark++;
+            xbox_FlightDumpRequest();
+        }
         if (ev.type == SDL_QUIT) {
             fprintf(stderr, "  [FBWIN] window closed -- exiting\n");
             fflush(stderr);
@@ -679,6 +688,15 @@ static void fb_events(SDL_Window *win, int *resized)
                     && !ev.key.repeat) {
                 /* The renderer's flight recorder (RECOMP_VK_FLIGHT). */
                 extern void xbox_FlightDumpRequest(void);
+                xbox_FlightDumpRequest();
+            }
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F9
+                    && !ev.key.repeat) {
+                /* A mark in the tree trace (RECOMP_TREE_TRACE), and the
+                 * flight recorder's last frames with it. */
+                extern volatile int g_recomp_user_mark;
+                extern void xbox_FlightDumpRequest(void);
+                g_recomp_user_mark++;
                 xbox_FlightDumpRequest();
             }
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F11
