@@ -563,6 +563,75 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     }
 }
 
+/* fetch_attr for vertices lo..lo+nv-1 (or idx[0..nv-1] when idx), into
+ * out + j * ostride: the same values, with the attribute's format and
+ * source worked out once rather than per vertex. Vertex assembly for the
+ * Vulkan path did nine of these per vertex and was a fifth of the
+ * executor's time. */
+static void fetch_attr_run(const VertexAttr *a, uint32_t lo, const uint32_t *idx,
+                           uint32_t nv, float *out, size_t ostride)
+{
+    const uint8_t *base;
+    uint32_t j, i, n, maxi;
+
+    for (j = 0; j < nv; j++) {
+        float *o = out + (size_t)j * ostride;
+        o[0] = o[1] = o[2] = 0.0f;
+        o[3] = 1.0f;
+    }
+    if (!a->size || !a->stride || !a->offset)
+        goto slow;                  /* inline offset 0 is legal: per vertex */
+    if (s_gpu.inline_active) {
+        maxi = lo + nv - 1;
+        if (idx)
+            for (j = 0, maxi = 0; j < nv; j++)
+                if (idx[j] > maxi)
+                    maxi = idx[j];
+        if ((size_t)a->offset + (size_t)maxi * a->stride + 4 > (size_t)s_gpu.inline_count * 4)
+            goto slow;              /* some vertices fall off the end */
+        base = (const uint8_t *)s_gpu.inline_buf + a->offset;
+    } else {
+        base = (const uint8_t *)xbox_GetMemoryOffset() + a->offset;
+    }
+    n = a->size < 4 ? a->size : 4;
+#define FETCH_LOOP(body) \
+    for (j = 0; j < nv; j++) { \
+        const uint8_t *p = base + (size_t)(idx ? idx[j] : lo + j) * a->stride; \
+        float *o = out + (size_t)j * ostride; \
+        body \
+    }
+    switch (a->type) {
+    case 0:
+        FETCH_LOOP(o[0] = (float)p[2] / 255.0f; o[1] = (float)p[1] / 255.0f;
+                   o[2] = (float)p[0] / 255.0f; o[3] = (float)p[3] / 255.0f;)
+        return;
+    case 2:
+        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = ((const float *)p)[i];)
+        return;
+    case 4:
+        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)p[i] / 255.0f;)
+        return;
+    case 1:
+        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)((const int16_t *)p)[i] / 32767.0f;)
+        return;
+    case 5:
+        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)((const int16_t *)p)[i];)
+        return;
+    case 6:
+        FETCH_LOOP(uint32_t v = *(const uint32_t *)p;
+                   o[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
+                   o[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
+                   o[2] = (float)((int32_t)v >> 22) / 511.0f;)
+        return;
+    default:
+        break;
+    }
+#undef FETCH_LOOP
+slow:
+    for (j = 0; j < nv; j++)
+        fetch_attr(a, idx ? idx[j] : lo + j, out + (size_t)j * ostride);
+}
+
 static uint32_t surface_bpp(void);
 
 static void note_drawn(void)
@@ -3137,16 +3206,15 @@ static int vk_program_batch(void)
     }
     ranged = hi - lo < NV_MAX_INDICES && hi - lo + 1 <= 2 * n + 64;
     nv = ranged ? hi - lo + 1 : n;
-    for (j = 0; j < nv; j++) {
-        uint32_t index = ranged ? lo + j : s_gpu.idx[j];
-        float *o = vin + (size_t)j * k * 4;
-        if (!kk) {
+    if (!kk)
+        for (j = 0; j < nv; j++) {
+            float *o = vin + (size_t)j * 4;
             o[0] = o[1] = o[2] = 0.0f;
             o[3] = 1.0f;
         }
-        for (i = 0; i < kk; i++)
-            fetch_attr(&s_gpu.attr[ins[i]], index, o + i * 4);
-    }
+    for (i = 0; i < kk; i++)
+        fetch_attr_run(&s_gpu.attr[ins[i]], ranged ? lo : 0, ranged ? NULL : s_gpu.idx,
+                       nv, vin + (size_t)i * 4, (size_t)k * 4);
     k = vk_tri_list(n);
     if (ranged)
         for (i = 0; i < k; i++)

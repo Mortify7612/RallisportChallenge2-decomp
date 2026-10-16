@@ -104,16 +104,21 @@ static const uint32_t s_frag_fast_spv[] =
 #define VK_SURF_H      1024
 #define VK_MAX_QUERIES 4096
 #define VK_MAX_REPORTS 512
+/* Frame slots: the GPU draws one frame while the CPU records the next
+ * (vk_flip). Each slot has its own command buffers, fences, descriptor pool,
+ * query pools and half of every ring. */
+#define VK_SLOTS 2
 
 typedef struct {
     VkBuffer buf;
     VkDeviceMemory mem;
     uint8_t *map;
-    VkDeviceSize size, used;
+    VkDeviceSize size, used;    /* size and use of one frame slot's half */
+    VkDeviceSize base;          /* where the current slot's half starts */
     int coherent;
 } Ring;
 
-typedef struct {
+typedef struct Surf_ {
     uint32_t va, pitch, bpp, w, h;
     int swz;                    /* guest copy is swizzled (Morton order) */
     /* At an internal scale above 1, `img` is (w, h) * scale and `nimg` a
@@ -126,14 +131,16 @@ typedef struct {
     VkImage img;
     VkDeviceMemory mem;
     VkImageView view;
-    int dirty;                  /* GPU has drawn since the last copy-back */
+    int dirty;                  /* GPU has drawn since the last copy-back;
+                                 * 2: and a submitted frame carries that
+                                 * copy-back, nothing drawn since (vk_flip) */
     uint32_t rows;              /* rows the title uses (max clip bottom)  */
     uint32_t dirty_rows;
     uint64_t hash;              /* guest bytes as of the last copy either way */
+    uint64_t hnow;              /* guest bytes this epoch (surf_hash_now) */
+    uint32_t hnow_ep, hnow_bytes;
     int hash_valid;
     uint32_t last_use;
-    VkDeviceSize rb_off;        /* where its copy-back landed this sync */
-    int rb_pending;
     uint32_t gen;               /* changes whenever its contents do */
     /* Since its last copy-back it has only been cleared, whole, to one
      * colour: the same bytes in any layout (alias_resolve). */
@@ -215,6 +222,42 @@ typedef struct {
     VkDeviceMemory mem;
     VkImageView view;
 } Retired;
+
+typedef struct {
+    uint32_t va, q0, q1;
+    uint64_t stamp, base;
+    int pre;                    /* no CLEAR_REPORT_VALUE before it this frame */
+} Rep;
+
+/* A surface's copy-back recorded into a submitted frame. */
+typedef struct {
+    struct Surf_ *s;
+    VkImage img;                /* the surface's image when it was recorded */
+    VkDeviceSize off;
+    uint32_t rows;
+} RbEnt;
+
+typedef struct {
+    VkCommandPool pool;
+    VkCommandBuffer ucbs[VK_KICKS], dcbs[VK_KICKS];
+    VkFence kfence[VK_KICKS], fence;
+    VkDescriptorPool dpool;
+    VkQueryPool tspool, qpool;
+    VkSemaphore sem_acq, sem_done;
+} Slot;
+
+/* A frame submitted at a flip and not yet waited for (vk_flip). */
+typedef struct {
+    int active, slot, kick;
+    uint32_t seq, nts, nq, nreps, rep_first;
+    int cleared;
+    uint8_t qsamples[VK_MAX_QUERIES];
+    Rep reps[VK_MAX_REPORTS];
+    RbEnt rb[VK_MAX_SURF];
+    int nrb;
+    Retired retired[VK_MAX_RETIRED];
+    int nretired;
+} Pend;
 
 static struct {
     int state;                  /* 0 untried, 1 up, -1 off/failed */
@@ -344,7 +387,15 @@ static struct {
     uint32_t nfq, fq_frame[VK_MAX_QUERIES], fq_seq[VK_MAX_QUERIES];
     int precise;
     uint64_t rep_acc;
-    struct { uint32_t va, q0, q1; uint64_t stamp, base; } reps[VK_MAX_REPORTS];
+    Rep reps[VK_MAX_REPORTS];
+    int rep_cleared;            /* a CLEAR_REPORT_VALUE this frame */
+    /* Frame slots (vk_flip): the handles above (pool, ucbs, fence, dpool,
+     * tspool, qpool, sem_*) are the current slot's, copied from here. */
+    Slot slots[VK_SLOTS];
+    int cur_slot;
+    int pipelined;              /* RECOMP_VK_PIPELINE (default on) */
+    uint32_t flip_seq;
+    Pend pend[VK_SLOTS];        /* pend[i]: slot i's frame in flight */
     double st_wait_ms;          /* CPU time spent waiting on the GPU */
     double st_tex_ms;           /* decoding and staging textures */
     char htex[8][64];           /* this frame's texture uploads (hitch log) */
@@ -543,7 +594,7 @@ static int ring_init(Ring *rg, VkDeviceSize size, VkBufferUsageFlags usage,
     VkMemoryRequirements req;
     VkMemoryPropertyFlags got = 0;
     VkResult r;
-    bi.size = size;
+    bi.size = size * VK_SLOTS;        /* one half per frame slot */
     bi.usage = usage;
     bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     r = vkCreateBuffer(V.dev, &bi, NULL, &rg->buf);
@@ -561,11 +612,13 @@ static int ring_init(Ring *rg, VkDeviceSize size, VkBufferUsageFlags usage,
         return vk_fail("vkMapMemory", r);
     rg->size = size;
     rg->used = 0;
+    rg->base = 0;
     rg->coherent = (got & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
     return 1;
 }
 
-/* Space in a ring, or NULL when it is full for this segment. */
+/* Space in the current frame slot's half of a ring, or NULL when it is full
+ * for this segment. Offsets are into the whole buffer. */
 static void *ring_alloc(Ring *rg, VkDeviceSize n, VkDeviceSize align,
                         VkDeviceSize *off)
 {
@@ -573,8 +626,8 @@ static void *ring_alloc(Ring *rg, VkDeviceSize n, VkDeviceSize align,
     if (o + n > rg->size)
         return NULL;
     rg->used = o + n;
-    *off = o;
-    return rg->map + o;
+    *off = rg->base + o;
+    return rg->map + rg->base + o;
 }
 
 /* Samples for the next image_create; set around the multisampled ones. */
@@ -672,9 +725,10 @@ static void segment_begin(void)
     V.seg_draws = 0;
     if (V.tspool && V.nts + 2 <= 2 * (VK_KICKS + 2))
         vkCmdWriteTimestamp(V.ucb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, V.tspool, V.nts);
-    if (V.kick) {
-        /* Segments already kicked may still be drawing with images this
-         * one's uploads overwrite: its transfers wait for them. */
+    if (V.kick || V.pend[V.cur_slot ^ 1].active) {
+        /* Segments already kicked -- or the flipped frame -- may still be
+         * drawing with images this one's uploads overwrite: its transfers
+         * wait for them. */
         VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
         mb.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -947,6 +1001,20 @@ static uint64_t surf_hash(const Surf *s)
     return hash_bytes(guest(s->va), surf_bytes(s));
 }
 
+/* surf_hash, computed at most once an epoch, as textures are (tex_get):
+ * a cube map's six faces were hashed again for every draw that sampled
+ * it. Our own writes to the surface's bytes (write_back) update it. */
+static uint64_t surf_hash_now(Surf *s)
+{
+    uint32_t bytes = surf_bytes(s);
+    if (s->hnow_ep != V.epoch + 1 || s->hnow_bytes != bytes) {
+        s->hnow = hash_bytes(guest(s->va), bytes);
+        s->hnow_ep = V.epoch + 1;
+        s->hnow_bytes = bytes;
+    }
+    return s->hnow;
+}
+
 /* Between a swizzled guest surface and linear rows: `to_guest` swizzles
  * rows into guest, otherwise unswizzles guest into rows. */
 static void surf_swizzle(Surf *s, uint8_t *g, uint8_t *lin, uint32_t rows, int to_guest)
@@ -980,57 +1048,72 @@ static void surf_swizzle(Surf *s, uint8_t *g, uint8_t *lin, uint32_t rows, int t
 
 /* ---- sync points -------------------------------------------------------- */
 
-static void destroy_retired(void)
+static void destroy_list(const Retired *r, int n)
 {
     int i;
-    for (i = 0; i < V.nretired; i++) {
-        if (V.retired[i].view) vkDestroyImageView(V.dev, V.retired[i].view, NULL);
-        if (V.retired[i].img)  vkDestroyImage(V.dev, V.retired[i].img, NULL);
-        if (V.retired[i].mem) {
-            vkFreeMemory(V.dev, V.retired[i].mem, NULL);
+    for (i = 0; i < n; i++) {
+        if (r[i].view) vkDestroyImageView(V.dev, r[i].view, NULL);
+        if (r[i].img)  vkDestroyImage(V.dev, r[i].img, NULL);
+        if (r[i].mem) {
+            vkFreeMemory(V.dev, r[i].mem, NULL);
             V.nimages--;
         }
     }
+}
+
+static void destroy_retired(void)
+{
+    destroy_list(V.retired, V.nretired);
     V.nretired = 0;
 }
 
-/* The segment's occlusion results into the reports that asked for them. */
-static void reports_resolve(void)
+/* A segment's occlusion results into the reports that asked for them, from
+ * query pool `qp`. Returns the pixels counted after the segment's last
+ * CLEAR_REPORT_VALUE (from query `rep_first`), which a later report with no
+ * clear of its own adds on. */
+static uint64_t reports_write(VkQueryPool qp, uint32_t nq, const uint8_t *qsamples,
+                              const Rep *reps, uint32_t nreps, uint32_t rep_first)
 {
     static uint64_t res[VK_MAX_QUERIES + 1];
     uint32_t i, q, div = V.sx * V.scale;
-    if (V.nq) {
+    if (nq) {
         uint64_t raw[VK_MAX_QUERIES];
-        if (vkGetQueryPoolResults(V.dev, V.qpool, 0, V.nq, sizeof raw, raw, 8,
+        if (vkGetQueryPoolResults(V.dev, qp, 0, nq, sizeof raw, raw, 8,
                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT)
                 != VK_SUCCESS)
             memset(raw, 0, sizeof raw);
         res[0] = 0;
-        for (q = 0; q < V.nq; q++)            /* prefix sums, in pixels */
-            res[q + 1] = res[q] + raw[q] / (V.qsamples[q] > 1 ? V.qsamples[q] : 1);
+        for (q = 0; q < nq; q++)              /* prefix sums, in pixels */
+            res[q + 1] = res[q] + raw[q] / (qsamples[q] > 1 ? qsamples[q] : 1);
     } else {
         res[0] = 0;
     }
-    for (i = 0; i < V.nreps; i++) {
-        uint64_t n = V.reps[i].base + res[V.reps[i].q1] - res[V.reps[i].q0];
+    for (i = 0; i < nreps; i++) {
+        uint64_t n = reps[i].base + res[reps[i].q1] - res[reps[i].q0];
         uint32_t count = (uint32_t)(n / div), done = 0;
-        uint8_t *g = guest(V.reps[i].va);
+        uint8_t *g = guest(reps[i].va);
         static int trace = -1;
         static uint32_t seen;
         if (trace < 0)
             trace = getenv("RECOMP_REPORT_TRACE") != NULL;
         if (trace && ((seen++ % 200) < 12 || getenv("RECOMP_REPORT_TRACE_ALL")))
             fprintf(stderr, "[REPORT] vk at 0x%08X: %u pixels (%u queries)\n",
-                    V.reps[i].va, count, V.reps[i].q1 - V.reps[i].q0);
-        memcpy(g, &V.reps[i].stamp, 8);
+                    reps[i].va, count, reps[i].q1 - reps[i].q0);
+        memcpy(g, &reps[i].stamp, 8);
         memcpy(g + 8, &count, 4);
         memcpy(g + 12, &done, 4);
     }
+    if (nq)
+        vkResetQueryPool(V.dev, qp, 0, nq);
+    return res[nq] - res[rep_first];
+}
+
+/* The current segment's reports, once it has been waited for. */
+static void reports_resolve(void)
+{
+    V.rep_acc += reports_write(V.qpool, V.nq, V.qsamples, V.reps, V.nreps, V.rep_first);
     V.nreps = 0;
-    V.rep_acc += res[V.nq] - res[V.rep_first];
     V.rep_first = 0;
-    if (V.nq)
-        vkResetQueryPool(V.dev, V.qpool, 0, V.nq);
     V.nq = 0;
 }
 
@@ -1130,15 +1213,16 @@ static void vk_sync_inner(int readback);
         vk_sync_inner(rb); \
     } while (0)
 
-static void vk_sync_inner(int readback)
+/* End the segment and submit it, with the surfaces' copy-backs when
+ * `readback` (listed in `list`). Does not wait. 0 on failure. */
+static int segment_submit(int readback, RbEnt *list, int *nrb)
 {
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkCommandBuffer cbs[2];
     int i, any = 0;
     VkResult r;
 
-    if (!V.recording)
-        return;
+    *nrb = 0;
     aw_check("between syncs (not a copy-back)", NULL);
     end_rendering();
     if (readback) {
@@ -1147,8 +1231,7 @@ static void vk_sync_inner(int readback)
             VkBufferImageCopy c;
             VkDeviceSize off;
             uint32_t rows = s->dirty_rows < s->h ? s->dirty_rows : s->h;
-            s->rb_pending = 0;
-            if (!s->dirty || !rows)
+            if (s->dirty != 1 || !rows)   /* 2: already on its way */
                 continue;
             if (!ring_alloc(&V.rb, (VkDeviceSize)s->w * rows * s->bpp, 16, &off))
                 continue;         /* ponytail: 64 MB of surfaces per sync */
@@ -1192,8 +1275,11 @@ static void vk_sync_inner(int readback)
             c.imageExtent.depth = 1;
             vkCmdCopyImageToBuffer(V.dcb, V.sx > 1 && s->nimg ? s->nimg : s->img,
                                    VK_IMAGE_LAYOUT_GENERAL, V.rb.buf, 1, &c);
-            s->rb_off = off;
-            s->rb_pending = (int)rows;
+            list[*nrb].s = s;
+            list[*nrb].img = s->img;
+            list[*nrb].off = off;
+            list[*nrb].rows = rows;
+            (*nrb)++;
         }
         if (any) {
             VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
@@ -1250,11 +1336,19 @@ static void vk_sync_inner(int readback)
     if (r != VK_SUCCESS) {
         vk_fail("vkQueueSubmit", r);
         V.state = -1;
-        return;
+        return 0;
     }
+    return 1;
+}
+
+/* Wait for slot `sl`'s frame: its final segment and `kick` kicked ones;
+ * then its command buffers can be reused. */
+static void slot_wait(Slot *sl, int kick, uint32_t nts)
+{
+    VkResult r;
     {
         double t0 = now_ms();
-        r = vkWaitForFences(V.dev, 1, &V.fence, VK_TRUE, UINT64_MAX);
+        r = vkWaitForFences(V.dev, 1, &sl->fence, VK_TRUE, UINT64_MAX);
         V.st_wait_ms += now_ms() - t0;
     }
     if (r != VK_SUCCESS) {
@@ -1262,58 +1356,160 @@ static void vk_sync_inner(int readback)
         V.state = -1;
         return;
     }
-    vkResetFences(V.dev, 1, &V.fence);
-    if (V.kick) {
+    vkResetFences(V.dev, 1, &sl->fence);
+    if (kick) {
         double t0 = now_ms();
-        vkWaitForFences(V.dev, (uint32_t)V.kick, V.kfence, VK_TRUE, UINT64_MAX);
+        vkWaitForFences(V.dev, (uint32_t)kick, sl->kfence, VK_TRUE, UINT64_MAX);
         V.st_wait_ms += now_ms() - t0;
-        vkResetFences(V.dev, (uint32_t)V.kick, V.kfence);
-        V.kick = 0;
+        vkResetFences(V.dev, (uint32_t)kick, sl->kfence);
     }
-    if (V.tspool && V.nts) {
+    if (sl->tspool && nts) {
         uint64_t ts[2 * (VK_KICKS + 2)];
         uint32_t k;
-        if (vkGetQueryPoolResults(V.dev, V.tspool, 0, V.nts, sizeof ts, ts, 8,
+        if (vkGetQueryPoolResults(V.dev, sl->tspool, 0, nts, sizeof ts, ts, 8,
                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
-            for (k = 0; k + 1 < V.nts; k += 2)
+            for (k = 0; k + 1 < nts; k += 2)
                 if (ts[k + 1] > ts[k])
                     V.gpu_ms += (double)(ts[k + 1] - ts[k]) * V.limits.timestampPeriod * 1e-6;
-        vkResetQueryPool(V.dev, V.tspool, 0, V.nts);
-        V.nts = 0;
+        vkResetQueryPool(V.dev, sl->tspool, 0, nts);
     }
-    vkResetCommandPool(V.dev, V.pool, 0);
+    vkResetCommandPool(V.dev, sl->pool, 0);
+}
+
+/* Copy-backs that have landed into guest RAM. `deferred`: they are a
+ * flipped frame's, and a surface drawn again since stays dirty. */
+static void write_back(const RbEnt *list, int n, int deferred)
+{
+    int i;
+    if (!n)
+        return;
+    if (!V.rb.coherent) {
+        VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+        mr.memory = V.rb.mem;
+        mr.size = VK_WHOLE_SIZE;
+        vkInvalidateMappedMemoryRanges(V.dev, 1, &mr);
+    }
+    /* The bytes change under any surface aliasing them, too. */
+    for (i = 0; i < V.nsurf; i++)
+        V.surf[i].hnow_ep = 0;
+    for (i = 0; i < n; i++) {
+        Surf *s = list[i].s;
+        uint32_t y, rows = list[i].rows;
+        /* Gone (evicted, recreated), or emptied meanwhile (alias_resolve
+         * moved its contents to another surface). */
+        if (s->img != list[i].img || !s->dirty)
+            continue;
+        if (s->swz)
+            surf_swizzle(s, guest(s->va), V.rb.map + list[i].off, rows, 1);
+        else
+            for (y = 0; y < rows; y++)
+                memcpy(guest(s->va) + (size_t)y * s->pitch,
+                       V.rb.map + list[i].off + (size_t)y * s->w * s->bpp,
+                       (size_t)s->w * s->bpp);
+        aw_check("copy-back", s);
+        if (!deferred || s->dirty == 2) {
+            s->dirty = 0;
+            s->dirty_rows = 0;
+        }
+        s->hash = surf_hash_now(s);
+        s->hash_valid = 1;
+    }
+}
+
+/* The current slot's handles and ring halves. */
+static void slot_use(int i)
+{
+    Slot *sl = &V.slots[i];
+    V.cur_slot = i;
+    V.pool = sl->pool;
+    memcpy(V.ucbs, sl->ucbs, sizeof V.ucbs);
+    memcpy(V.dcbs, sl->dcbs, sizeof V.dcbs);
+    memcpy(V.kfence, sl->kfence, sizeof V.kfence);
+    V.fence = sl->fence;
+    V.dpool = sl->dpool;
+    V.tspool = sl->tspool;
+    V.qpool = sl->qpool;
+    V.sem_acq = sl->sem_acq;
+    V.sem_done = sl->sem_done;
+    V.ucb = V.ucbs[0];
+    V.dcb = V.dcbs[0];
+    V.vtx.base = V.vtx.size * (VkDeviceSize)i;
+    V.idx.base = V.idx.size * (VkDeviceSize)i;
+    V.ubo.base = V.ubo.size * (VkDeviceSize)i;
+    V.stage.base = V.stage.size * (VkDeviceSize)i;
+    V.rb.base = V.rb.size * (VkDeviceSize)i;
+    V.vtx.used = V.idx.used = V.ubo.used = V.stage.used = V.rb.used = 0;
+}
+
+/* Finish a flipped frame: wait for it, land its copy-backs and reports,
+ * and free its slot. */
+static void pend_retire(Pend *p)
+{
+    Slot *sl;
+    Pend *newer;
+    uint64_t delta;
+    uint32_t i;
+    int chain = 0;
+
+    if (!p->active)
+        return;
+    p->active = 0;
+    sl = &V.slots[p->slot];
+    slot_wait(sl, p->kick, p->nts);
+    write_back(p->rb, p->nrb, 1);
+    delta = reports_write(sl->qpool, p->nq, p->qsamples, p->reps, p->nreps, p->rep_first);
+    /* Reports made since, with no clear of their own before them, count
+     * on from this frame's tail; they were recorded without it. */
+    newer = &V.pend[p->slot ^ 1];
+    if (newer->active && newer->seq > p->seq) {
+        for (i = 0; i < newer->nreps; i++)
+            if (newer->reps[i].pre)
+                newer->reps[i].base += delta;
+        chain = newer->cleared;
+    }
+    if (!chain) {
+        for (i = 0; i < V.nreps; i++)
+            if (V.reps[i].pre)
+                V.reps[i].base += delta;
+        if (!V.rep_cleared)
+            V.rep_acc += delta;
+    }
+    vkResetDescriptorPool(V.dev, sl->dpool, 0);
+    destroy_list(p->retired, p->nretired);
+    p->nretired = 0;
+}
+
+/* The flipped frame still in flight, if any. */
+static void pend_retire_all(void)
+{
+    int i;
+    for (i = 0; i < VK_SLOTS; i++)
+        if (i != V.cur_slot)
+            pend_retire(&V.pend[i]);
+}
+
+/* Submit the segment and wait for it. With `readback`, every dirty surface
+ * is copied back into guest RAM first. */
+static void vk_sync_inner(int readback)
+{
+    static RbEnt list[VK_MAX_SURF];
+    int nrb = 0;
+
+    /* A flipped frame's copy-backs and reports first: whoever asked for
+     * this sync may be about to read them. */
+    pend_retire_all();
+    if (!V.recording)
+        return;
+    if (!segment_submit(readback, list, &nrb))
+        return;
+    slot_wait(&V.slots[V.cur_slot], V.kick, V.nts);
+    V.kick = 0;
+    V.nts = 0;
     V.ucb = V.ucbs[0];
     V.dcb = V.dcbs[0];
     V.recording = 0;
     V.st_syncs++;
-
-    if (any) {
-        if (!V.rb.coherent) {
-            VkMappedMemoryRange mr = { VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
-            mr.memory = V.rb.mem;
-            mr.size = VK_WHOLE_SIZE;
-            vkInvalidateMappedMemoryRanges(V.dev, 1, &mr);
-        }
-        for (i = 0; i < V.nsurf; i++) {
-            Surf *s = &V.surf[i];
-            uint32_t y, rows = (uint32_t)s->rb_pending;
-            if (!rows)
-                continue;
-            if (s->swz)
-                surf_swizzle(s, guest(s->va), V.rb.map + s->rb_off, rows, 1);
-            else
-                for (y = 0; y < rows; y++)
-                    memcpy(guest(s->va) + (size_t)y * s->pitch,
-                           V.rb.map + s->rb_off + (size_t)y * s->w * s->bpp,
-                           (size_t)s->w * s->bpp);
-            aw_check("copy-back", s);
-            s->rb_pending = 0;
-            s->dirty = 0;
-            s->dirty_rows = 0;
-            s->hash = surf_hash(s);
-            s->hash_valid = 1;
-        }
-    }
+    write_back(list, nrb, 0);
     reports_resolve();
     if (V.nfq) {
         /* Flight recorder: the pass counts, as "Q F<frame> D<draw> <samples>"
@@ -1399,6 +1595,69 @@ static void vk_sync_inner(int readback)
     V.last_set = VK_NULL_HANDLE;
     destroy_retired();
     V.epoch++;
+}
+
+/* The flip: submit the frame and go on to record the next one in the other
+ * slot while the GPU draws it. The frame before is waited for now -- it has
+ * had a whole frame's time -- and its copy-backs and visibility reports land
+ * in guest RAM a frame later than a full sync would put them. Anything that
+ * needs them sooner syncs (any_dirty_overlap and the rest see a surface
+ * whose copy-back is in flight as dirty). */
+static void vk_flip(void)
+{
+    int cur = V.cur_slot, nxt = cur ^ 1, i;
+    Pend *p = &V.pend[cur];
+
+    /* Debug captures read their results right after the sync. */
+    if (!V.pipelined || !V.recording || V.nfq || s_probe_nq || V.present_dump_px) {
+        vk_sync(1);
+        return;
+    }
+    if (!segment_submit(1, p->rb, &p->nrb))
+        return;
+    for (i = 0; i < p->nrb; i++)
+        p->rb[i].s->dirty = 2;
+    p->slot = cur;
+    p->kick = V.kick;
+    p->nts = V.nts;
+    p->seq = ++V.flip_seq;
+    p->nq = V.nq;
+    memcpy(p->qsamples, V.qsamples, V.nq);
+    p->nreps = V.nreps;
+    memcpy(p->reps, V.reps, V.nreps * sizeof V.reps[0]);
+    p->rep_first = V.rep_first;
+    p->cleared = V.rep_cleared;
+    memcpy(p->retired, V.retired, (size_t)V.nretired * sizeof V.retired[0]);
+    p->nretired = V.nretired;
+    p->active = 1;
+    V.kick = 0;
+    V.nts = 0;
+    V.nq = V.nreps = V.rep_first = 0;
+    V.rep_cleared = 0;
+    V.nretired = 0;
+    V.recording = 0;
+    V.st_syncs++;
+    pend_retire(&V.pend[nxt]);
+    slot_use(nxt);
+    V.sets_used = 0;
+    V.last_set = VK_NULL_HANDLE;
+    V.epoch++;
+}
+
+/* Surfaces over [va, va+bytes) whose only GPU-newer contents are a flipped
+ * frame's copy-back (dirty 2): landing that frame is enough -- it has had
+ * the whole frame to finish -- rather than a full sync of this one. RSC2
+ * clears its swizzled shadow map through a linear surface each frame. */
+static void settle_inflight(uint32_t va, uint32_t bytes, const Surf *except)
+{
+    int i;
+    for (i = 0; i < V.nsurf; i++) {
+        const Surf *s = &V.surf[i];
+        if (s != except && s->dirty == 2 && va < s->va + surf_bytes(s) && va + bytes > s->va) {
+            pend_retire_all();
+            return;
+        }
+    }
 }
 
 static int any_dirty_overlap(uint32_t va, uint32_t bytes, const Surf *except)
@@ -1817,64 +2076,56 @@ static int vk_init(void)
         VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
         VkCommandBuffer cbs[2];
         VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
+        VkQueryPoolCreateInfo qci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        const char *e = getenv("RECOMP_VK_KICK");
+        int sl, k;
+        V.kick_draws = e ? atoi(e) : 16;
+        e = getenv("RECOMP_VK_PIPELINE");
+        V.pipelined = e ? atoi(e) != 0 : 1;
         pci.queueFamilyIndex = V.qf;
         pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-        if (vkCreateCommandPool(V.dev, &pci, NULL, &V.pool) != VK_SUCCESS)
-            return 0;
-        cai.commandPool = V.pool;
         cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cai.commandBufferCount = 2;
-        if (vkAllocateCommandBuffers(V.dev, &cai, cbs) != VK_SUCCESS)
-            return 0;
-        V.ucb = cbs[0];
-        V.dcb = cbs[1];
-        if (vkCreateFence(V.dev, &fci, NULL, &V.fence) != VK_SUCCESS)
-            return 0;
-        if (getenv("RECOMP_VK_STATS") && V.limits.timestampPeriod > 0.0f) {
-            VkQueryPoolCreateInfo tq = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
-            tq.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            tq.queryCount = 2 * (VK_KICKS + 2);
-            if (vkCreateQueryPool(V.dev, &tq, NULL, &V.tspool) == VK_SUCCESS)
-                vkResetQueryPool(V.dev, V.tspool, 0, tq.queryCount);
-            else
-                V.tspool = VK_NULL_HANDLE;
-        }
-        {
-            int k;
-            const char *e = getenv("RECOMP_VK_KICK");
-            V.kick_draws = e ? atoi(e) : 16;
-            V.ucbs[0] = V.ucb;
-            V.dcbs[0] = V.dcb;
-            for (k = 1; k < VK_KICKS; k++) {
+        qci.queryType = VK_QUERY_TYPE_OCCLUSION;
+        qci.queryCount = VK_MAX_QUERIES;
+        for (sl = 0; sl < VK_SLOTS; sl++) {
+            Slot *q = &V.slots[sl];
+            if (vkCreateCommandPool(V.dev, &pci, NULL, &q->pool) != VK_SUCCESS)
+                return 0;
+            cai.commandPool = q->pool;
+            for (k = 0; k < VK_KICKS; k++) {
                 if (vkAllocateCommandBuffers(V.dev, &cai, cbs) != VK_SUCCESS)
                     return 0;
-                V.ucbs[k] = cbs[0];
-                V.dcbs[k] = cbs[1];
-            }
-            for (k = 0; k < VK_KICKS; k++)
-                if (vkCreateFence(V.dev, &fci, NULL, &V.kfence[k]) != VK_SUCCESS)
+                q->ucbs[k] = cbs[0];
+                q->dcbs[k] = cbs[1];
+                if (vkCreateFence(V.dev, &fci, NULL, &q->kfence[k]) != VK_SUCCESS)
                     return 0;
-        }
-        {
-            VkQueryPoolCreateInfo qci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
-            qci.queryType = VK_QUERY_TYPE_OCCLUSION;
-            qci.queryCount = VK_MAX_QUERIES;
-            if (vkCreateQueryPool(V.dev, &qci, NULL, &V.qpool) != VK_SUCCESS)
+            }
+            if (vkCreateFence(V.dev, &fci, NULL, &q->fence) != VK_SUCCESS)
                 return 0;
-            vkResetQueryPool(V.dev, V.qpool, 0, VK_MAX_QUERIES);
-            if (vkCreateQueryPool(V.dev, &qci, NULL, &V.fqpool) == VK_SUCCESS)
-                vkResetQueryPool(V.dev, V.fqpool, 0, VK_MAX_QUERIES);
+            if (getenv("RECOMP_VK_STATS") && V.limits.timestampPeriod > 0.0f) {
+                VkQueryPoolCreateInfo tq = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+                tq.queryType = VK_QUERY_TYPE_TIMESTAMP;
+                tq.queryCount = 2 * (VK_KICKS + 2);
+                if (vkCreateQueryPool(V.dev, &tq, NULL, &q->tspool) == VK_SUCCESS)
+                    vkResetQueryPool(V.dev, q->tspool, 0, tq.queryCount);
+                else
+                    q->tspool = VK_NULL_HANDLE;
+            }
+            if (vkCreateQueryPool(V.dev, &qci, NULL, &q->qpool) != VK_SUCCESS)
+                return 0;
+            vkResetQueryPool(V.dev, q->qpool, 0, VK_MAX_QUERIES);
+            vkCreateSemaphore(V.dev, &sci, NULL, &q->sem_acq);
+            vkCreateSemaphore(V.dev, &sci, NULL, &q->sem_done);
         }
-        {
-            VkSemaphoreCreateInfo sci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-            vkCreateSemaphore(V.dev, &sci, NULL, &V.sem_acq);
-            vkCreateSemaphore(V.dev, &sci, NULL, &V.sem_done);
-        }
+        if (vkCreateQueryPool(V.dev, &qci, NULL, &V.fqpool) == VK_SUCCESS)
+            vkResetQueryPool(V.dev, V.fqpool, 0, VK_MAX_QUERIES);
     }
     if (!ring_init(&V.vtx, VK_RING_VTX, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, 0)
         || !ring_init(&V.idx, VK_RING_IDX, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, 0)
         || !ring_init(&V.ubo, VK_RING_UBO, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, 0)
-        || !ring_init(&V.stage, VK_RING_STAGE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0)
+        || !ring_init(&V.stage, VK_RING_STAGE / VK_SLOTS, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, 0)
         || !ring_init(&V.rb, VK_RING_RB, VK_BUFFER_USAGE_TRANSFER_DST_BIT, 1))
         return 0;
     {
@@ -1913,8 +2164,13 @@ static int vk_init(void)
         dpci.maxSets = VK_MAX_SETS;
         dpci.poolSizeCount = 2;
         dpci.pPoolSizes = ps;
-        if (vkCreateDescriptorPool(V.dev, &dpci, NULL, &V.dpool) != VK_SUCCESS)
-            return 0;
+        {
+            int sl;
+            for (sl = 0; sl < VK_SLOTS; sl++)
+                if (vkCreateDescriptorPool(V.dev, &dpci, NULL, &V.slots[sl].dpool) != VK_SUCCESS)
+                    return 0;
+            slot_use(0);
+        }
         {
             /* The driver checks the header (vendor, device, UUID) and
              * ignores data from anything else. */
@@ -2465,7 +2721,7 @@ static int rt_cube(const Nv2aVkTex *d, uint32_t bytes, VkImageView *view, uint32
             if (q != face[f] && q->dirty && va < q->va + surf_bytes(q) && va + fbytes > q->va)
                 return 0;
         }
-        if (!face[f]->dirty && (!face[f]->hash_valid || surf_hash(face[f]) != face[f]->hash))
+        if (!face[f]->dirty && (!face[f]->hash_valid || surf_hash_now(face[f]) != face[f]->hash))
             return 0;
     }
     n = d->width * V.scale;
@@ -2627,6 +2883,7 @@ static int tex_get(const Nv2aVkTex *t, VkImageView *view, uint32_t *levels_out)
     /* The title may draw a surface and sample it in the same frame. */
     if (rt_tex(&d, bytes, view, levels_out))
         return 1;
+    settle_inflight(d.offset, bytes, NULL);
     if (any_dirty_overlap(d.offset, bytes, NULL)) {
         static int trace = -1;
         if (trace < 0)
@@ -3073,7 +3330,7 @@ static Surf *surf_get(const Nv2aVkState *st)
         uint64_t h;
         if (rows > s->rows)
             s->rows = rows;
-        h = surf_hash(s);
+        h = surf_hash_now(s);
         if (!s->hash_valid || h != s->hash) {
             static int trace = -1;
             static uint32_t shown;
@@ -3649,6 +3906,8 @@ static int begin_target(const Nv2aVkState *st)
     uint32_t w, h;
 
     cs = surf_get(st);
+    if (cs)
+        settle_inflight(cs->va, cs->rows * cs->pitch, cs);
     if (cs && any_dirty_overlap(cs->va, cs->rows * cs->pitch, cs) && alias_resolve(cs)) {
         if (getenv("RECOMP_VK_SYNC_TRACE")) {
             int k;
@@ -4189,7 +4448,7 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     VkDeviceSize voff = 0, ioff = 0, uoff = 0, coff = 0;
     VkDeviceSize vbytes = (VkDeviceSize)nv * ninputs * 16;
     void *vp, *ip;
-    Nv2aVkUbo *ub;
+    Nv2aVkUbo *ub, *ubm, ubl;
     VkPipeline pipe;
     VkDescriptorSet set;
     VkViewport vpt;
@@ -4299,23 +4558,27 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
 
     vp = ring_alloc(&V.vtx, vbytes, 16, &voff);
     ip = ring_alloc(&V.idx, (VkDeviceSize)nidx * 4, 4, &ioff);
-    ub = (Nv2aVkUbo *)ring_alloc(&V.ubo, sizeof *ub,
-                                 V.limits.minUniformBufferOffsetAlignment, &uoff);
-    if (!vp || !ip || !ub || !const_upload(&coff) || V.sets_used >= VK_MAX_SETS) {
+    ubm = (Nv2aVkUbo *)ring_alloc(&V.ubo, sizeof *ubm,
+                                  V.limits.minUniformBufferOffsetAlignment, &uoff);
+    if (!vp || !ip || !ubm || !const_upload(&coff) || V.sets_used >= VK_MAX_SETS) {
         vk_sync(0);
         if (!begin_target(st))
             return;
         vp = ring_alloc(&V.vtx, vbytes, 16, &voff);
         ip = ring_alloc(&V.idx, (VkDeviceSize)nidx * 4, 4, &ioff);
-        ub = (Nv2aVkUbo *)ring_alloc(&V.ubo, sizeof *ub,
-                                     V.limits.minUniformBufferOffsetAlignment, &uoff);
-        if (!vp || !ip || !ub || !const_upload(&coff))
+        ubm = (Nv2aVkUbo *)ring_alloc(&V.ubo, sizeof *ubm,
+                                      V.limits.minUniformBufferOffsetAlignment, &uoff);
+        if (!vp || !ip || !ubm || !const_upload(&coff))
             return;
     }
     memcpy(vp, v, (size_t)vbytes);
     memcpy(ip, idx, (size_t)nidx * 4);
 
-    /* Per-draw constants. */
+    /* Per-draw constants. Built in ordinary memory and copied over once: the
+     * ring is mapped device memory, write-combined on most drivers, where
+     * the reads below (the specialisation key) cost about a microsecond
+     * a draw. */
+    ub = &ubl;
     memset(ub, 0, sizeof *ub);
     {
         uint32_t w = V.cur_cs ? V.cur_cs->w : V.cur_zs->w;
@@ -4408,6 +4671,7 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         ub->zoff[2] = (float)V.sx;      /* host pixels per title pixel */
         ub->zoff[3] = (float)V.scale;
     }
+    memcpy(ubm, ub, sizeof *ub);
 
     /* Descriptor set: reused while the images and samplers stay put. */
     if (V.last_set && !memcmp(views, V.last_views, sizeof views)
@@ -5156,6 +5420,7 @@ void nv2a_vk_report_clear(void)
 {
     V.rep_acc = 0;
     V.rep_first = V.nq;
+    V.rep_cleared = 1;
 }
 
 void nv2a_vk_report_get(uint32_t va, uint64_t stamp)
@@ -5174,12 +5439,15 @@ void nv2a_vk_report_get(uint32_t va, uint64_t stamp)
     V.reps[V.nreps].base = V.rep_acc;
     V.reps[V.nreps].q0 = V.rep_first;
     V.reps[V.nreps].q1 = V.nq;
+    V.reps[V.nreps].pre = !V.rep_cleared;
     V.nreps++;
     V.st_reports++;
     /* Nothing recorded yet this segment: answer now rather than at a sync
      * that may be a frame away. */
-    if (!V.recording)
+    if (!V.recording) {
+        pend_retire_all();        /* its tail counts towards this one */
         reports_resolve();
+    }
 }
 
 /* ---- presentation -------------------------------------------------------- */
@@ -5845,7 +6113,7 @@ void nv2a_vk_flush(void)
     static int stats = -1;
     if (V.state <= 0)
         return;
-    vk_sync(1);
+    vk_flip();
     hitch_check();
     V.frame++;
     {
