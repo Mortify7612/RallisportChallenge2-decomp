@@ -38,7 +38,8 @@ int nv2a_vk_device_names(char (*names)[256], int max);
 #define MAXV 12
 
 enum {
-    O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS, O_FPSCOUNT, O_SHOW,
+    O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS, O_FPSCOUNT, O_HDR, O_HDRPAPER,
+    O_SHOW,
     O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_KEYBOARD, O_KEYS, O_STEER, O_RUMBLE,
     O_COUNT
 };
@@ -171,6 +172,26 @@ static void opts_init(int list_gpus)
                 "recent frames. F3 switches it while playing.");
     opt_add(o, "Off", "0");
     opt_add(o, "On", "1");
+
+    o = opt_def(O_HDR, "hdr", "RECOMP_HDR", NULL, 0, "HDR",
+                "High dynamic range output on an HDR screen (turn HDR on in the system's "
+                "display settings first). The sky, lights and the sun's glare get brighter "
+                "than white; the HUD stays as it was.");
+    opt_add(o, "Off", "0");
+    opt_add(o, "On", "1");
+
+    o = opt_def(O_HDRPAPER, "hdr_brightness", "RECOMP_HDR_PAPER", NULL, 0, "HDR brightness",
+                "How bright the game's white is in HDR, in nits; the highlights go above "
+                "it. Raise it if the game looks darker than without HDR, lower it if it "
+                "looks too bright.");
+    opt_add(o, "100 nits", "100");
+    opt_add(o, "150 nits", "150");
+    opt_add(o, "203 nits  (standard)", "203");
+    opt_add(o, "250 nits", "250");
+    opt_add(o, "300 nits", "300");
+    opt_add(o, "400 nits", "400");
+    opt_add(o, "500 nits", "500");
+    o->def = 2;
 
     o = opt_def(O_SHOW, "show_launcher", NULL, "LAUNCHER", 0, "Show at startup",
                 "When off, the game starts straight away. Start it with --launcher "
@@ -369,7 +390,7 @@ static void env_put(const char *k, const char *v)
 static int vk_only(int i)
 {
     return i == O_GPU || i == O_SCALE || i == O_MSAA || i == O_ANISO || i == O_AO
-        || i == O_FPSCOUNT;
+        || i == O_FPSCOUNT || i == O_HDR || i == O_HDRPAPER;
 }
 
 /* Only variables nobody set by hand. The Vulkan-only settings are left out
@@ -402,6 +423,8 @@ static int row_disabled(int i)
         return 1;
     if ((i == O_KEYS || i == O_STEER)
             && strcmp(s_opt[O_KEYBOARD].val[s_opt[O_KEYBOARD].cur], "0") == 0)
+        return 1;
+    if (i == O_HDRPAPER && strcmp(s_opt[O_HDR].val[s_opt[O_HDR].cur], "1") != 0)
         return 1;
     return i == O_GPU && s_opt[i].n < 2;
 }
@@ -829,6 +852,9 @@ static void draw(void)
                      o->help, o->env, o->env_set);
         else if (row_disabled(s_focus) && (s_focus == O_KEYS || s_focus == O_STEER))
             snprintf(t, sizeof t, "%s  (Turn the keyboard on to use this.)", o->help);
+        else if (row_disabled(s_focus) && s_focus == O_HDRPAPER
+                 && strcmp(s_opt[O_RENDERER].val[s_opt[O_RENDERER].cur], "0") != 0)
+            snprintf(t, sizeof t, "%s  (Turn HDR on to use this.)", o->help);
         else if (row_disabled(s_focus) && !o->soon)
             snprintf(t, sizeof t, "%s  (Only used by the Vulkan renderer.)", o->help);
         else

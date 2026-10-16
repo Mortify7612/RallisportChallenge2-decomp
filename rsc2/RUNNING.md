@@ -88,6 +88,23 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
   - `RECOMP_VK_AO_SHOW=1` shows the occlusion term on its own.
 - The launcher sets these three from its Graphics section. Its default is
   16x anisotropic, with MSAA and AO off.
+- `RECOMP_HDR=1`: HDR output, when the window offers an HDR format. HDR10
+  (10-bit PQ, BT.2020) is used if available, else scRGB. Turn HDR on in the
+  system's display settings first; otherwise the game says so and stays SDR.
+  The game draws in SDR, so its frame is mapped up:
+  - its white sits at paper white, `RECOMP_HDR_PAPER` nits (default 203);
+  - only the brightest part (linear luminance above `RECOMP_HDR_KNEE`,
+    0.25) is stretched, up to `RECOMP_HDR_PEAK` nits (1000) for pure white.
+    `RECOMP_HDR_STRENGTH` (0-2, default 1) scales the stretch;
+  - the light the game adds (the sun's glare) is kept in a float buffer and
+    goes up towards the peak, scaled by `RECOMP_HDR_GLOW` (1);
+  - the HUD and menus stay at paper white, not stretched. The HUD is the
+    draws without a depth test after the 3D scene. A frame with no 3D scene
+    (menus, films) isn't stretched at all.
+  - The launcher has HDR and HDR brightness (paper white).
+  - `RECOMP_HDR_DUMP=<prefix>:<frame>[,<frame>...]` writes those frames as
+    they would go to an HDR screen, in nits, to `<prefix>_<frame>.raw`. It
+    works headless too, and needs no HDR screen.
 - Compiled shaders are cached in `~/.cache/xboxrecomp/vk`
   (`RECOMP_VK_CACHE=dir`, `=0` off).
 

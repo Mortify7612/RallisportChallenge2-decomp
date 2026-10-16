@@ -433,6 +433,26 @@ static struct {
     uint32_t sc_n, sc_idx;
     VkSemaphore sem_acq, sem_done;
     int present_pending, sc_dead;
+    /* RECOMP_HDR: an HDR swapchain and the pass that fills it (hdr_*). */
+    int hdr_want;               /* asked for; hdr_mode: what the window got */
+    int hdr_mode;               /* 0 SDR, 1 HDR10 (PQ), 2 scRGB (linear) */
+    float hdr_paper, hdr_peak, hdr_strength, hdr_glow, hdr_knee;
+    int has_colorspace_ext, has_hdr_meta;
+    VkImageView sc_view[8];
+    VkPipeline hdr_pipe[3];     /* per mode, 0: the headless dump's */
+    VkSampler hdr_samp;
+    VkImage hdr_dimg;           /* RECOMP_HDR_DUMP target */
+    VkDeviceMemory hdr_dmem;
+    VkImageView hdr_dview;
+    int32_t ov_dst[4];          /* the counter's window rect, drawn by the pass */
+    /* The HDR side buffer, the presented scene's size: rgb the light the
+     * title adds (sun glare), alpha where its HUD covers. Filled by drawing
+     * those draws a second time into it (aux_*). */
+    VkImage aux_img;
+    VkDeviceMemory aux_mem;
+    VkImageView aux_view;
+    uint32_t aux_w, aux_h, aux_va, aux_frame;
+    int aux_used;               /* drawn into since the last clear */
     /* Visibility tests: one occlusion query per draw while counting is on;
      * a report sums the queries since CLEAR_REPORT_VALUE and is written to
      * guest RAM when the segment's results are back. */
@@ -465,6 +485,7 @@ static struct {
     const char *present_dump_path;
     uint32_t dump_w, dump_h;    /* the pending dump's size and byte order */
     int dump_bgr;
+    int dump_float;             /* RGBA half floats, written raw (hdr_dump) */
     /* last descriptor set, reused while the textures stay the same */
     VkDescriptorSet last_set;
     VkImageView last_views[8];
@@ -838,11 +859,16 @@ static void segment_begin(void)
     }
 }
 
+static void aux_flush(void);
+static int s_naux;
+
 static void end_rendering(void)
 {
     if (!V.rendering)
         return;
     vkCmdEndRendering(V.dcb);
+    if (s_naux)
+        aux_flush();               /* HDR side buffer: this scene's draws */
     V.rendering = 0;
     V.cur_cs = NULL;
     V.cur_zs = NULL;
@@ -1475,7 +1501,8 @@ static int segment_submit(int readback, RbEnt *list, int *nrb)
     si.commandBufferCount = 2;
     si.pCommandBuffers = cbs;
     {
-        static const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        static const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT
+                                                     | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         if (V.present_pending) {
             si.waitSemaphoreCount = 1;
             si.pWaitSemaphores = &V.sem_acq;
@@ -1737,6 +1764,14 @@ static void vk_sync_inner(int readback)
             mr.size = VK_WHOLE_SIZE;
             vkInvalidateMappedMemoryRanges(V.dev, 1, &mr);
         }
+        if (f && V.dump_float) {
+            fprintf(f, "RSC2HDR %u %u\n", w, h);
+            fwrite(V.present_dump_px, 8, (size_t)w * h, f);
+            fclose(f);
+            fprintf(stderr, "  [VK] wrote %s (%ux%u, HDR in nits)\n", V.present_dump_path, w, h);
+            f = NULL;
+        }
+        V.dump_float = 0;
         if (f) {
             uint8_t hdr[54], *line = (uint8_t *)calloc(1, row);
             uint32_t total = 54 + row * h, img = row * h;
@@ -2155,8 +2190,9 @@ static int vk_init(void)
             "VK_KHR_surface", "VK_KHR_xlib_surface", "VK_KHR_xcb_surface",
             "VK_KHR_wayland_surface", "VK_KHR_win32_surface",
             "VK_KHR_android_surface", "VK_EXT_metal_surface",
+            "VK_EXT_swapchain_colorspace",
         };
-        static const char *on[8];
+        static const char *on[12];
         VkExtensionProperties ep[256];
         uint32_t ne = 256, j, k, n = 0;
         vkEnumerateInstanceExtensionProperties(NULL, &ne, ep);
@@ -2164,6 +2200,8 @@ static int vk_init(void)
             for (k = 0; k < ne; k++)
                 if (!strcmp(ep[k].extensionName, want[j])) {
                     on[n++] = want[j];
+                    if (!strcmp(want[j], "VK_EXT_swapchain_colorspace"))
+                        V.has_colorspace_ext = 1;
                     break;
                 }
         ici.enabledExtensionCount = n;
@@ -2279,16 +2317,21 @@ static int vk_init(void)
         }
         dci.pNext = &f2;
         {
-            static const char *swext[1] = { "VK_KHR_swapchain" };
+            static const char *swext[2] = { "VK_KHR_swapchain", "VK_EXT_hdr_metadata" };
             VkExtensionProperties ep[512];
             uint32_t ne = 512, k;
             vkEnumerateDeviceExtensionProperties(V.pd, NULL, &ne, ep);
-            for (k = 0; k < ne; k++)
+            for (k = 0; k < ne; k++) {
                 if (!strcmp(ep[k].extensionName, "VK_KHR_swapchain"))
                     V.has_swapchain_ext = 1;
+                if (!strcmp(ep[k].extensionName, "VK_EXT_hdr_metadata"))
+                    V.has_hdr_meta = 1;
+            }
             if (V.has_swapchain_ext) {
-                dci.enabledExtensionCount = 1;
+                dci.enabledExtensionCount = V.has_hdr_meta ? 2 : 1;
                 dci.ppEnabledExtensionNames = swext;
+            } else {
+                V.has_hdr_meta = 0;
             }
         }
         dci.queueCreateInfoCount = 1;
@@ -2785,16 +2828,25 @@ static void pipe_record(const PipeDesc *d, const uint64_t k[4], uint32_t prog, i
  * or, with `async_ok` (a title program's draw, which can fall back to the
  * CPU vertex path), built by the worker: NULL until it is ready. Building
  * one is ~35 ms on a desktop driver, a stall for every new state. */
+static VkPipeline pipeline_from(PipeDesc *dp, const Nv2aVkState *s, uint32_t prog, int async_ok);
+
 static VkPipeline pipeline(VkFormat cfmt, int has_depth, const Nv2aVkState *s,
                            VkShaderModule vs, uint32_t prog, uint32_t ninputs, int async_ok)
 {
-    int fast = !needs_fragdepth(s);
     PipeDesc d;
+    pipe_desc(&d, cfmt, has_depth, s, vs, ninputs);
+    return pipeline_from(&d, s, prog, async_ok);
+}
+
+/* The same from a description the caller made (or changed). */
+static VkPipeline pipeline_from(PipeDesc *dp, const Nv2aVkState *s, uint32_t prog, int async_ok)
+{
+    int fast = !needs_fragdepth(s);
+    PipeDesc d = *dp;
     uint64_t k[4];
     Pipe *pp;
     VkPipeline p;
 
-    pipe_desc(&d, cfmt, has_depth, s, vs, ninputs);
     d.fs = fast ? V.fs_fast : V.fs;
     pipe_key(&d, prog, fast, 0, k);
     pp = pipe_find(k);
@@ -3887,8 +3939,9 @@ static void ms_create(Surf *cs)
                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 }
 
-/* A descriptor set for a fullscreen pass: `a` and `b` (b may be NULL). */
-static VkDescriptorSet post_set(VkImageView a, VkImageView b)
+/* A descriptor set for a fullscreen pass: `a` and `b` (b may be NULL),
+ * sampled through `samp`. */
+static VkDescriptorSet post_set_s(VkImageView a, VkImageView b, VkSampler samp)
 {
     VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
     VkDescriptorImageInfo ii[2];
@@ -3901,7 +3954,7 @@ static VkDescriptorSet post_set(VkImageView a, VkImageView b)
     if (vkAllocateDescriptorSets(V.dev, &ai, &set) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     V.sets_used++;
-    ii[0].sampler = ii[1].sampler = V.post_samp;
+    ii[0].sampler = ii[1].sampler = samp;
     ii[0].imageView = a;
     ii[1].imageView = b ? b : a;
     ii[0].imageLayout = ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -3916,6 +3969,11 @@ static VkDescriptorSet post_set(VkImageView a, VkImageView b)
     }
     vkUpdateDescriptorSets(V.dev, 2, wr, 0, NULL);
     return set;
+}
+
+static VkDescriptorSet post_set(VkImageView a, VkImageView b)
+{
+    return post_set_s(a, b, V.post_samp);
 }
 
 /* `cs->img` was written directly: copy it into the multisampled twin (every
@@ -5060,6 +5118,224 @@ static int zpass_trace(void)
     return at >= 0 && nv2a_pb_presented_frames() == (uint32_t)at;
 }
 
+/* ---- HDR side buffer ----------------------------------------------------- */
+
+/* What the HDR pass needs to know beyond the finished frame, kept for the
+ * presented scene: where the title added light (its sun glare: additive
+ * draws without a depth test, before the HUD -- in a float buffer they
+ * keep the brightness that clipped to white in the frame), and where its
+ * HUD covers (the draws without a depth test after the 3D, as for ambient
+ * occlusion). Those draws are drawn a second time into aux_img: recorded
+ * at the draw, replayed when the scene's rendering instance ends -- one
+ * extra instance, not one per draw. */
+typedef struct {
+    VkPipeline pipe;
+    VkDescriptorSet set;
+    uint32_t doff[2];
+    VkDeviceSize voff, ioff;
+    uint32_t nidx;
+    VkViewport vp;
+    VkRect2D sc;
+    VkCullModeFlags cull;
+    VkFrontFace ff;
+    float bc[4];
+} AuxDraw;
+
+#define AUX_MAX 256
+static AuxDraw s_aux[AUX_MAX];
+static uint32_t s_aux_w, s_aux_h, s_aux_rva;  /* the recorded draws' surface */
+static uint32_t s_aux_zdraws;                 /* depth-tested draws into it */
+static uint32_t s_aux_3d;                     /* surface with a 3D scene this frame */
+static int s_aux_hud;                         /* its HUD has begun */
+static int s_aux_on = -1;
+
+/* This draw into the side buffer too? 1 its added light, 2 its coverage
+ * as HUD, 0 no. */
+static int aux_kind(const Nv2aVkState *st)
+{
+    const Surf *cs = V.cur_cs;
+    uint32_t va;
+    if (s_aux_on <= 0)
+        return 0;
+    if (!cs || !V.cur_zs || cs->swz || cs->bpp != 4 || cs->w != 640)
+        return 0;
+    va = cs->va & 0x0FFFFFFFu;
+    if (va != (V.flip_va[0] & 0x0FFFFFFFu) && va != (V.flip_va[1] & 0x0FFFFFFFu))
+        return 0;
+    if (s_aux_3d && s_aux_3d != cs->va)
+        return 0;
+    if (st->depth_test && !s_aux_hud) {
+        if (++s_aux_zdraws == 32)
+            s_aux_3d = cs->va;
+    } else if (!st->depth_test && s_aux_3d == cs->va) {
+        s_aux_hud = 1;
+    }
+    if (s_aux_hud)
+        return st->color_mask & 0x01010101u ? 2 : 0;
+    /* Before the HUD: additive light drawn over everything (ALWAYS, or no
+     * depth test), into the colour. */
+    if (st->blend_enable && st->blend_dfactor == 0x0001 && st->blend_equation == 0x8006
+            && (!st->depth_test || st->depth_func == 0x0207) && (st->color_mask & 0x00010101u))
+        return 1;
+    return 0;
+}
+
+static VkPipeline pipeline_from(PipeDesc *d, const Nv2aVkState *s, uint32_t prog, int async_ok);
+
+/* The draw's pipeline into the side buffer: the general fragment shader,
+ * no depth, one sample. Light: the title's own blend into the colour.
+ * HUD: its coverage into alpha -- `a + dst (1 - a)` for a blended draw,
+ * 1 for an opaque one (the blend constant's alpha, set to 1). */
+static VkPipeline aux_pipeline(const Nv2aVkState *st, int kind, VkShaderModule vs,
+                               uint32_t prog, uint32_t ninputs)
+{
+    PipeDesc d;
+    pipe_desc(&d, VK_FORMAT_R16G16B16A16_SFLOAT, 0, st, vs, ninputs);
+    d.samples = 1;
+    if (kind == 1) {
+        d.cm &= VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT;
+    } else {
+        d.cm = VK_COLOR_COMPONENT_A_BIT;
+        d.beq = 0x8006;
+        if (d.blend) {
+            d.sf = 0x0001;
+            d.df = 0x0303;
+        } else {
+            d.blend = 1;
+            d.sf = 0x8003;
+            d.df = 0x0000;
+        }
+    }
+    return pipeline_from(&d, st, prog, 1);
+}
+
+static void aux_record(const Nv2aVkState *st, int kind, VkShaderModule vs, uint32_t prog,
+                       uint32_t ninputs, VkDescriptorSet set, const uint32_t *doff,
+                       VkDeviceSize voff, VkDeviceSize ioff, uint32_t nidx,
+                       const VkViewport *vp, const VkRect2D *sc, VkCullModeFlags cull,
+                       VkFrontFace ff, const float *bc)
+{
+    AuxDraw *a;
+    VkPipeline p;
+    const Surf *cs = V.cur_cs;
+    if (s_naux == AUX_MAX || (s_naux && s_aux_rva != cs->va))
+        return;
+    p = aux_pipeline(st, kind, vs, prog, ninputs);
+    if (!p)
+        return;                     /* still being built: next frame */
+    a = &s_aux[s_naux++];
+    a->pipe = p;
+    a->set = set;
+    a->doff[0] = doff[0];
+    a->doff[1] = doff[1];
+    a->voff = voff;
+    a->ioff = ioff;
+    a->nidx = nidx;
+    a->vp = *vp;
+    a->sc = *sc;
+    a->cull = cull;
+    a->ff = ff;
+    if (kind == 2) {
+        a->bc[0] = a->bc[1] = a->bc[2] = 0.0f;
+        a->bc[3] = 1.0f;
+    } else {
+        memcpy(a->bc, bc, sizeof a->bc);
+    }
+    s_aux_rva = cs->va;
+    s_aux_w = cs->w * V.sx;
+    s_aux_h = cs->h * V.scale;
+}
+
+/* The recorded draws into the side buffer; right after the scene's
+ * rendering instance has ended (end_rendering), the buffers they use still
+ * those of the segment being recorded. */
+static void aux_flush(void)
+{
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    int i, n = s_naux;
+
+    s_naux = 0;
+    if (!V.aux_img || V.aux_w != s_aux_w || V.aux_h != s_aux_h) {
+        if (V.aux_img)
+            retire(V.aux_img, V.aux_mem, V.aux_view);
+        V.aux_img = VK_NULL_HANDLE;
+        V.aux_used = 0;
+        if (!image_create(s_aux_w, s_aux_h, 1, 1, VK_FORMAT_R16G16B16A16_SFLOAT,
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
+                          VK_IMAGE_ASPECT_COLOR_BIT, &V.aux_img, &V.aux_mem, &V.aux_view)) {
+            V.aux_img = VK_NULL_HANDLE;
+            return;
+        }
+        V.aux_w = s_aux_w;
+        V.aux_h = s_aux_h;
+        barrier_image(V.dcb, V.aux_img, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    }
+    /* After the last frame's HDR pass read it, and this frame's earlier
+     * replays wrote it. */
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    mb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                         | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    ri.renderArea.extent.width = V.aux_w;
+    ri.renderArea.extent.height = V.aux_h;
+    ri.layerCount = 1;
+    ca.imageView = V.aux_view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.loadOp = V.aux_used ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(V.dcb, &ri);
+    V.st_passes++;
+    V.aux_used = 1;
+    V.aux_va = s_aux_rva;
+    vkCmdSetDepthTestEnable(V.dcb, VK_FALSE);
+    vkCmdSetDepthWriteEnable(V.dcb, VK_FALSE);
+    vkCmdSetStencilTestEnable(V.dcb, VK_FALSE);
+    for (i = 0; i < n; i++) {
+        const AuxDraw *a = &s_aux[i];
+        vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, a->pipe);
+        vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
+                                &a->set, 2, a->doff);
+        vkCmdBindVertexBuffers(V.dcb, 0, 1, &V.vtx.buf, &a->voff);
+        vkCmdBindIndexBuffer(V.dcb, V.idx.buf, a->ioff, VK_INDEX_TYPE_UINT32);
+        vkCmdSetViewport(V.dcb, 0, 1, &a->vp);
+        vkCmdSetScissor(V.dcb, 0, 1, &a->sc);
+        vkCmdSetBlendConstants(V.dcb, a->bc);
+        vkCmdSetCullMode(V.dcb, a->cull);
+        vkCmdSetFrontFace(V.dcb, a->ff);
+        vkCmdDrawIndexed(V.dcb, a->nidx, 1, 0, 0, 0);
+    }
+    vkCmdEndRendering(V.dcb);
+    V.last_set = VK_NULL_HANDLE;
+}
+
+/* At present: does the side buffer hold `s`'s frame (1), and was there a
+ * 3D scene in it at all (*is3d) -- without one (menus, films) the frame is
+ * shown at paper white, nothing stretched. */
+static int aux_for(const Surf *s, int *is3d)
+{
+    *is3d = s_aux_3d == s->va || s_aux_on <= 0;
+    return V.aux_used && V.aux_img && V.aux_va == s->va && s_aux_3d == s->va;
+}
+
+/* After the present: the next frame starts empty. */
+static void aux_frame_end(void)
+{
+    s_naux = 0;
+    s_aux_zdraws = 0;
+    s_aux_3d = 0;
+    s_aux_hud = 0;
+    V.aux_used = 0;
+}
+
 static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                         uint32_t ninputs, const void *v, uint32_t nv,
                         const uint32_t *idx, uint32_t nidx)
@@ -5075,7 +5351,10 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     VkViewport vpt;
     VkRect2D sc;
     int i, stage_on[4];
-    float zmax;
+    float zmax, bc[4];
+    uint32_t doff[2];
+    VkCullModeFlags cm = VK_CULL_MODE_NONE;
+    int ccw = st->front_face == 0x0901;
 
     if (dlog_active())
         dlog_draw(st, prog, v, vbytes, idx, nidx);
@@ -5378,13 +5657,10 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         if (sp) V.st_spec_draws++; else V.st_uber_draws++;
     }
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
-    {
-        uint32_t doff[2];
-        doff[0] = (uint32_t)uoff;
-        doff[1] = (uint32_t)coff;
-        vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
-                                &set, 2, doff);
-    }
+    doff[0] = (uint32_t)uoff;
+    doff[1] = (uint32_t)coff;
+    vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
+                            &set, 2, doff);
     vkCmdBindVertexBuffers(V.dcb, 0, 1, &V.vtx.buf, &voff);
     vkCmdBindIndexBuffer(V.dcb, V.idx.buf, ioff, VK_INDEX_TYPE_UINT32);
     vkCmdSetViewport(V.dcb, 0, 1, &vpt);
@@ -5392,17 +5668,12 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     if (!sc.extent.width || !sc.extent.height)
         return 1;
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
-    {
-        float bc[4];
-        nv2a_rc_unpack(st->blend_color, bc);
-        vkCmdSetBlendConstants(V.dcb, bc);
-    }
+    nv2a_rc_unpack(st->blend_color, bc);
+    vkCmdSetBlendConstants(V.dcb, bc);
     {
         /* RECOMP_VK_CULL=0 draws both faces whatever the title asks;
          * RECOMP_VK_FLIP_FRONT swaps the winding meaning. */
         static int cull = -1, flip = -1;
-        VkCullModeFlags cm = VK_CULL_MODE_NONE;
-        int ccw = st->front_face == 0x0901;
         if (cull < 0) {
             const char *e = getenv("RECOMP_VK_CULL");
             cull = !(e && strcmp(e, "0") == 0);
@@ -5592,6 +5863,12 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
             fprintf(stderr, "[VKAW] F%u alpha-writing draw prog %08X into %08X cm %08X blend %u %X %X\n",
                     nv2a_pb_presented_frames(), prog, V.cur_cs->va, st->color_mask,
                     st->blend_enable, st->blend_sfactor, st->blend_dfactor);
+    }
+    {
+        int kind = aux_kind(st);
+        if (kind)
+            aux_record(st, kind, vs, prog, ninputs, set, doff, voff, ioff, nidx, &vpt, &sc, cm,
+                       ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE, bc);
     }
     mark_drawn(st);
     V.st_draws++;
@@ -6203,10 +6480,397 @@ void nv2a_vk_set_window_size(int w, int h)
     V.win_h = h;
 }
 
+/* ---- HDR output ---------------------------------------------------------- */
+
+/* RECOMP_HDR=1: present in HDR when the window takes it. The title draws in
+ * SDR, so the frame is mapped up: what the title made white sits at paper
+ * white (RECOMP_HDR_PAPER nits, 203 by default, the BT.2408 reference) and
+ * only its brightest part is stretched towards RECOMP_HDR_PEAK (1000) --
+ * RECOMP_HDR_STRENGTH (0-2, 1) how far, RECOMP_HDR_KNEE (linear 0-0.95,
+ * 0.25) from where. On top of that the light the title adds (the sun's
+ * glare, aux_*) goes up to the peak, scaled by RECOMP_HDR_GLOW (1), and its
+ * HUD stays at paper white, not stretched. */
+static void hdr_settings(void)
+{
+    static int done;
+    const char *e;
+    if (done++)
+        return;
+    e = getenv("RECOMP_HDR");
+    V.hdr_want = e && *e && strcmp(e, "0") != 0;
+    e = getenv("RECOMP_HDR_PAPER");
+    V.hdr_paper = e ? (float)atof(e) : 203.0f;
+    if (!(V.hdr_paper >= 80.0f)) V.hdr_paper = 80.0f;
+    if (V.hdr_paper > 1000.0f) V.hdr_paper = 1000.0f;
+    e = getenv("RECOMP_HDR_PEAK");
+    V.hdr_peak = e ? (float)atof(e) : 1000.0f;
+    if (!(V.hdr_peak >= V.hdr_paper)) V.hdr_peak = V.hdr_paper;
+    if (V.hdr_peak > 10000.0f) V.hdr_peak = 10000.0f;
+    e = getenv("RECOMP_HDR_STRENGTH");
+    V.hdr_strength = e ? (float)atof(e) : 1.0f;
+    if (!(V.hdr_strength >= 0.0f)) V.hdr_strength = 0.0f;
+    if (V.hdr_strength > 2.0f) V.hdr_strength = 2.0f;
+    e = getenv("RECOMP_HDR_GLOW");
+    V.hdr_glow = e ? (float)atof(e) : 1.0f;
+    if (!(V.hdr_glow >= 0.0f)) V.hdr_glow = 0.0f;
+    if (V.hdr_glow > 8.0f) V.hdr_glow = 8.0f;
+    e = getenv("RECOMP_HDR_KNEE");
+    V.hdr_knee = e ? (float)atof(e) : 0.25f;
+    if (!(V.hdr_knee >= 0.0f)) V.hdr_knee = 0.0f;
+    if (V.hdr_knee > 0.95f) V.hdr_knee = 0.95f;
+}
+
+/* The mapping, per window pixel. `src` the title's frame through its gamma
+ * ramp (display values, sampled over uv.xy of it), `aux` the side buffer
+ * (uv.zw). mode.x: 1 HDR10 (BT.2020 primaries, PQ), 2 scRGB (BT.709,
+ * 1.0 = 80 nits), 3 nits (the dump); mode.y: aux holds this frame; mode.z:
+ * flat -- the FPS counter, at paper white. */
+static const char *k_hdr_fs =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+    "layout(set = 0, binding = 1) uniform sampler2D aux;\n"
+    "layout(push_constant) uniform P {\n"
+    "    vec4 dst;   /* the frame's rectangle in the target */\n"
+    "    vec4 lum;   /* paper, peak (nits), strength, glow */\n"
+    "    vec4 uv;    /* src u, v extent; aux u, v extent */\n"
+    "    vec4 mode;  /* output, aux on, flat, knee */\n"
+    "} p;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "const vec3 Y = vec3(0.2126, 0.7152, 0.0722);\n"
+    "vec3 pq(vec3 n) {\n"
+    "    vec3 y = pow(max(n, vec3(0.0)), vec3(0.1593017578125));\n"
+    "    return pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), vec3(78.84375));\n"
+    "}\n"
+    "void main() {\n"
+    "    vec2 t = (gl_FragCoord.xy - p.dst.xy) / p.dst.zw;\n"
+    "    vec3 c = texture(src, t * p.uv.xy).rgb;\n"
+    "    vec3 lin = pow(clamp(c, 0.0, 1.0), vec3(2.2));\n"
+    "    vec3 sdr = lin * p.lum.x;\n"
+    "    vec3 n = sdr;\n"
+    "    float dbg = 0.0;\n"
+    "    if (p.mode.z == 0.0) {\n"
+    "        /* Highlights: luminance above the knee stretched (hue kept),\n"
+    "         * smoothly from 1x there to peak/paper at white. */\n"
+    "        float y = dot(lin, Y);\n"
+    "        float k = clamp((y - p.mode.w) / (1.0 - p.mode.w), 0.0, 1.0);\n"
+    "        n = sdr * (1.0 + p.lum.z * (p.lum.y / p.lum.x - 1.0) * k * k);\n"
+    "        if (p.mode.y != 0.0) {\n"
+    "            vec4 a = texture(aux, t * p.uv.zw);\n"
+    "            /* Added light: towards the peak, saturating. */\n"
+    "            float g = 1.0 - exp(-max(dot(a.rgb, Y), 0.0) * p.lum.w);\n"
+    "            float yn = max(dot(n, Y), 1e-4);\n"
+    "            float to = mix(yn, max(yn, p.lum.y), clamp(g * p.lum.z, 0.0, 1.0));\n"
+    "            n *= to / yn;\n"
+    "            /* HUD: as the title drew it, at paper white. */\n"
+    "            n = mix(n, sdr, clamp(a.a, 0.0, 1.0));\n"
+    "            dbg = clamp(a.a, 0.0, 1.0) * 0.5 + floor(g * 64.0);\n"
+    "        }\n"
+    "    }\n"
+    "    if (p.mode.x == 1.0) {\n"
+    "        const mat3 to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880,\n"
+    "                                 0.0433, 0.0114, 0.8956);\n"
+    "        o = vec4(pq(to2020 * n / 10000.0), 1.0);\n"
+    "    } else if (p.mode.x == 2.0) {\n"
+    "        o = vec4(n / 80.0, 1.0);\n"
+    "    } else {\n"
+    "        o = vec4(n, dbg);   /* the dump: alpha HUD / 2 + glare * 64, whole */\n"
+    "    }\n"
+    "}\n";
+
+/* The pass's pipeline for target format `fmt` (one per output mode). */
+static VkPipeline hdr_pipeline(int mode, VkFormat fmt)
+{
+    static VkFormat built[3];
+    VkShaderModule fs;
+    if (V.hdr_pipe[mode] && built[mode] == fmt)
+        return V.hdr_pipe[mode];
+    if (V.hdr_pipe[mode]) {
+        vkDeviceWaitIdle(V.dev);
+        vkDestroyPipeline(V.dev, V.hdr_pipe[mode], NULL);
+        V.hdr_pipe[mode] = VK_NULL_HANDLE;
+    }
+    if (!V.post_pl)
+        return VK_NULL_HANDLE;
+    if (!V.hdr_samp) {
+        VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+        sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = 0.25f;
+        if (vkCreateSampler(V.dev, &sci, NULL, &V.hdr_samp) != VK_SUCCESS) {
+            V.hdr_samp = VK_NULL_HANDLE;
+            return VK_NULL_HANDLE;
+        }
+    }
+    fs = glsl_module(k_hdr_fs, 1);
+    V.hdr_pipe[mode] = fs ? post_pipeline(fs, fmt, 1, 0) : VK_NULL_HANDLE;
+    if (fs)
+        vkDestroyShaderModule(V.dev, fs, NULL);
+    built[mode] = fmt;
+    if (!V.hdr_pipe[mode])
+        fprintf(stderr, "  [VK] HDR pass failed to build\n");
+    return V.hdr_pipe[mode];
+}
+
+/* A new HDR swapchain: views of its images, the pass for its format. */
+static int hdr_swapchain_ready(void)
+{
+    uint32_t i;
+    for (i = 0; i < V.sc_n && i < 8; i++) {
+        VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vi.image = V.sc_img[i];
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = V.sc_fmt;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vi.subresourceRange.levelCount = 1;
+        vi.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(V.dev, &vi, NULL, &V.sc_view[i]) != VK_SUCCESS) {
+            V.sc_view[i] = VK_NULL_HANDLE;
+            return 0;
+        }
+    }
+    if (!hdr_pipeline(V.hdr_mode, V.sc_fmt))
+        return 0;
+    if (V.has_hdr_meta) {
+        /* What the frames hold, for the compositor's own mapping to the
+         * screen: BT.709 colours, up to the peak. */
+        PFN_vkSetHdrMetadataEXT set_md =
+            (PFN_vkSetHdrMetadataEXT)vkGetDeviceProcAddr(V.dev, "vkSetHdrMetadataEXT");
+        if (set_md) {
+            VkHdrMetadataEXT md = { VK_STRUCTURE_TYPE_HDR_METADATA_EXT };
+            md.displayPrimaryRed.x = 0.640f;   md.displayPrimaryRed.y = 0.330f;
+            md.displayPrimaryGreen.x = 0.300f; md.displayPrimaryGreen.y = 0.600f;
+            md.displayPrimaryBlue.x = 0.150f;  md.displayPrimaryBlue.y = 0.060f;
+            md.whitePoint.x = 0.3127f;         md.whitePoint.y = 0.3290f;
+            md.maxLuminance = V.hdr_peak;
+            md.minLuminance = 0.0f;
+            md.maxContentLightLevel = V.hdr_peak;
+            md.maxFrameAverageLightLevel = V.hdr_paper;
+            set_md(V.dev, 1, &V.swapchain, &md);
+        }
+    }
+    fprintf(stderr, "  [VK] HDR: paper white %.0f nits, peak %.0f, strength %.2f, glow %.2f\n",
+            V.hdr_paper, V.hdr_peak, V.hdr_strength, V.hdr_glow);
+    return 1;
+}
+
+/* The frame (`src`, its region u/v extent `su`, `sv` -- the frame through
+ * the ramp) into `target` (tw x th, in `layout`), at (ox, oy) dw x dh, the
+ * rest black; then the FPS counter if overlay_frame() left one. `aux` the
+ * side buffer if it holds this frame's scene (region au x av of it). */
+static void hdr_pass(VkImageView target, VkImageLayout layout, VkPipeline pipe, int mode,
+                     uint32_t tw, uint32_t th, VkImageView src, float su, float sv,
+                     VkImageView aux, float au, float av, int flat,
+                     uint32_t ox, uint32_t oy, uint32_t dw, uint32_t dh)
+{
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    VkDescriptorSet set;
+    VkViewport vp;
+    VkRect2D sc;
+    float pc[16];
+
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    set = post_set_s(src, aux ? aux : src, V.hdr_samp);
+    if (!set)
+        return;
+    sc.offset.x = sc.offset.y = 0;
+    sc.extent.width = tw;
+    sc.extent.height = th;
+    ri.renderArea = sc;
+    ri.layerCount = 1;
+    ca.imageView = target;
+    ca.imageLayout = layout;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;     /* black: 0 in PQ and in linear */
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(V.dcb, &ri);
+    V.st_passes++;
+    vp.x = vp.y = 0.0f;
+    vp.width = (float)tw;
+    vp.height = (float)th;
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(V.dcb, 0, 1, &vp);
+    sc.offset.x = (int32_t)ox;
+    sc.offset.y = (int32_t)oy;
+    sc.extent.width = dw;
+    sc.extent.height = dh;
+    vkCmdSetScissor(V.dcb, 0, 1, &sc);
+    vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
+    pc[0] = (float)ox;
+    pc[1] = (float)oy;
+    pc[2] = (float)dw;
+    pc[3] = (float)dh;
+    pc[4] = V.hdr_paper;
+    pc[5] = V.hdr_peak;
+    pc[6] = V.hdr_strength;
+    pc[7] = V.hdr_glow;
+    pc[8] = su;
+    pc[9] = sv;
+    pc[10] = au;
+    pc[11] = av;
+    pc[12] = (float)mode;
+    pc[13] = aux ? 1.0f : 0.0f;
+    pc[14] = flat ? 1.0f : 0.0f;
+    pc[15] = V.hdr_knee;
+    vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, pc);
+    vkCmdDraw(V.dcb, 3, 1, 0, 0);
+    if (V.ov_dst[2] > 0 && V.ov_view
+            && (set = post_set_s(V.ov_view, V.ov_view, V.post_samp)) != VK_NULL_HANDLE) {
+        int32_t x0 = V.ov_dst[0], y0 = V.ov_dst[1];
+        sc.offset.x = x0;
+        sc.offset.y = y0;
+        sc.extent.width = (uint32_t)V.ov_dst[2];
+        sc.extent.height = (uint32_t)V.ov_dst[3];
+        vkCmdSetScissor(V.dcb, 0, 1, &sc);
+        vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
+        pc[0] = (float)x0;
+        pc[1] = (float)y0;
+        pc[2] = (float)V.ov_dst[2];
+        pc[3] = (float)V.ov_dst[3];
+        pc[8] = pc[9] = 1.0f;
+        pc[13] = 0.0f;
+        pc[14] = 1.0f;
+        vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, pc);
+        vkCmdDraw(V.dcb, 3, 1, 0, 0);
+    }
+    vkCmdEndRendering(V.dcb);
+    V.last_set = VK_NULL_HANDLE;
+}
+
+/* RECOMP_HDR_DUMP=<prefix>:<frame>[,<frame>...]: those frames through the
+ * HDR pass, in nits, to <prefix>_<frame>.raw: a line "RSC2HDR <w> <h>",
+ * then RGBA half floats, rows top down (alpha: HUD cover / 2 + glare * 64,
+ * whole). The mapping without an HDR screen, headless runs too;
+ * RECOMP_HDR_* apply. */
+static void hdr_dump(uint32_t va, uint32_t pitch)
+{
+    static int nwant = -1;
+    static uint32_t wantf[32];
+    static char prefix[480], path[512];
+    static uint32_t iw, ih;
+    VkBufferImageCopy c;
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    VkDeviceSize off;
+    VkPipeline pipe;
+    VkImage src;
+    uint8_t *px;
+    Surf *s = NULL;
+    uint32_t sw, sh, w, h;
+    int i, g, aux, is3d;
+
+    if (nwant < 0) {
+        const char *e = getenv("RECOMP_HDR_DUMP"), *colon;
+        nwant = 0;
+        if (e && (colon = strrchr(e, ':')) != NULL && (size_t)(colon - e) < sizeof prefix) {
+            const char *c = colon + 1;
+            memcpy(prefix, e, (size_t)(colon - e));
+            prefix[colon - e] = 0;
+            while (*c && nwant < 32) {
+                wantf[nwant++] = (uint32_t)strtoul(c, (char **)&c, 10);
+                while (*c == ',') c++;
+            }
+            hdr_settings();
+        }
+    }
+    s_aux_on = V.hdr_mode || nwant > 0;
+    if (!nwant || V.present_dump_px)
+        return;
+    for (i = 0; i < nwant && wantf[i] != nv2a_pb_presented_frames(); i++)
+        ;
+    if (i == nwant)
+        return;
+    for (i = 0; i < V.nsurf; i++)
+        if (V.surf[i].va == va && !V.surf[i].swz && V.surf[i].pitch == pitch) {
+            s = &V.surf[i];
+            break;
+        }
+    if (!s)
+        return;
+    snprintf(path, sizeof path, "%s_%u.raw", prefix, nv2a_pb_presented_frames());
+    sw = s->w;
+    sh = s->rows ? s->rows : s->h;
+    w = sw * V.sx;
+    h = sh * V.scale;
+    pipe = hdr_pipeline(0, VK_FORMAT_R16G16B16A16_SFLOAT);
+    px = (uint8_t *)ring_alloc(&V.rb, (VkDeviceSize)w * h * 8, 16, &off);
+    if (!pipe || !px)
+        return;
+    segment_begin();
+    end_rendering();
+    if (!V.hdr_dimg || iw != w || ih != h) {
+        if (V.hdr_dimg)
+            retire(V.hdr_dimg, V.hdr_dmem, V.hdr_dview);
+        if (!image_create(w, h, 1, 1, VK_FORMAT_R16G16B16A16_SFLOAT,
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0,
+                          VK_IMAGE_ASPECT_COLOR_BIT, &V.hdr_dimg, &V.hdr_dmem, &V.hdr_dview)) {
+            V.hdr_dimg = VK_NULL_HANDLE;
+            return;
+        }
+        iw = w;
+        ih = h;
+        barrier_image(V.dcb, V.hdr_dimg, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    }
+    src = gamma_apply(s, w, h);
+    g = src == V.gm_img;
+    aux = aux_for(s, &is3d);
+    V.ov_dst[2] = 0;
+    hdr_pass(V.hdr_dview, VK_IMAGE_LAYOUT_GENERAL, pipe, 3, w, h,
+             g ? V.gm_img_view : s->view, g ? 1.0f : (float)sw / s->w,
+             g ? 1.0f : (float)sh / s->h, aux ? V.aux_view : VK_NULL_HANDLE,
+             aux ? (float)w / V.aux_w : 1.0f, aux ? (float)h / V.aux_h : 1.0f, !is3d,
+             0, 0, w, h);
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    memset(&c, 0, sizeof c);
+    c.bufferOffset = off;
+    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    c.imageSubresource.layerCount = 1;
+    c.imageExtent.width = w;
+    c.imageExtent.height = h;
+    c.imageExtent.depth = 1;
+    vkCmdCopyImageToBuffer(V.dcb, V.hdr_dimg, VK_IMAGE_LAYOUT_GENERAL, V.rb.buf, 1, &c);
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+    V.present_dump_px = px;
+    V.present_dump_path = path;
+    V.dump_w = w;
+    V.dump_h = h;
+    V.dump_float = 1;
+    fprintf(stderr, "  [VK] HDR dump of frame %u: %s scene, side buffer %s\n",
+            nv2a_pb_presented_frames(), is3d ? "3D" : "no 3D", aux ? "used" : "empty");
+}
+
+/* The swapchain images' views (an HDR swapchain is drawn into). */
+static void sc_views_destroy(void)
+{
+    uint32_t i;
+    for (i = 0; i < 8; i++)
+        if (V.sc_view[i]) {
+            vkDestroyImageView(V.dev, V.sc_view[i], NULL);
+            V.sc_view[i] = VK_NULL_HANDLE;
+        }
+}
+
 static void swapchain_destroy(void)
 {
     if (V.swapchain) {
         vkDeviceWaitIdle(V.dev);
+        sc_views_destroy();
         vkDestroySwapchainKHR(V.dev, V.swapchain, NULL);
         V.swapchain = VK_NULL_HANDLE;
     }
@@ -6224,6 +6888,7 @@ static int swapchain_create(void)
     VkSwapchainKHR old = V.swapchain;
     const char *vs = getenv("RECOMP_VK_VSYNC");
 
+    hdr_settings();
     vkGetPhysicalDeviceSurfaceSupportKHR(V.pd, V.qf, V.surface, &ok);
     if (!ok) {
         fprintf(stderr, "  [VK] this GPU cannot present to the window (PRIME? try prime-run)\n");
@@ -6233,14 +6898,41 @@ static int swapchain_create(void)
     vkGetPhysicalDeviceSurfaceFormatsKHR(V.pd, V.surface, &nf, fmts);
     vkGetPhysicalDeviceSurfacePresentModesKHR(V.pd, V.surface, &nm, modes);
     V.sc_fmt = fmts[0].format;
-    for (i = 0; i < nf; i++)
+    V.hdr_mode = 0;
+    /* RECOMP_HDR: HDR10 (10-bit PQ, BT.2020) if the window takes it, else
+     * scRGB (linear half floats); drawn into by hdr_present(). */
+    if (V.hdr_want && V.has_colorspace_ext && V.post_pl
+            && (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+        for (i = 0; i < nf && !V.hdr_mode; i++)
+            if (fmts[i].colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT
+                    && (fmts[i].format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
+                        || fmts[i].format == VK_FORMAT_A2R10G10B10_UNORM_PACK32)) {
+                V.sc_fmt = fmts[i].format;
+                ci.imageColorSpace = fmts[i].colorSpace;
+                V.hdr_mode = 1;
+            }
+        for (i = 0; i < nf && !V.hdr_mode; i++)
+            if (fmts[i].colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+                    && fmts[i].format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+                V.sc_fmt = fmts[i].format;
+                ci.imageColorSpace = fmts[i].colorSpace;
+                V.hdr_mode = 2;
+            }
+        if (!V.hdr_mode) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, "  [VK] HDR asked for, but the window offers no HDR format"
+                        " (is HDR on in the display settings?) -- SDR\n");
+        }
+    }
+    for (i = 0; i < nf && !V.hdr_mode; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM
             || fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM) {
             V.sc_fmt = fmts[i].format;
             ci.imageColorSpace = fmts[i].colorSpace;
             break;
         }
-    if (i == nf)
+    if (i == nf && !V.hdr_mode)
         ci.imageColorSpace = fmts[0].colorSpace;
     /* The flip is paced to 60 Hz already: present without blocking on the
      * display unless RECOMP_VK_VSYNC=1 asks for FIFO. */
@@ -6265,7 +6957,8 @@ static int swapchain_create(void)
     ci.imageExtent = V.sc_ext;
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                  | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                  | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+                  | (V.hdr_mode ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     /* Identity: frames are drawn upright and the compositor turns them to
      * the panel. currentTransform would promise they were already rotated --
@@ -6279,8 +6972,10 @@ static int swapchain_create(void)
     ci.presentMode = mode;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = old;
-    if (old)
+    if (old) {
         vkDeviceWaitIdle(V.dev);
+        sc_views_destroy();
+    }
     if (vkCreateSwapchainKHR(V.dev, &ci, NULL, &V.swapchain) != VK_SUCCESS) {
         V.swapchain = VK_NULL_HANDLE;
         if (old)
@@ -6292,8 +6987,15 @@ static int swapchain_create(void)
     V.sc_n = 8;
     vkGetSwapchainImagesKHR(V.dev, V.swapchain, &V.sc_n, V.sc_img);
     V.sc_dead = 0;
-    fprintf(stderr, "  [VK] presenting %ux%u, format %d, mode %d\n", V.sc_ext.width,
-            V.sc_ext.height, (int)V.sc_fmt, (int)mode);
+    if (V.hdr_mode && !hdr_swapchain_ready()) {
+        /* No views or no pass: an SDR swapchain after all. */
+        sc_views_destroy();
+        V.hdr_want = 0;
+        return swapchain_create();
+    }
+    fprintf(stderr, "  [VK] presenting %ux%u, format %d, mode %d%s\n", V.sc_ext.width,
+            V.sc_ext.height, (int)V.sc_fmt, (int)mode,
+            V.hdr_mode == 1 ? ", HDR10" : V.hdr_mode == 2 ? ", HDR scRGB" : "");
     return 1;
 }
 
@@ -6491,6 +7193,7 @@ static void overlay_frame(uint32_t ox, uint32_t oy)
     uint32_t k, n, i;
     int hz;
 
+    V.ov_dst[2] = 0;
     if (s_ov_on < 0) {
         const char *e = getenv("RECOMP_FPS_OVERLAY");
         s_ov_on = e && *e && strcmp(e, "0") != 0;
@@ -6549,7 +7252,8 @@ static void overlay_frame(uint32_t ox, uint32_t oy)
     /* Into the window, scaled up for its size, at the frame's corner. */
     if (!V.ov_img) {
         if (!image_create(OV_W, OV_H, 1, 1, VK_FORMAT_R8G8B8A8_UNORM,
-                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0,
+                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                          | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
                           VK_IMAGE_ASPECT_COLOR_BIT, &V.ov_img, &V.ov_mem, &V.ov_view)) {
             V.ov_img = VK_NULL_HANDLE;
             return;
@@ -6598,14 +7302,25 @@ static void overlay_frame(uint32_t ox, uint32_t oy)
         b.dstOffsets[1].x = (int32_t)(ox + 8 * k + 20 + OV_W * k);
         b.dstOffsets[1].y = (int32_t)(oy + 8 * k + OV_H * k);
         b.dstOffsets[1].z = 1;
-        if ((uint32_t)b.dstOffsets[1].x <= V.sc_ext.width && (uint32_t)b.dstOffsets[1].y <= V.sc_ext.height)
-            vkCmdBlitImage(V.dcb, V.ov_img, VK_IMAGE_LAYOUT_GENERAL, V.sc_img[V.sc_idx],
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+        if ((uint32_t)b.dstOffsets[1].x > V.sc_ext.width || (uint32_t)b.dstOffsets[1].y > V.sc_ext.height)
+            return;
+        if (V.hdr_mode) {
+            /* Drawn by hdr_pass(), at paper white. */
+            V.ov_dst[0] = b.dstOffsets[0].x;
+            V.ov_dst[1] = b.dstOffsets[0].y;
+            V.ov_dst[2] = b.dstOffsets[1].x - b.dstOffsets[0].x;
+            V.ov_dst[3] = b.dstOffsets[1].y - b.dstOffsets[0].y;
+            return;
+        }
+        vkCmdBlitImage(V.dcb, V.ov_img, VK_IMAGE_LAYOUT_GENERAL, V.sc_img[V.sc_idx],
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
     }
 }
 
+static void hdr_dump(uint32_t va, uint32_t pitch);
+
 /* Blit the surface the title just finished into the window. */
-void nv2a_vk_present(uint32_t va, uint32_t pitch)
+static void present_frame(uint32_t va, uint32_t pitch)
 {
     Surf *s = NULL;
     VkResult r;
@@ -6620,6 +7335,7 @@ void nv2a_vk_present(uint32_t va, uint32_t pitch)
     V.flip_va[0] = V.flip_va[1];
     V.flip_va[1] = va;
     hires_dump(va, pitch);
+    hdr_dump(va, pitch);
     if (!V.has_swapchain_ext)
         return;
     if (!V.surface) {
@@ -6670,23 +7386,31 @@ void nv2a_vk_present(uint32_t va, uint32_t pitch)
         vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
-    barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
-                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                  VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                  VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
-    memset(&black, 0, sizeof black);
-    memset(&rng, 0, sizeof rng);
-    rng.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    rng.levelCount = 1;
-    rng.layerCount = 1;
-    vkCmdClearColorImage(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                         &black, 1, &rng);
-    {
-        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    if (V.hdr_mode) {
+        barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    } else {
+        barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        memset(&black, 0, sizeof black);
+        memset(&rng, 0, sizeof rng);
+        rng.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rng.levelCount = 1;
+        rng.layerCount = 1;
+        vkCmdClearColorImage(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             &black, 1, &rng);
+        {
+            VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+            mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        }
     }
     /* The title's frame, scaled to fit with its aspect kept: its own
      * shape, or view_aspect() (16:9, or a wider screen's own) for a
@@ -6718,6 +7442,27 @@ void nv2a_vk_present(uint32_t va, uint32_t pitch)
     b.dstOffsets[1].x = (int32_t)(ox + dw);
     b.dstOffsets[1].y = (int32_t)(oy + dh);
     b.dstOffsets[1].z = 1;
+    if (V.hdr_mode) {
+        /* Ramp, then the HDR pass draws it into the window, counter and
+         * all. */
+        VkImage src = gamma_apply(s, sw * V.sx, sh * V.scale);
+        int g = src == V.gm_img, is3d;
+        int aux = aux_for(s, &is3d);
+        overlay_frame(ox, oy);
+        hdr_pass(V.sc_view[V.sc_idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                 V.hdr_pipe[V.hdr_mode], V.hdr_mode, V.sc_ext.width, V.sc_ext.height,
+                 g ? V.gm_img_view : s->view, g ? 1.0f : (float)sw / s->w,
+                 g ? 1.0f : (float)sh / s->h, aux ? V.aux_view : VK_NULL_HANDLE,
+                 aux ? (float)(sw * V.sx) / V.aux_w : 1.0f,
+                 aux ? (float)(sh * V.scale) / V.aux_h : 1.0f, !is3d, ox, oy, dw, dh);
+        barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
+        V.present_pending = 1;
+        return;
+    }
     {
         /* Through the title's gamma ramp first, as the console's DAC. */
         VkImage src = gamma_apply(s, sw * V.sx, sh * V.scale);
@@ -6751,6 +7496,13 @@ void nv2a_vk_present(uint32_t va, uint32_t pitch)
                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
     }
     V.present_pending = 1;
+}
+
+void nv2a_vk_present(uint32_t va, uint32_t pitch)
+{
+    present_frame(va, pitch);
+    if (V.state > 0)
+        aux_frame_end();
 }
 
 /* RECOMP_VK_HITCH=<ms>: a frame that took longer, with what the renderer did
