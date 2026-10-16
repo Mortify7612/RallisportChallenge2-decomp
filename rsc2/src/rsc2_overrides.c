@@ -713,6 +713,19 @@ void sub_0037E590(void)
     }
 
     xinput_get_state_lifted();          /* pops the arguments, sets eax */
+    {
+        /* A screen wider than 16:9 (a phone): the renderer widens the view
+         * to it (nv2a_vk_view_aspect), and the game's culling frustum
+         * (sub_000F3F20) takes its aspect from 0x3DFE94, 16:9 as shipped.
+         * Widened with it, so the new edges are not left empty. Only in the
+         * game's widescreen mode (flag 0x488710). */
+        extern float nv2a_vk_view_aspect(void);
+        if (MEM8(0x488710)) {
+            float a = nv2a_vk_view_aspect();
+            if (a > 16.0f / 9.0f)
+                MEMF(0x3DFE94) = a;
+        }
+    }
     if (!mode || !pstate)
         return;
     port = xi_port(handle);

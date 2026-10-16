@@ -913,6 +913,21 @@ static void android_setup(void)
      * window is created (overriding the manifest) and, for a resizable
      * window without this hint, follows the phone's rotation setting. */
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+    /* The game's own 16:9 mode, widened by the renderer to the display's
+     * shape (a phone is about 20:9): the display's landscape aspect, for
+     * the renderer to size its targets by before it has a swapchain. */
+    setenv("RECOMP_WIDESCREEN", "1", 0);
+    {
+        SDL_DisplayMode dm;
+        if (SDL_InitSubSystem(SDL_INIT_VIDEO) == 0          /* counted: the window's init follows */
+                && SDL_GetCurrentDisplayMode(0, &dm) == 0 && dm.w > 0 && dm.h > 0) {
+            char a[32];
+            int w = dm.w > dm.h ? dm.w : dm.h, h = dm.w > dm.h ? dm.h : dm.w;
+            snprintf(a, sizeof a, "%.4f", (double)w / (double)h);
+            setenv("RECOMP_VIEW_ASPECT", a, 0);
+            fprintf(stderr, "[ANDROID] display %dx%d: view aspect %s\n", w, h, a);
+        }
+    }
     /* No desktop launcher here yet; the defaults below, full screen. */
     setenv("RSC2_LAUNCHER", "0", 0);
     setenv("RECOMP_FULLSCREEN", "1", 0);

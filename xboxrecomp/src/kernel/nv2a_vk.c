@@ -40,6 +40,7 @@ void nv2a_vk_clear(const Nv2aVkState *s, uint32_t f, uint32_t c, uint32_t z)
 { (void)s; (void)f; (void)c; (void)z; }
 void nv2a_vk_flush(void) { }
 void nv2a_vk_present(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
+float nv2a_vk_view_aspect(void) { return 16.0f / 9.0f; }
 void nv2a_vk_zpass(int enable) { (void)enable; }
 void nv2a_vk_set_gamma(const uint8_t *r, const uint8_t *g, const uint8_t *b) { (void)r; (void)g; (void)b; }
 int nv2a_gamma_ramp(uint8_t out[3][256]) { (void)out; return 0; }
@@ -585,6 +586,38 @@ static int fb_widescreen(void)
         on = e && *e && strcmp(e, "0") != 0;
     }
     return on;
+}
+
+/* The shape the 3D view is shown at. 16:9 for a widescreen title, unless the
+ * screen is wider (a phone's 20:9, an ultrawide monitor): then the screen's
+ * own shape, and perspective draws are squeezed by (16/9)/aspect so the view
+ * is widened rather than stretched (nv2a_vk_view_aspect; the title must
+ * widen its own culling to match). RECOMP_WIDE_FILL=0 keeps 16:9;
+ * RECOMP_VIEW_ASPECT=<width/height> forces a shape. */
+static float view_aspect(void)
+{
+    static int fill = -1;
+    static float force;
+    float a = 16.0f / 9.0f;
+    if (fill < 0) {
+        const char *e = getenv("RECOMP_WIDE_FILL");
+        fill = !(e && strcmp(e, "0") == 0);
+        e = getenv("RECOMP_VIEW_ASPECT");          /* width / height, forced */
+        force = e ? (float)atof(e) : 0.0f;
+    }
+    if (fb_widescreen() && force > a)
+        return force;
+    if (fb_widescreen() && fill && V.sc_ext.width && V.sc_ext.height) {
+        float s = (float)V.sc_ext.width / (float)V.sc_ext.height;
+        if (s > a * 1.01f)
+            a = s;
+    }
+    return a;
+}
+
+float nv2a_vk_view_aspect(void)
+{
+    return view_aspect();
 }
 
 /* `s` contains `sub`, ignoring ASCII case. */
@@ -2426,8 +2459,15 @@ static int vk_init(void)
          * pixels to draw). */
         const char *sharp = getenv("RECOMP_VK_WIDE_SHARP");
         V.sx = V.scale;
-        if (fb_widescreen() && !(sharp && strcmp(sharp, "0") == 0))
-            V.sx = (V.scale * 4 + 2) / 3;
+        if (fb_widescreen() && !(sharp && strcmp(sharp, "0") == 0)) {
+            /* view_aspect() is 16:9 here unless forced: the swapchain, and so
+             * the screen's shape, comes later. Android passes the display's
+             * shape in RECOMP_VIEW_ASPECT for this. */
+            float cols = (float)V.scale * view_aspect() * 0.75f;
+            V.sx = (uint32_t)cols;
+            if ((float)V.sx < cols - 0.01f)
+                V.sx++;
+        }
         if (V.sx > 8) V.sx = 8;
     }
     if (!white_images())
@@ -4378,6 +4418,8 @@ typedef struct {
     float pts[4];        /* point size px, render scale, sprite, size from oPts */
     float zoff[4];       /* polygon offset: slope factor, units (depth LSBs);
                           * host pixels per title pixel across, down */
+    float wide[4];       /* x: horizontal squeeze of perspective draws into
+                          * the scene (wider screens than the title's), 1 off */
 } Nv2aVkUbo;
 
 /* ---- specialised fragment shaders ----------------------------------------
@@ -4939,6 +4981,25 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         ub->zoff[2] = (float)V.sx;      /* host pixels per title pixel */
         ub->zoff[3] = (float)V.scale;
     }
+    {
+        /* Draws into the scene targets (640 wide, 32-bit, linear, with depth
+         * -- not shadow maps, reflections or effect textures) squeezed by
+         * (16/9) / view_aspect() across: the view widened to a screen wider
+         * than 16:9. RECOMP_VK_WIDE_X=<k> forces the factor. */
+        static float force = -1.0f;
+        const Surf *c = V.cur_cs;
+        float k;
+        if (force < 0.0f) {
+            const char *e = getenv("RECOMP_VK_WIDE_X");
+            force = e ? (float)atof(e) : 0.0f;
+            if (!(force > 0.1f && force <= 1.0f))
+                force = 0.0f;
+        }
+        k = force > 0.0f ? force : (16.0f / 9.0f) / view_aspect();
+        ub->wide[0] = c && !c->swz && c->bpp == 4 && c->w == 640 && V.cur_zs && c->rows <= 480
+                    ? k : 1.0f;
+        ub->wide[1] = ub->wide[2] = ub->wide[3] = 0.0f;
+    }
     memcpy(ubm, ub, sizeof *ub);
 
     /* Descriptor set: reused while the images and samplers stay put. */
@@ -5235,7 +5296,7 @@ static const char k_prog_head[] =
     "layout(set = 0, binding = 0, std140) uniform Nv2aDraw {\n"
     "    vec4 vp; uvec4 misc; uvec4 misc2; vec4 fogc; vec4 fogp;\n"
     "    uvec4 cw[8]; vec4 f0[8]; vec4 f1[8]; vec4 fc0; vec4 fc1;\n"
-    "    vec4 ts[4]; uvec4 misc3; vec4 pts; vec4 zoff;\n"
+    "    vec4 ts[4]; uvec4 misc3; vec4 pts; vec4 zoff; vec4 wide;\n"
     "} u;\n"
     "layout(set = 0, binding = 3, std140) uniform Nv2aConst { vec4 c[192]; } k;\n"
     "layout(location = 0) out vec4 v_d0;\n"
@@ -5293,6 +5354,12 @@ static const char k_prog_main[] =
 static const char k_prog_tail[] =
     "    float w = R[12].w;\n"
     "    vec2 ndc = R[12].xy * u.vp.xy - 1.0;\n"
+    /* A screen wider than the title's: everything drawn into the scene is
+     * squeezed towards the centre, so the 3D view is widened rather than
+     * stretched and the HUD keeps its proportions -- except flat (w = 1)
+     * vertices on the screen's edges, which keep full-screen passes
+     * (colour grading, fades) covering the whole screen. */
+    "    if (abs(w - 1.0) > 1e-5 || abs(ndc.x) < 0.999) ndc.x *= u.wide.x;\n"
     "    gl_Position = vec4(ndc * w, u.vp.w == 2.0 ? WREV_C : R[12].z * u.vp.z * w, w);\n"
     "    v_zs = R[12].z * u.vp.z;\n"
     /* oD0/oD1 are clamped to [0,1] by the hardware before interpolation
@@ -5308,7 +5375,7 @@ static const char k_prog_tail[] =
 
 /* Bump when the translation or the frame around it changes: cached SPIR-V
  * from an older translator is then ignored. */
-#define VK_PROG_VERSION 7
+#define VK_PROG_VERSION 9
 
 /* GLSL to SPIR-V at runtime. glslang's C interface: the reference
  * compiler, packaged on every desktop platform and in the Android NDK.
@@ -6271,14 +6338,14 @@ void nv2a_vk_present(uint32_t va, uint32_t pitch)
                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     }
     /* The title's frame, scaled to fit with its aspect kept: its own
-     * shape, or 16:9 for a 4:3-sized frame a widescreen title drew
-     * anamorphic (RECOMP_WIDESCREEN). */
+     * shape, or view_aspect() (16:9, or a wider screen's own) for a
+     * 4:3-sized frame a widescreen title drew anamorphic. */
     sw = s->w;
     sh = s->rows ? s->rows : s->h;
     {
         uint32_t aw = sw;
         if (fb_widescreen() && sw * 3 == sh * 4)
-            aw = sh * 16 / 9;
+            aw = (uint32_t)((float)sh * view_aspect() + 0.5f);
         if ((uint64_t)V.sc_ext.width * sh <= (uint64_t)V.sc_ext.height * aw) {
             dw = V.sc_ext.width;
             dh = (uint32_t)((uint64_t)V.sc_ext.width * sh / aw);

@@ -18,6 +18,8 @@ layout(set = 0, binding = 0, std140) uniform Nv2aDraw {
     vec4  pts;       /* point size px, render scale, sprite, size from oPts */
     vec4  zoff;      /* polygon offset: slope factor, units (depth LSBs);
                         host pixels per title pixel across, down           */
+    vec4  wide;      /* x: horizontal squeeze of perspective scene draws
+                        (screens wider than the title's), 1 = off          */
 } u;
 
 /* Reversed w-buffer (vp.w == 2): depth = WREV_C / w. With gl_Position.z set to

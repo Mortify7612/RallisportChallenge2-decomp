@@ -104,6 +104,11 @@ void nv2a_vk_report_get(uint32_t va, uint64_t stamp);
  * surface with nv2a_vk_set_surface. */
 void nv2a_vk_present(uint32_t va, uint32_t pitch);
 
+/* The shape the 3D view is shown at: 16:9 for a widescreen title, or the
+ * screen's own when it is wider. A title that culls by its own field of
+ * view widens that to match (RSC2: rsc2_overrides.c). */
+float nv2a_vk_view_aspect(void);
+
 /* For the window thread (fb_present.c), without Vulkan types: the instance
  * to make a surface with (NULL when the renderer is not up or cannot
  * present), the surface it made, and the window's drawable size. */
