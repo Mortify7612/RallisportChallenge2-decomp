@@ -10,9 +10,9 @@
 #   rsc2/tools/arm64/run_qemu.sh RECOMP_FB_WINDOW=0 RECOMP_VULKAN=0 \
 #       RECOMP_AUDIO=0 RSC2_INPUT_REPLAY=../../work/my_run2.xi
 #
-# The Vulkan renderer starts on Mesa's software rasteriser (lavapipe, in the
-# sysroot) with VK_ICD_FILENAMES=$RSC2_SYSROOT/usr/share/vulkan/icd.d/lvp_icd.json;
-# its output has not been compared yet.
+# The Vulkan renderer runs on Mesa's software rasteriser (lavapipe, in the
+# sysroot) with VK_ICD_FILENAMES=$RSC2_SYSROOT/usr/share/vulkan/icd.d/lvp_icd.json,
+# at about a second per frame: menus and races render as on the PC.
 #
 # qemu translates ARM code on this x86 host with x86's strong memory ordering,
 # so a missing barrier between guest threads cannot show up here; only real

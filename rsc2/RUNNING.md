@@ -182,6 +182,12 @@ by the AArch64 decoder. Up to the race the frames match the x86 build to
 within the noise between two x86 runs. Past that point not even two x86 runs
 agree, because the replay is not bit-exact.
 
+The Vulkan renderer also runs, on Mesa's software Vulkan driver from the
+sysroot (`VK_ICD_FILENAMES=$PWD/third_party/sysroot-aarch64/usr/share/vulkan/icd.d/lvp_icd.json`).
+It is slow, about one frame a second, but menus and races render as they
+do on the PC, including the menu backgrounds that the software renderer
+leaves black on every platform.
+
 What qemu cannot check: x86 orders memory accesses strictly and ARM does
 not. Under qemu the ARM code runs on x86 hardware and inherits its ordering,
 so a race between the game's threads only shows on a real ARM CPU. The ARM
