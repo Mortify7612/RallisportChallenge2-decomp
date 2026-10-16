@@ -56,6 +56,7 @@ set(GAME_SOURCES
     src/rsc2_profile.c      # RSC2_PROFILE sampling profiler (Linux)
     src/rsc2_callcount.c    # RSC2_CALLCOUNT (needs tools/callcount_instrument.py on)
     src/launcher.c          # pre-game settings window + settings.ini
+    src/steam_shortcut.c    # launcher's "Add to Steam" (shortcuts.vdf)
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c

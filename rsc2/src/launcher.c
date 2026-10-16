@@ -20,6 +20,7 @@
  */
 #include "launcher.h"
 #include "xbox/keymap.h"
+#include "steam_shortcut.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -442,7 +443,7 @@ static int launcher_window(void) { return 1; }
 #define FOOT_Y 702                      /* key hints; a rule below them */
 #define BTN_Y 752
 
-enum { B_DEFAULTS = O_COUNT, B_QUIT, B_START, FOCUS_COUNT };
+enum { B_DEFAULTS = O_COUNT, B_STEAM, B_QUIT, B_START, FOCUS_COUNT };
 
 typedef struct {
     SDL_Texture *tex;
@@ -459,6 +460,7 @@ static float s_px = 1.0f;
 static Font s_body, s_bold, s_title, s_small, s_smallb;
 static int s_focus = B_START, s_hover = -1;
 static Box s_row_box[O_COUNT], s_btn_box[B_START - B_DEFAULTS + 1];
+static char s_note[400];               /* the last button's outcome, in the help area */
 
 /* Colours. */
 static const SDL_Color C_BG0 = { 0x0E, 0x13, 0x1E, 255 }, C_BG1 = { 0x17, 0x1F, 0x30, 255 };
@@ -812,7 +814,14 @@ static void draw(void)
     }
 
     /* What the focused row does. */
-    if (s_focus < O_COUNT) {
+    if (s_note[0]) {
+        text_wrap(&s_body, 58, HELP_Y, WIN_W - 116, 22, s_note, C_TEXT);
+    } else if (s_focus == B_STEAM) {
+        text_wrap(&s_body, 58, HELP_Y, WIN_W - 116, 22,
+                  "Adds the game to your Steam library as a non-Steam game, so it starts "
+                  "from Steam and Big Picture. Quit Steam first: it rewrites the list when "
+                  "it closes.", C_MUTED);
+    } else if (s_focus < O_COUNT) {
         const Opt *o = &s_opt[s_focus];
         char t[400];
         if (o->env_set)
@@ -840,6 +849,7 @@ static void draw(void)
         keycap(&hx, FOOT_Y, "A / Start", "on a controller");
     }
     draw_button(B_DEFAULTS, 48, BTN_Y, 130, "Defaults", 0);
+    draw_button(B_STEAM, 48 + 130 + 12, BTN_Y, 150, "Add to Steam", 0);
     draw_button(B_QUIT, WIN_W - 48 - 190 - 12 - 110, BTN_Y, 110, "Quit", 0);
     draw_button(B_START, WIN_W - 48 - 190, BTN_Y, 190, "Start game", 1);
 }
@@ -1181,6 +1191,7 @@ static void keys_event(const SDL_Event *ev)
 static void change(int i, int d)
 {
     Opt *o = &s_opt[i];
+    s_note[0] = 0;
     if (i == O_KEYS && !row_disabled(i)) {
         keys_open();
         return;
@@ -1192,6 +1203,7 @@ static void change(int i, int d)
 
 static void move_focus(int d)
 {
+    s_note[0] = 0;
     if (d > 0)
         s_focus = s_focus < O_COUNT - 1 ? s_focus + 1 : s_focus < O_COUNT ? B_START
                 : s_focus == B_START ? 0 : B_START;
@@ -1206,6 +1218,7 @@ static void side(int d)
         change(s_focus, d);
         return;
     }
+    s_note[0] = 0;
     s_focus += d;
     if (s_focus < B_DEFAULTS) s_focus = B_DEFAULTS;
     if (s_focus > B_START) s_focus = B_START;
@@ -1226,7 +1239,9 @@ static int activate(int f)
         return 1;
     if (f == B_QUIT)
         return 0;
-    if (f == B_DEFAULTS)
+    if (f == B_STEAM)
+        rsc2_steam_add(s_note, sizeof s_note);
+    else if (f == B_DEFAULTS)
         defaults();
     else
         change(f, 1);

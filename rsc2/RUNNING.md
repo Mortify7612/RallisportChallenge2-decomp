@@ -43,6 +43,12 @@ a menu is up. The bindings reach the runtime as `RECOMP_KEYMAP`
 (`id=vk[+vk];...`, see `xboxrecomp/include/xbox/keymap.h`) and the easing
 as `RECOMP_KEY_STEER_MS`.
 
+The launcher's **Add to Steam** button puts the game in the Steam library
+as a non-Steam game (`run.sh` on Linux, the `.exe` on Windows), for the
+account that logged in last. Quit Steam first: it rewrites
+`userdata/<account>/config/shortcuts.vdf` when it closes. The previous file
+is kept as `shortcuts.vdf.bak`.
+
 What works: boot, intro movies with audio, title, profile create/save, career
 menus, stage loading, and driving a race (SS1 Cooper Hill) with HUD and timer.
 
