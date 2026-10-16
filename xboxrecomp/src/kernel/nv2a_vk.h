@@ -79,9 +79,10 @@ void nv2a_vk_draw(const Nv2aVkState *s, const Nv2aVshOutput *v, uint32_t nv,
 int  nv2a_vk_program(uint32_t hash, uint8_t inputs[16]);
 
 /* Draw with that program on the GPU: `vin` holds nv vertices of its inputs
- * (4 floats each, in the order nv2a_vk_program gave). */
-void nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
-                          uint32_t nv, const uint32_t *idx, uint32_t nidx);
+ * (4 floats each, in the order nv2a_vk_program gave). 0 when the program or
+ * its pipeline is still being built on the worker: draw it another way. */
+int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
+                         uint32_t nv, const uint32_t *idx, uint32_t nidx);
 
 /* CLEAR_SURFACE: `flags` is its parameter (0x01 Z, 0x02 stencil, 0xF0
  * colour), `argb` the colour clear value, `zs` ZSTENCIL_CLEAR_VALUE. */

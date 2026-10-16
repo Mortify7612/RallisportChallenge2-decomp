@@ -55,9 +55,9 @@ void nv2a_vk_set_surface(uint64_t surface) { (void)surface; }
 void nv2a_vk_set_window_size(int w, int h) { (void)w; (void)h; }
 int nv2a_vk_program(uint32_t hash, uint8_t inputs[16])
 { (void)hash; (void)inputs; return -1; }
-void nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
-                          uint32_t nv, const uint32_t *idx, uint32_t nidx)
-{ (void)s; (void)hash; (void)vin; (void)nv; (void)idx; (void)nidx; }
+int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
+                         uint32_t nv, const uint32_t *idx, uint32_t nidx)
+{ (void)s; (void)hash; (void)vin; (void)nv; (void)idx; (void)nidx; return 0; }
 
 #else
 
@@ -131,6 +131,12 @@ static const uint32_t s_frag_fast_spv[] =
 #include "nv2a_frag_src.h"
 #include "nv2a_common_glsl_src.h"
 #include <pthread.h>
+#include <sched.h>
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 #define VK_RING_VTX    (96u << 20)
 #define VK_RING_IDX    (32u << 20)
@@ -142,6 +148,7 @@ static const uint32_t s_frag_fast_spv[] =
 #define VK_MAX_ZETA    8
 #define VK_MAX_PIPES   4096          /* power of two: hashed */
 #define VK_MAX_PROGS   1024          /* power of two */
+#define VK_PROG_VERSION 9            /* translated-program cache files */
 #define VK_MAX_SAMPLERS 512
 #define VK_TEX_SLOTS   8192          /* power of two */
 #define VK_MAX_RETIRED 4096
@@ -240,7 +247,7 @@ typedef struct {
 /* A title vertex program, compiled to a Vulkan vertex shader. */
 typedef struct {
     uint32_t hash;
-    int state;                  /* 0 empty, 1 compiled, -1 failed */
+    volatile int state;         /* 0 empty, 1 compiled, 2 compiling (worker), -1 failed */
     VkShaderModule vs;
     uint32_t ninputs;
     uint8_t inputs[16];
@@ -466,6 +473,7 @@ static struct {
     uint32_t st_draws, st_tris, st_syncs, st_tex_up, st_tex_hash_mb, st_surf_up;
     uint32_t st_surf_hash_kb;   /* surface bytes hashed (surf_hash_now) */
     uint32_t st_compiles, st_pipes_new;
+    uint32_t st_pipes_async;    /* general pipelines handed to the worker */
     double st_compile_ms, st_pipe_ms;
 } V;
 
@@ -558,6 +566,9 @@ static void file_write(const char *path, const void *a, size_t na,
     remove(path);                         /* Windows rename will not replace */
     rename(tmp, path);
 }
+
+static void warm_start(void);
+static void warm_save(void);
 
 static void pipeline_cache_save(void)
 {
@@ -2473,6 +2484,7 @@ static int vk_init(void)
     if (!white_images())
         return 0;
     post_init();
+    warm_start();
     ao_init();
     V.cur_samples = 1;
     fprintf(stderr, "  [VK] renderer up: depth format %d, depth clamp %d, scale %ux\n",
@@ -2574,6 +2586,36 @@ typedef struct {
     uint32_t cm, beq, sf, df, topo, ninputs;
     VkShaderModule vs, fs;
 } PipeDesc;
+
+typedef struct {
+    uint32_t misc_x, misc_y, misc_w;
+    uint32_t misc2[4], misc3[4];
+    uint32_t cw[8][4];
+    float ptsz, tsz[4], vpw;
+    uint32_t fast;
+} SpecVals;
+
+typedef struct {
+    uint64_t h;
+    volatile int state;         /* 0 free, 1 queued, 2 ready, -1 failed */
+    VkShaderModule fs;
+} SpecEnt;
+
+typedef struct {
+    int kind;                   /* JOB_SPEC, JOB_PROG, JOB_PIPE */
+    SpecVals sv;
+    uint64_t h;
+    SpecEnt *se;
+    Pipe *pp;
+    PipeDesc d;
+    Prog *prog;                 /* JOB_PROG: the program, `src` its GLSL */
+    char *src;
+} SpecJob;
+
+/* What the worker thread does with a job: specialise a fragment shader and
+ * build its pipeline; compile a title vertex program; build a pipeline from
+ * a complete description (a program draw's general one). */
+enum { JOB_SPEC, JOB_PROG, JOB_PIPE };
 
 /* `count`: the main thread's statistics (a worker leaves them alone). */
 static VkPipeline pipe_build(const PipeDesc *d, int count)
@@ -2732,9 +2774,15 @@ static void pipe_desc(PipeDesc *d, VkFormat cfmt, int has_depth, const Nv2aVkSta
     d->samples = V.cur_samples ? V.cur_samples : 1;
 }
 
-/* The draw's pipeline with the general fragment shader, built now if new. */
+static int job_push(const SpecJob *j);
+static void pipe_record(const PipeDesc *d, const uint64_t k[4], uint32_t prog, int fast);
+
+/* The draw's pipeline with the general fragment shader. Built now if new --
+ * or, with `async_ok` (a title program's draw, which can fall back to the
+ * CPU vertex path), built by the worker: NULL until it is ready. Building
+ * one is ~35 ms on a desktop driver, a stall for every new state. */
 static VkPipeline pipeline(VkFormat cfmt, int has_depth, const Nv2aVkState *s,
-                           VkShaderModule vs, uint32_t prog, uint32_t ninputs)
+                           VkShaderModule vs, uint32_t prog, uint32_t ninputs, int async_ok)
 {
     int fast = !needs_fragdepth(s);
     PipeDesc d;
@@ -2748,8 +2796,48 @@ static VkPipeline pipeline(VkFormat cfmt, int has_depth, const Nv2aVkState *s,
     pp = pipe_find(k);
     if (!pp)
         return VK_NULL_HANDLE;
-    if (pp->used)
-        return pp->pipe;
+    if (pp->used) {
+        /* Ready; or being built by the worker or the warm-up thread -- a
+         * program draw goes the CPU way meanwhile, anything else waits (no
+         * longer than building it here would take); or that build failed,
+         * and it is built here after all. */
+        VkPipeline q = __atomic_load_n(&pp->pipe, __ATOMIC_ACQUIRE);
+        if (q)
+            return q;
+        if (!__atomic_load_n(&pp->failed, __ATOMIC_ACQUIRE)) {
+            if (async_ok)
+                return VK_NULL_HANDLE;
+            while (!(q = __atomic_load_n(&pp->pipe, __ATOMIC_ACQUIRE))
+                   && !__atomic_load_n(&pp->failed, __ATOMIC_ACQUIRE))
+                sched_yield();
+            if (q)
+                return q;
+        }
+        p = pipe_build(&d, 1);
+        if (!p)
+            return VK_NULL_HANDLE;
+        pp->failed = 0;
+        __atomic_store_n(&pp->pipe, p, __ATOMIC_RELEASE);
+        pipe_record(&d, k, prog, fast);
+        return p;
+    }
+    if (async_ok) {
+        SpecJob j;
+        memset(&j, 0, sizeof j);
+        j.kind = JOB_PIPE;
+        j.pp = pp;
+        j.d = d;
+        memcpy(pp->key, k, sizeof k);
+        pp->pipe = VK_NULL_HANDLE;
+        pp->failed = 0;
+        pp->used = 1;
+        if (job_push(&j)) {
+            V.npipes++;
+            V.st_pipes_async++;
+            return VK_NULL_HANDLE;
+        }
+        pp->used = 0;
+    }
     p = pipe_build(&d, 1);
     if (!p)
         return VK_NULL_HANDLE;
@@ -2757,6 +2845,7 @@ static VkPipeline pipeline(VkFormat cfmt, int has_depth, const Nv2aVkState *s,
     pp->pipe = p;
     pp->used = 1;
     V.npipes++;
+    pipe_record(&d, k, prog, fast);
     return p;
 }
 
@@ -4435,27 +4524,6 @@ typedef struct {
  * SPIR-V is cached on disk (frag_<source hash>_<setup>.spv). RECOMP_VK_SPEC=0
  * turns it off. */
 
-typedef struct {
-    uint32_t misc_x, misc_y, misc_w;
-    uint32_t misc2[4], misc3[4];
-    uint32_t cw[8][4];
-    float ptsz, tsz[4], vpw;
-    uint32_t fast;
-} SpecVals;
-
-typedef struct {
-    uint64_t h;
-    volatile int state;         /* 0 free, 1 queued, 2 ready, -1 failed */
-    VkShaderModule fs;
-} SpecEnt;
-
-typedef struct {
-    SpecVals sv;
-    uint64_t h;
-    SpecEnt *se;
-    Pipe *pp;
-    PipeDesc d;
-} SpecJob;
 
 #define VK_MAX_SPECS 4096
 #define VK_SPEC_JOBS 1024
@@ -4573,6 +4641,9 @@ static VkShaderModule spec_compile(const SpecVals *v, uint64_t h)
     return m;
 }
 
+static void prog_build(Prog *p, char *src);
+static void pipe_record(const PipeDesc *d, const uint64_t k[4], uint32_t prog, int fast);
+
 static void *spec_worker(void *unused)
 {
     (void)unused;
@@ -4585,6 +4656,20 @@ static void *spec_worker(void *unused)
         s_job_tail++;
         pthread_mutex_unlock(&s_job_lock);
 
+        if (j.kind == JOB_PROG) {
+            prog_build(j.prog, j.src);
+            continue;
+        }
+        if (j.kind == JOB_PIPE) {
+            VkPipeline p = pipe_build(&j.d, 0);
+            if (p) {
+                pipe_record(&j.d, j.pp->key, (uint32_t)(j.pp->key[2] >> 8), (int)(j.pp->key[2] >> 44) & 1);
+                __atomic_store_n(&j.pp->pipe, p, __ATOMIC_RELEASE);
+            } else {
+                __atomic_store_n(&j.pp->failed, 1, __ATOMIC_RELEASE);
+            }
+            continue;
+        }
         if (__atomic_load_n(&j.se->state, __ATOMIC_ACQUIRE) == 1) {
             VkShaderModule m = spec_compile(&j.sv, j.h);
             j.se->fs = m;
@@ -4595,8 +4680,10 @@ static void *spec_worker(void *unused)
             VkPipeline p;
             j.d.fs = j.se->fs;
             p = pipe_build(&j.d, 0);
-            if (p)
+            if (p) {
+                pipe_record(&j.d, j.pp->key, (uint32_t)(j.pp->key[2] >> 8), (int)(j.pp->key[2] >> 44) & 1);
                 __atomic_store_n(&j.pp->pipe, p, __ATOMIC_RELEASE);
+            }
             else
                 __atomic_store_n(&j.pp->failed, 1, __ATOMIC_RELEASE);
         } else {
@@ -4632,6 +4719,225 @@ static int spec_enabled(void)
         }
     }
     return s_spec_on;
+}
+
+/* Queue a program compile or a pipeline build for the worker; 0 when there
+ * is no worker or the queue is full (the caller does it itself). */
+static int job_push(const SpecJob *j)
+{
+    int ok = 0;
+    if (!spec_enabled())
+        return 0;
+    pthread_mutex_lock(&s_job_lock);
+    if (s_job_head - s_job_tail < VK_SPEC_JOBS) {
+        s_jobs[s_job_head % VK_SPEC_JOBS] = *j;
+        s_job_head++;
+        pthread_cond_signal(&s_job_cond);
+        ok = 1;
+    }
+    pthread_mutex_unlock(&s_job_lock);
+    return ok;
+}
+
+/* ---- pipeline warm-up --------------------------------------------------- *
+ *
+ * Every pipeline built is recorded -- its description, key, program and
+ * fragment variant -- and the list is saved beside the pipeline cache. On
+ * the next start a low-priority thread builds them all again from the
+ * cached SPIR-V while the intro and menus run, so a race does not stop for
+ * them. A first-ever start has nothing to warm: the background builds
+ * (JOB_PROG, JOB_PIPE) cover that. RECOMP_VK_WARM=0 turns it off. */
+typedef struct {
+    uint64_t key[4];
+    uint32_t cfmt, has_depth, blend, samples, cm, beq, sf, df, topo, ninputs;
+    uint32_t prog, fast;
+} WarmRec;
+
+static pthread_mutex_t s_warm_lock = PTHREAD_MUTEX_INITIALIZER;
+static WarmRec s_warm[VK_MAX_PIPES];
+static uint32_t s_nwarm, s_warm_saved;
+
+static void pipe_record(const PipeDesc *d, const uint64_t k[4], uint32_t prog, int fast)
+{
+    WarmRec r;
+    uint32_t i;
+    memset(&r, 0, sizeof r);
+    memcpy(r.key, k, sizeof r.key);
+    r.cfmt = (uint32_t)d->cfmt; r.has_depth = (uint32_t)d->has_depth; r.blend = (uint32_t)d->blend;
+    r.samples = d->samples; r.cm = d->cm; r.beq = d->beq; r.sf = d->sf; r.df = d->df;
+    r.topo = d->topo; r.ninputs = d->ninputs; r.prog = prog; r.fast = (uint32_t)fast;
+    pthread_mutex_lock(&s_warm_lock);
+    for (i = 0; i < s_nwarm; i++)
+        if (!memcmp(s_warm[i].key, r.key, sizeof r.key))
+            break;
+    if (i == s_nwarm && s_nwarm < VK_MAX_PIPES)
+        s_warm[s_nwarm++] = r;
+    pthread_mutex_unlock(&s_warm_lock);
+}
+
+/* Its file: tied to the program translator's and the fragment shader's
+ * versions, so a list from another build is not used. */
+static int warm_path(char *path, size_t n)
+{
+    const char *dir = cache_dir();
+    if (!dir || !spec_enabled())
+        return 0;
+    snprintf(path, n, "%s/pipes_v%u_%016llX.bin", dir, VK_PROG_VERSION,
+             (unsigned long long)s_frag_src_hash);
+    return 1;
+}
+
+static void warm_save(void)
+{
+    char path[1100];
+    WarmRec *copy;
+    uint32_t n;
+    if (!warm_path(path, sizeof path))
+        return;
+    pthread_mutex_lock(&s_warm_lock);
+    n = s_nwarm;
+    copy = n != s_warm_saved ? (WarmRec *)malloc(sizeof *copy * n) : NULL;
+    if (copy)
+        memcpy(copy, s_warm, sizeof *copy * n);
+    pthread_mutex_unlock(&s_warm_lock);
+    if (!copy)
+        return;
+    file_write(path, "NVW1", 4, copy, sizeof *copy * n);
+    s_warm_saved = n;
+    free(copy);
+}
+
+typedef struct {
+    WarmRec r;
+    Pipe *pp;
+} WarmJob;
+
+static WarmJob *s_wjobs;
+static uint32_t s_nwjobs;
+
+static VkShaderModule module_file(const char *path, size_t skip, uint32_t *ninputs)
+{
+    VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    VkShaderModule m = VK_NULL_HANDLE;
+    size_t n = 0;
+    uint8_t *f = (uint8_t *)file_read(path, &n);
+    if (f && n > skip && ((n - skip) & 3) == 0 && (!skip || !memcmp(f, "NVP1", 4))) {
+        if (ninputs)
+            memcpy(ninputs, f + 4, 4);
+        ci.codeSize = n - skip;
+        ci.pCode = (const uint32_t *)(f + skip);
+        if (vkCreateShaderModule(V.dev, &ci, NULL, &m) != VK_SUCCESS)
+            m = VK_NULL_HANDLE;
+    }
+    free(f);
+    return m;
+}
+
+static void *warm_thread(void *unused)
+{
+    const char *dir = cache_dir();
+    uint32_t i, built = 0, failed = 0;
+    double t0 = now_ms();
+    (void)unused;
+#if defined(__linux__)
+    setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);   /* behind the game */
+#endif
+    for (i = 0; i < s_nwjobs; i++) {
+        const WarmRec *r = &s_wjobs[i].r;
+        Pipe *pp = s_wjobs[i].pp;
+        char path[1100];
+        PipeDesc d;
+        VkShaderModule vs = V.vs, fs, own_vs = VK_NULL_HANDLE, own_fs = VK_NULL_HANDLE;
+        VkPipeline p = VK_NULL_HANDLE;
+        uint32_t nin = 0;
+        if (r->prog) {
+            snprintf(path, sizeof path, "%s/prog_v%u_%08X.spv", dir, VK_PROG_VERSION, r->prog);
+            vs = own_vs = module_file(path, 24, &nin);
+        }
+        if (r->key[3]) {
+            snprintf(path, sizeof path, "%s/frag_%016llX_%016llX.spv", dir,
+                     (unsigned long long)s_frag_src_hash, (unsigned long long)r->key[3]);
+            fs = own_fs = module_file(path, 0, NULL);
+        } else {
+            fs = r->fast ? V.fs_fast : V.fs;
+        }
+        if (vs && fs && (!r->prog || nin == r->ninputs)) {
+            memset(&d, 0, sizeof d);
+            d.cfmt = (VkFormat)r->cfmt; d.has_depth = (int)r->has_depth; d.blend = (int)r->blend;
+            d.samples = r->samples; d.cm = r->cm; d.beq = r->beq; d.sf = r->sf; d.df = r->df;
+            d.topo = r->topo; d.ninputs = r->ninputs; d.vs = vs; d.fs = fs;
+            p = pipe_build(&d, 0);
+        }
+        if (own_vs) vkDestroyShaderModule(V.dev, own_vs, NULL);
+        if (own_fs) vkDestroyShaderModule(V.dev, own_fs, NULL);
+        if (p) {
+            pipe_record(&d, r->key, r->prog, (int)r->fast);
+            __atomic_store_n(&pp->pipe, p, __ATOMIC_RELEASE);
+            built++;
+        } else {
+            __atomic_store_n(&pp->failed, 1, __ATOMIC_RELEASE);
+            failed++;
+        }
+    }
+    fprintf(stderr, "  [VK] warm-up: %u pipelines built in %.0f ms (%u not)\n",
+            built, now_ms() - t0, failed);
+    free(s_wjobs);
+    s_wjobs = NULL;
+    return NULL;
+}
+
+/* At start, on the renderer's thread: claim every recorded pipeline's slot
+ * (so a draw finds it pending rather than building it twice) and hand the
+ * list to the warm-up thread, fixed-function ones first -- those a draw
+ * waits for. */
+static void warm_start(void)
+{
+    char path[1100];
+    size_t n = 0;
+    uint8_t *f;
+    uint32_t i, cnt, pass;
+    const char *e = getenv("RECOMP_VK_WARM");
+    pthread_t th;
+    if ((e && strcmp(e, "0") == 0) || !warm_path(path, sizeof path))
+        return;
+    f = (uint8_t *)file_read(path, &n);
+    if (!f || n < 4 || memcmp(f, "NVW1", 4) || (n - 4) % sizeof(WarmRec)) {
+        free(f);
+        return;
+    }
+    cnt = (uint32_t)((n - 4) / sizeof(WarmRec));
+    s_wjobs = (WarmJob *)malloc(sizeof *s_wjobs * (cnt ? cnt : 1));
+    if (!s_wjobs) {
+        free(f);
+        return;
+    }
+    for (pass = 0; pass < 2; pass++)
+        for (i = 0; i < cnt; i++) {
+            WarmRec r;
+            Pipe *pp;
+            memcpy(&r, f + 4 + (size_t)i * sizeof r, sizeof r);
+            if ((pass == 0) != (r.prog == 0))
+                continue;
+            pp = pipe_find(r.key);
+            if (!pp || pp->used)
+                continue;
+            memcpy(pp->key, r.key, sizeof r.key);
+            pp->pipe = VK_NULL_HANDLE;
+            pp->failed = 0;
+            pp->used = 1;
+            V.npipes++;
+            s_wjobs[s_nwjobs].r = r;
+            s_wjobs[s_nwjobs].pp = pp;
+            s_nwjobs++;
+        }
+    free(f);
+    fprintf(stderr, "  [VK] warm-up: %u pipelines from the last run\n", s_nwjobs);
+    if (!s_nwjobs || pthread_create(&th, NULL, warm_thread, NULL) != 0) {
+        for (i = 0; i < s_nwjobs; i++)
+            __atomic_store_n(&s_wjobs[i].pp->failed, 1, __ATOMIC_RELEASE);
+        return;
+    }
+    pthread_detach(th);
 }
 
 /* The draw's setup, from the uniforms it is about to be drawn with. */
@@ -4701,6 +5007,7 @@ static VkPipeline pipeline_spec(VkFormat cfmt, int has_depth, const Nv2aVkState 
     pthread_mutex_lock(&s_job_lock);
     if (s_job_head - s_job_tail < VK_SPEC_JOBS) {
         SpecJob *j = &s_jobs[s_job_head % VK_SPEC_JOBS];
+        j->kind = JOB_SPEC;
         j->sv = v;
         j->h = h;
         j->se = se;
@@ -4749,7 +5056,7 @@ static int zpass_trace(void)
     return at >= 0 && nv2a_pb_presented_frames() == (uint32_t)at;
 }
 
-static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
+static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                         uint32_t ninputs, const void *v, uint32_t nv,
                         const uint32_t *idx, uint32_t nidx)
 {
@@ -4785,7 +5092,7 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         for (k = 0; k < nskip; k++)
             if (skip[k] == prog
                     && !(getenv("RECOMP_VK_SKIP_ODD") && !(nv2a_pb_presented_frames() & 1)))
-                return;
+                return 1;
     }
     {
         /* RECOMP_VK_STAGE_TRACE: stage programs using modes the shader does
@@ -4854,17 +5161,13 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         }
         samps[i] = samps[4 + i] = sampler(&st->tex[i], lv);
         if (V.state < 0)
-            return;
+            return 1;
     }
 
     if (!begin_target(st))
-        return;
+        return 1;
     if (V.ao_on && ao_maybe(st) && !begin_target(st))
-        return;
-    pipe = pipeline(V.cur_cs ? V.cur_cs->fmt : VK_FORMAT_UNDEFINED, V.cur_zs != NULL, st,
-                    vs, prog, ninputs);
-    if (!pipe)
-        return;
+        return 1;
 
     vp = ring_alloc(&V.vtx, vbytes, 16, &voff);
     ip = ring_alloc(&V.idx, (VkDeviceSize)nidx * 4, 4, &ioff);
@@ -4873,13 +5176,13 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     if (!vp || !ip || !ubm || !const_upload(&coff) || V.sets_used >= VK_MAX_SETS) {
         vk_sync(0);
         if (!begin_target(st))
-            return;
+            return 1;
         vp = ring_alloc(&V.vtx, vbytes, 16, &voff);
         ip = ring_alloc(&V.idx, (VkDeviceSize)nidx * 4, 4, &ioff);
         ubm = (Nv2aVkUbo *)ring_alloc(&V.ubo, sizeof *ubm,
                                       V.limits.minUniformBufferOffsetAlignment, &uoff);
         if (!vp || !ip || !ubm || !const_upload(&coff))
-            return;
+            return 1;
     }
     memcpy(vp, v, (size_t)vbytes);
     memcpy(ip, idx, (size_t)nidx * 4);
@@ -5015,7 +5318,7 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         ai.descriptorSetCount = 1;
         ai.pSetLayouts = &V.dsl;
         if (vkAllocateDescriptorSets(V.dev, &ai, &set) != VK_SUCCESS)
-            return;
+            return 1;
         V.sets_used++;
         for (i = 0; i < 8; i++) {
             ii[i].sampler = samps[i];
@@ -5053,10 +5356,21 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     }
 
     {
+        /* The specialised pipeline when it is ready, else the general one --
+         * built only then: building both for every new state doubled the
+         * stalls. A title program's draw whose general pipeline is still
+         * being built returns 0, and the executor draws it through the CPU
+         * vertex path instead. */
         VkPipeline sp = pipeline_spec(V.cur_cs ? V.cur_cs->fmt : VK_FORMAT_UNDEFINED,
                                       V.cur_zs != NULL, st, vs, prog, ninputs, ub);
-        if (sp)
+        if (sp) {
             pipe = sp;
+        } else {
+            pipe = pipeline(V.cur_cs ? V.cur_cs->fmt : VK_FORMAT_UNDEFINED, V.cur_zs != NULL, st,
+                            vs, prog, ninputs, prog != 0);
+            if (!pipe)
+                return prog ? 0 : 1;
+        }
         if (sp) V.st_spec_draws++; else V.st_uber_draws++;
     }
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
@@ -5072,7 +5386,7 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     vkCmdSetViewport(V.dcb, 0, 1, &vpt);
     sc = clip_rect(st);
     if (!sc.extent.width || !sc.extent.height)
-        return;
+        return 1;
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     {
         float bc[4];
@@ -5175,7 +5489,7 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                 vis.color_mask = 0x01010101u;
                 vis.st_test = 0;
                 vp2 = pipeline(V.cur_cs ? V.cur_cs->fmt : VK_FORMAT_UNDEFINED, V.cur_zs != NULL,
-                               &vis, vs, prog, ninputs);
+                               &vis, vs, prog, ninputs, 0);
                 if (vp2) {
                     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, vp2);
                     vkCmdSetStencilTestEnable(V.dcb, VK_FALSE);
@@ -5225,7 +5539,7 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                 fprintf(stderr, "[ZPASS] stencil under the test: 00:%llu 01:%llu 14:%llu C8:%llu C9:%llu FF:%llu\n",
                         (unsigned long long)res[0], (unsigned long long)res[1], (unsigned long long)res[2],
                         (unsigned long long)res[3], (unsigned long long)res[4], (unsigned long long)res[5]);
-            return;
+            return 1;
         }
     } else if (s_flight > 0 && s_dlog && V.fqpool && V.nfq < VK_MAX_QUERIES) {
         /* Flight recorder: how many samples this draw actually wrote. */
@@ -5279,6 +5593,7 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     V.st_draws++;
     V.seg_draws++;
     V.st_tris += nidx / 3;
+    return 1;
 }
 
 void nv2a_vk_draw(const Nv2aVkState *st, const Nv2aVshOutput *v, uint32_t nv,
@@ -5286,7 +5601,7 @@ void nv2a_vk_draw(const Nv2aVkState *st, const Nv2aVshOutput *v, uint32_t nv,
 {
     if (!nidx || !nv || !nv2a_vk_active())
         return;
-    draw_common(st, V.vs, 0, sizeof *v / 16, v, nv, idx, nidx);
+    (void)draw_common(st, V.vs, 0, sizeof *v / 16, v, nv, idx, nidx);
 }
 
 /* ---- title vertex programs on the GPU ----------------------------------- */
@@ -5375,7 +5690,6 @@ static const char k_prog_tail[] =
 
 /* Bump when the translation or the frame around it changes: cached SPIR-V
  * from an older translator is then ignored. */
-#define VK_PROG_VERSION 9
 
 /* GLSL to SPIR-V at runtime. glslang's C interface: the reference
  * compiler, packaged on every desktop platform and in the Android NDK.
@@ -5438,83 +5752,97 @@ static int glsl_to_spirv(const char *src, uint32_t hash, int frag, uint32_t **wo
 #endif
 }
 
-static int prog_compile(Prog *p)
+/* A program's SPIR-V from the disk cache, keyed by its hash and the
+ * translator's version: input list then SPIR-V. 1 when found. */
+static int prog_load_cached(Prog *p)
+{
+    VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    const char *dir = cache_dir();
+    char path[1100];
+    size_t n = 0;
+    uint8_t *f = NULL;
+    int ok = 0;
+    if (dir) {
+        snprintf(path, sizeof path, "%s/prog_v%u_%08X.spv", dir, VK_PROG_VERSION, p->hash);
+        f = (uint8_t *)file_read(path, &n);
+    }
+    if (f && n > 24 && !memcmp(f, "NVP1", 4) && ((n - 24) & 3) == 0) {
+        memcpy(&p->ninputs, f + 4, 4);
+        memcpy(p->inputs, f + 8, 16);
+        ci.codeSize = n - 24;
+        ci.pCode = (const uint32_t *)(f + 24);
+        ok = p->ninputs <= 16 && vkCreateShaderModule(V.dev, &ci, NULL, &p->vs) == VK_SUCCESS;
+    }
+    free(f);
+    return ok;
+}
+
+/* The GLSL of the program loaded now (the translator reads the current
+ * program slots, so this happens on the executor), with p's input list set.
+ * NULL when it cannot be translated. */
+static char *prog_source(Prog *p)
 {
     static char body[256 * 1024];
-    char *src;
+    char *src, *q;
     size_t n;
-    uint32_t inmask = 0, i, j, *spv = NULL;
-    size_t spv_bytes = 0;
-    VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    uint32_t inmask = 0, i, j;
 
     if (!nv2a_vsh_to_glsl(body, sizeof body, &inmask))
-        return 0;
-    {
-        /* Compiled before? The file is keyed by the program's hash and the
-         * translator's version, and holds its input list then SPIR-V. */
-        const char *dir = cache_dir();
-        char path[1100];
-        size_t n = 0;
-        uint8_t *f = NULL;
-        if (dir) {
-            snprintf(path, sizeof path, "%s/prog_v%u_%08X.spv", dir, VK_PROG_VERSION, p->hash);
-            f = (uint8_t *)file_read(path, &n);
-        }
-        if (f && n > 24 && !memcmp(f, "NVP1", 4) && ((n - 24) & 3) == 0) {
-            memcpy(&p->ninputs, f + 4, 4);
-            memcpy(p->inputs, f + 8, 16);
-            ci.codeSize = n - 24;
-            ci.pCode = (const uint32_t *)(f + 24);
-            if (p->ninputs <= 16
-                && vkCreateShaderModule(V.dev, &ci, NULL, &p->vs) == VK_SUCCESS) {
-                free(f);
-                return 1;
-            }
-        }
-        free(f);
-    }
+        return NULL;
     n = sizeof k_prog_head + sizeof k_prog_main + sizeof k_prog_tail + strlen(body) + 2048;
     src = (char *)malloc(n);
     if (!src)
-        return 0;
-    {
-        char *q = src;
-        q += sprintf(q, "%s", k_prog_head);
-        for (i = 0, j = 0; i < 16; i++)
-            if (inmask & (1u << i)) {
-                q += sprintf(q, "layout(location = %u) in vec4 v%u;\n", j, i);
-                p->inputs[j++] = (uint8_t)i;
-            }
-        p->ninputs = j;
-        q += sprintf(q, "%s%s%s", k_prog_main, body, k_prog_tail);
-    }
+        return NULL;
+    q = src;
+    q += sprintf(q, "%s", k_prog_head);
+    for (i = 0, j = 0; i < 16; i++)
+        if (inmask & (1u << i)) {
+            q += sprintf(q, "layout(location = %u) in vec4 v%u;\n", j, i);
+            p->inputs[j++] = (uint8_t)i;
+        }
+    p->ninputs = j;
+    sprintf(q, "%s%s%s", k_prog_main, body, k_prog_tail);
     if (getenv("RECOMP_VK_PROG_DUMP"))
         fprintf(stderr, "  [VK] program %08X:\n%s\n", p->hash, src);
-    if (!glsl_to_spirv(src, p->hash, 0, &spv, &spv_bytes)) {
-        free(src);
-        return 0;
-    }
-    ci.codeSize = spv_bytes;
-    ci.pCode = spv;
-    if (vkCreateShaderModule(V.dev, &ci, NULL, &p->vs) != VK_SUCCESS)
-        p->vs = VK_NULL_HANDLE;
-    {
-        const char *dir = cache_dir();
-        if (dir && p->vs) {
-            char path[1100];
-            uint8_t hdr[24];
-            memcpy(hdr, "NVP1", 4);
-            memcpy(hdr + 4, &p->ninputs, 4);
-            memcpy(hdr + 8, p->inputs, 16);
-            snprintf(path, sizeof path, "%s/prog_v%u_%08X.spv", dir, VK_PROG_VERSION, p->hash);
-            file_write(path, hdr, sizeof hdr, ci.pCode, ci.codeSize);
+    return src;
+}
+
+/* glslang, the module and the disk cache, then the state published: on the
+ * worker thread (JOB_PROG), or here when there is none. Frees `src`. */
+static void prog_build(Prog *p, char *src)
+{
+    VkShaderModuleCreateInfo ci = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    uint32_t *spv = NULL;
+    size_t spv_bytes = 0;
+    VkShaderModule vs = VK_NULL_HANDLE;
+
+    if (glsl_to_spirv(src, p->hash, 0, &spv, &spv_bytes)) {
+        ci.codeSize = spv_bytes;
+        ci.pCode = spv;
+        if (vkCreateShaderModule(V.dev, &ci, NULL, &vs) != VK_SUCCESS)
+            vs = VK_NULL_HANDLE;
+        if (vs) {
+            const char *dir = cache_dir();
+            if (dir) {
+                char path[1100];
+                uint8_t hdr[24];
+                memcpy(hdr, "NVP1", 4);
+                memcpy(hdr + 4, &p->ninputs, 4);
+                memcpy(hdr + 8, p->inputs, 16);
+                snprintf(path, sizeof path, "%s/prog_v%u_%08X.spv", dir, VK_PROG_VERSION, p->hash);
+                file_write(path, hdr, sizeof hdr, ci.pCode, ci.codeSize);
+            }
         }
     }
     free(spv);
     free(src);
-    return p->vs != VK_NULL_HANDLE;
+    p->vs = vs;
+    __atomic_store_n(&p->state, vs ? 1 : -1, __ATOMIC_RELEASE);
 }
 
+/* The program `hash`, the one loaded now: from the disk cache at once, or
+ * compiled on the worker (state 2 until then; nv2a_vk_program says -1 and
+ * the executor runs it on the CPU meanwhile). */
 static Prog *prog_get(uint32_t hash)
 {
     uint32_t slot = (hash * 2654435761u) & (VK_MAX_PROGS - 1), n;
@@ -5522,8 +5850,22 @@ static Prog *prog_get(uint32_t hash)
         Prog *p = &V.progs[(slot + n) & (VK_MAX_PROGS - 1)];
         if (p->state == 0) {
             double t0 = now_ms();
+            char *src;
             p->hash = hash;
-            p->state = prog_compile(p) ? 1 : -1;
+            if (prog_load_cached(p)) {
+                p->state = 1;
+            } else if (!(src = prog_source(p))) {
+                p->state = -1;
+            } else {
+                SpecJob j;
+                memset(&j, 0, sizeof j);
+                j.kind = JOB_PROG;
+                j.prog = p;
+                j.src = src;
+                p->state = 2;
+                if (!job_push(&j))
+                    prog_build(p, src);
+            }
             V.st_compile_ms += now_ms() - t0;
             V.st_compiles++;
             return p;
@@ -5543,22 +5885,22 @@ int nv2a_vk_program(uint32_t hash, uint8_t inputs[16])
     if (off || !nv2a_vk_active())
         return -1;
     p = prog_get(hash);
-    if (!p || p->state != 1)
+    if (!p || __atomic_load_n(&p->state, __ATOMIC_ACQUIRE) != 1)
         return -1;
     memcpy(inputs, p->inputs, 16);
     return (int)p->ninputs;
 }
 
-void nv2a_vk_draw_program(const Nv2aVkState *st, uint32_t hash, const float *vin,
-                          uint32_t nv, const uint32_t *idx, uint32_t nidx)
+int nv2a_vk_draw_program(const Nv2aVkState *st, uint32_t hash, const float *vin,
+                         uint32_t nv, const uint32_t *idx, uint32_t nidx)
 {
     Prog *p;
     if (!nidx || !nv || !nv2a_vk_active())
-        return;
+        return 1;
     p = prog_get(hash);
-    if (!p || p->state != 1)
-        return;
-    draw_common(st, p->vs, hash, p->ninputs ? p->ninputs : 1, vin, nv, idx, nidx);
+    if (!p || __atomic_load_n(&p->state, __ATOMIC_ACQUIRE) != 1)
+        return 0;
+    return draw_common(st, p->vs, hash, p->ninputs ? p->ninputs : 1, vin, nv, idx, nidx);
 }
 
 
@@ -6462,6 +6804,7 @@ void nv2a_vk_flush(void)
         static uint32_t saved_npipes;
         if (V.npipes != (int)saved_npipes && V.frame % 600 == 0) {
             pipeline_cache_save();
+            warm_save();
             saved_npipes = (uint32_t)V.npipes;
         }
     }

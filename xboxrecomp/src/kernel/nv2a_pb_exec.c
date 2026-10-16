@@ -572,7 +572,7 @@ static void fetch_attr_run(const VertexAttr *a, uint32_t lo, const uint32_t *idx
                            uint32_t nv, float *out, size_t ostride)
 {
     const uint8_t *base;
-    uint32_t j, i, n, maxi;
+    uint32_t j, n, maxi;
 
     /* The fast paths below write all four components of every vertex --
      * the attribute's, then the (0, 0, 0, 1) defaults -- so only the slow
@@ -3312,7 +3312,8 @@ static int vk_program_batch(void)
         }
     }
     vk_state(&st);
-    nv2a_vk_draw_program(&st, h, vin, nv, s_vk_idx, k);
+    if (!nv2a_vk_draw_program(&st, h, vin, nv, s_vk_idx, k))
+        return 0;                       /* still compiling: the CPU path draws it */
     s_gpu.tris_drawn += k / 3;
     s_gpu.xf_drawn += k / 3;
     note_drawn();
