@@ -15,7 +15,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include <execinfo.h>
+#include "platform/host_backtrace.h"   /* backtrace(), also on Android */
 #include <pthread.h>
 #include <unistd.h>
 #endif

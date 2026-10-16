@@ -40,7 +40,7 @@
 /* dladdr() / backtrace(); the Win32 vocabulary comes from xboxrecomp.h. */
 #define _GNU_SOURCE
 #include <dlfcn.h>
-#include <execinfo.h>
+#include "platform/host_backtrace.h"   /* backtrace(), also on Android */
 #include <unistd.h>
 #include <dirent.h>
 #include <signal.h>
@@ -775,6 +775,65 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
     return TRUE;
 }
 
+#ifdef __ANDROID__
+#define SDL_MAIN_HANDLED        /* SDL_main is defined by name below */
+#include <SDL.h>
+#include <SDL_system.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* Android: SDLActivity loads libmain.so and calls SDL_main on its own
+ * thread. Everything lives in the app's external files directory,
+ * /sdcard/Android/data/<package>/files, which a PC can reach over USB:
+ *
+ *   game/      the player's copy of the game (default.xbe, Media, ...)
+ *   rsc2.log   stderr and stdout
+ *   config/ data/ cache/   what $XDG_*_HOME point at on Linux
+ */
+static void android_setup(void)
+{
+    const char *base = SDL_AndroidGetExternalStoragePath();
+    char p[1024];
+    static const char *const xdg[][2] = {
+        { "XDG_CONFIG_HOME", "config" },
+        { "XDG_DATA_HOME",   "data"   },
+        { "XDG_CACHE_HOME",  "cache"  },
+    };
+    size_t i;
+
+    if (!base)
+        base = SDL_AndroidGetInternalStoragePath();
+    if (!base)
+        return;
+    if (chdir(base) != 0)
+        return;
+    snprintf(p, sizeof p, "%s/rsc2.log", base);
+    if (freopen(p, "w", stderr))
+        setvbuf(stderr, NULL, _IOLBF, 0);
+    freopen(p, "a", stdout);
+    setenv("HOME", base, 0);
+    for (i = 0; i < sizeof xdg / sizeof xdg[0]; i++) {
+        snprintf(p, sizeof p, "%s/%s", base, xdg[i][1]);
+        mkdir(p, 0755);
+        setenv(xdg[i][0], p, 0);
+    }
+    mkdir("game", 0755);
+    fprintf(stderr, "[ANDROID] files in %s; game data expected in %s/game\n", base, base);
+    /* No desktop launcher here yet; the defaults below, full screen. */
+    setenv("RSC2_LAUNCHER", "0", 0);
+    setenv("RECOMP_FULLSCREEN", "1", 0);
+}
+
+int SDL_main(int argc, char **argv)
+{
+    android_setup();
+    s_argc = argc;
+    s_argv = argv;
+    return rsc2_main(NULL, NULL, NULL, 0);
+}
+#endif
+
+#ifndef __ANDROID__
 /* Console entry point (for debugging -- lets you see printf output) */
 int main(int argc, char **argv)
 {
@@ -786,3 +845,4 @@ int main(int argc, char **argv)
     return rsc2_main(NULL, NULL, NULL, 0);
 #endif
 }
+#endif

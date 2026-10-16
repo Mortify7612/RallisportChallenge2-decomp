@@ -33,6 +33,19 @@ add_compile_definitions(
 set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH
     "Path to the xboxrecomp toolkit root directory")
 
+# Android: SDL2 from source (libSDL2.so, which SDLActivity loads), added
+# before the toolkit so its find_package(SDL2) calls find these targets.
+# See android/README.md.
+if(ANDROID)
+    set(RSC2_SDL2_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/src/SDL2-2.32.10" CACHE PATH
+        "SDL2 source tree for the Android build")
+    set(SDL_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+    set(SDL_TEST OFF CACHE BOOL "" FORCE)
+    add_subdirectory(${RSC2_SDL2_SRC} ${CMAKE_BINARY_DIR}/SDL2)
+    set(SDL2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmake/android" CACHE PATH "" FORCE)
+endif()
+
 # Add xboxrecomp as a subdirectory -- this builds all 6 runtime libraries
 # and provides the 'xboxrecomp' umbrella target to link against.
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
@@ -57,6 +70,7 @@ set(GAME_SOURCES
     src/rsc2_callcount.c    # RSC2_CALLCOUNT (needs tools/callcount_instrument.py on)
     src/launcher.c          # pre-game settings window + settings.ini
     src/steam_shortcut.c    # launcher's "Add to Steam" (shortcuts.vdf)
+    src/host_coro.c         # fiber stacks where there is no ucontext (Android)
     # Add game-specific sources here, e.g.:
     # src/asset_loader.c
     # src/custom_renderer.c
@@ -68,10 +82,28 @@ set(GAME_SOURCES
 #   src/recomp/recomp_dispatch.h     - binary search dispatch table
 #   src/recomp/recomp_types.h        - register model, ICALL macros, MEM helpers
 
+if(ANDROID)
+    # SDLActivity loads libmain.so and calls SDL_main (main.c).
+    add_library(${PROJECT_NAME} SHARED ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
+    set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME main)
+    target_link_libraries(${PROJECT_NAME} PRIVATE android log)
+    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--no-undefined)
+else()
 add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
 )
+endif()
+
+# host_coro.c in place of ucontext for the fiber HLE: always on Android,
+# where bionic has no ucontext; on Linux only to test it.
+option(RSC2_HOST_CORO "Fibers on host_coro.c instead of ucontext" OFF)
+if(RSC2_HOST_CORO)
+    set_property(SOURCE src/rsc2_overrides.c APPEND PROPERTY COMPILE_DEFINITIONS RSC2_HOST_CORO=1)
+endif()
+if(WIN32)
+    set_source_files_properties(src/host_coro.c PROPERTIES HEADER_FILE_ONLY ON)
+endif()
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)

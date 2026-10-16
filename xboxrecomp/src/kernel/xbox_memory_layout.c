@@ -15,7 +15,7 @@
 #if defined(__linux__)
 #define _GNU_SOURCE 1
 #include <dlfcn.h>
-#include <execinfo.h>
+#include "../platform/host_backtrace.h"   /* backtrace(), also on Android */
 #endif
 #include "xbox_memory_layout.h"
 #include "kernel.h"

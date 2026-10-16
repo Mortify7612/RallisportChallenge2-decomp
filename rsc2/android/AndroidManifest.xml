@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- RalliSport Challenge 2 (recompiled) for Android. Built by build_apk.sh;
+     the activity is SDL's (org.libsdl.app.SDLActivity), subclassed in
+     src/io/github/rsc2recomp/RSC2Activity.java. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="io.github.rsc2recomp"
+    android:versionCode="1"
+    android:versionName="0.1-android"
+    android:installLocation="auto">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="34" />
+
+    <!-- The renderer needs Vulkan 1.3 (0x00403000). -->
+    <uses-feature android:name="android.hardware.vulkan.version"
+        android:version="0x00403000" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.bluetooth" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+    <uses-feature android:name="android.hardware.usb.host" android:required="false" />
+
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <application android:label="RSC2 (recomp)"
+        android:allowBackup="false"
+        android:extractNativeLibs="true"
+        android:hasFragileUserData="true"
+        android:isGame="true"
+        android:appCategory="game"
+        android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+        android:hardwareAccelerated="true">
+
+        <activity android:name="io.github.rsc2recomp.RSC2Activity"
+            android:label="RSC2 (recomp)"
+            android:screenOrientation="sensorLandscape"
+            android:alwaysRetainTaskState="true"
+            android:launchMode="singleInstance"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation"
+            android:preferMinimalPostProcessing="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

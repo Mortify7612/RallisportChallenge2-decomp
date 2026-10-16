@@ -26,6 +26,7 @@
 #include <signal.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <sched.h>
 #include <fenv.h>
 #include <sys/mman.h>
@@ -915,7 +916,13 @@ BOOL TerminateThread(HANDLE h, DWORD exitCode)
 {
     w32_object *o = obj_of(h);
     if (!o || o->kind != K_THREAD) return FALSE;
+#if defined(__ANDROID__)
+    /* Bionic has no pthread_cancel. The thread is marked exited for its
+     * waiters and keeps running until it next leaves on its own. */
+    fprintf(stderr, "[win32_compat] TerminateThread: no cancellation on Android\n");
+#else
     pthread_cancel(o->thread);
+#endif
     pthread_mutex_lock(&o->lock);
     o->exit_code = exitCode;
     o->exited    = 1;
@@ -1425,6 +1432,10 @@ VOID SecureZeroMemory(PVOID ptr, SIZE_T cnt)
 {
 #if defined(__APPLE__)
     memset_s(ptr, cnt, 0, cnt);
+#elif defined(__ANDROID__)
+    volatile unsigned char *p = (volatile unsigned char *)ptr;   /* no explicit_bzero */
+    while (cnt--)
+        *p++ = 0;
 #else
     explicit_bzero(ptr, cnt);
 #endif
@@ -1718,6 +1729,9 @@ static int anon_map_fd(const char *name)
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
+#elif defined(__ANDROID__)
+    /* Bionic declares memfd_create from API 30; the syscall is older. */
+    return (int)syscall(__NR_memfd_create, name ? name : "xbox_map", 0u);
 #else
     return memfd_create(name ? name : "xbox_map", 0);
 #endif

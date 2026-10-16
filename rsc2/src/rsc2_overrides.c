@@ -267,9 +267,10 @@ void sub_0030FD2A(void)
  * pops the frame CreateFiber built, exactly as the original's pops and
  * `ret 4` would, and enters the start thunk (0x00082D54) from there.
  */
-/* Host coroutines: ucontext on POSIX, native fibers on Windows. Everything
- * else -- the guest bookkeeping, the register file, the first-activation
- * frame -- is shared. */
+/* Host coroutines: ucontext on glibc, host_coro.c where there is no ucontext
+ * (Android; RSC2_HOST_CORO=1 selects it on Linux too), native fibers on
+ * Windows. Everything else -- the guest bookkeeping, the register file, the
+ * first-activation frame -- is shared. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -278,7 +279,14 @@ void sub_0030FD2A(void)
 #else
 #include <pthread.h>
 #include <sys/mman.h>
+#if defined(__ANDROID__) && !defined(RSC2_HOST_CORO)
+#define RSC2_HOST_CORO 1
+#endif
+#if RSC2_HOST_CORO
+#include "host_coro.h"
+#else
 #include <ucontext.h>
+#endif
 #endif
 
 #define FIBER_TLS_INDEX_VA  0x00415200u
@@ -292,6 +300,9 @@ typedef struct {
     int        started;
 #ifdef _WIN32
     LPVOID     hfiber;                 /* host fiber */
+#elif RSC2_HOST_CORO
+    void      *sp;                     /* saved host stack pointer */
+    void      *stack;
 #else
     ucontext_t uc;
     void      *stack;
@@ -386,6 +397,11 @@ static VOID CALLBACK fiber_entry(LPVOID p)
 {
     fiber_run((HostFiber *)p);
 }
+#elif RSC2_HOST_CORO
+static void fiber_entry(void *p)
+{
+    fiber_run((HostFiber *)p);
+}
 #else
 static void fiber_entry(unsigned lo, unsigned hi)
 {
@@ -453,12 +469,17 @@ void sub_00082E25(void)
             fprintf(stderr, "[FIBER] cannot allocate a host stack\n");
             abort();
         }
+#if RSC2_HOST_CORO
+        (void)p;
+        t->sp = coro_init(t->stack, FIBER_HOST_STACK, fiber_entry, t);
+#else
         getcontext(&t->uc);
         t->uc.uc_stack.ss_sp = t->stack;
         t->uc.uc_stack.ss_size = FIBER_HOST_STACK;
         t->uc.uc_link = NULL;
         makecontext(&t->uc, (void (*)(void))fiber_entry, 2,
                     (unsigned)(p & 0xFFFFFFFFu), (unsigned)(p >> 32));
+#endif
         t->started = 1;
         {
             static int shown;
@@ -470,7 +491,11 @@ void sub_00082E25(void)
         /* Resuming a fiber that switched away through here: its registers
          * come back from its record once swapcontext lands in it. */
     }
+#if RSC2_HOST_CORO
+    coro_switch(&c->sp, t->sp);
+#else
     swapcontext(&c->uc, &t->uc);
+#endif
 #endif
     /* Resumed: some fiber switched back to this one. */
     fiber_restore(c);

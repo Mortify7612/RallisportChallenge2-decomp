@@ -65,6 +65,49 @@ void nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
 #include <windows.h>
 #endif
 #include <vulkan/vulkan.h>
+
+/* Android's libvulkan.so exports only the core functions of the API level
+ * the app targets (1.1 at API 29), so the 1.2/1.3 ones the renderer uses are
+ * looked up on the device once it exists (vk_load_device_fns), trying the
+ * core name first and then the extension alias the same entry point had. */
+#if defined(__ANDROID__)
+#define VK_LATE_FNS(X) \
+    X(vkCmdBeginRendering, "KHR") X(vkCmdEndRendering, "KHR") \
+    X(vkCmdSetCullMode, "EXT") X(vkCmdSetFrontFace, "EXT") \
+    X(vkCmdSetDepthTestEnable, "EXT") X(vkCmdSetDepthWriteEnable, "EXT") \
+    X(vkCmdSetDepthCompareOp, "EXT") X(vkCmdSetStencilTestEnable, "EXT") \
+    X(vkCmdSetStencilOp, "EXT") X(vkResetQueryPool, "EXT")
+#define VK_LATE_DECL(name, sfx) static PFN_##name p_##name;
+VK_LATE_FNS(VK_LATE_DECL)
+#undef VK_LATE_DECL
+#define vkCmdBeginRendering       p_vkCmdBeginRendering
+#define vkCmdEndRendering         p_vkCmdEndRendering
+#define vkCmdSetCullMode          p_vkCmdSetCullMode
+#define vkCmdSetFrontFace         p_vkCmdSetFrontFace
+#define vkCmdSetDepthTestEnable   p_vkCmdSetDepthTestEnable
+#define vkCmdSetDepthWriteEnable  p_vkCmdSetDepthWriteEnable
+#define vkCmdSetDepthCompareOp    p_vkCmdSetDepthCompareOp
+#define vkCmdSetStencilTestEnable p_vkCmdSetStencilTestEnable
+#define vkCmdSetStencilOp         p_vkCmdSetStencilOp
+#define vkResetQueryPool          p_vkResetQueryPool
+
+/* 0 if any is missing. */
+static int vk_load_device_fns(VkDevice dev)
+{
+    int ok = 1;
+#define VK_LATE_LOAD(name, sfx) \
+    p_##name = (PFN_##name)vkGetDeviceProcAddr(dev, #name); \
+    if (!p_##name) \
+        p_##name = (PFN_##name)vkGetDeviceProcAddr(dev, #name sfx); \
+    if (!p_##name) { \
+        fprintf(stderr, "  [VK] %s not available\n", #name); \
+        ok = 0; \
+    }
+    VK_LATE_FNS(VK_LATE_LOAD)
+#undef VK_LATE_LOAD
+    return ok;
+}
+#endif
 #include "../d3d/d3d8_swizzle.h"
 #if defined(XBOXRECOMP_HAVE_GLSLANG)
 #include <glslang/Include/glslang_c_interface.h>
@@ -2069,6 +2112,10 @@ static int vk_init(void)
         r = vkCreateDevice(V.pd, &dci, NULL, &V.dev);
         if (r != VK_SUCCESS)
             return vk_fail("vkCreateDevice", r);
+#if defined(__ANDROID__)
+        if (!vk_load_device_fns(V.dev))
+            return vk_fail("vkGetDeviceProcAddr", VK_ERROR_INITIALIZATION_FAILED);
+#endif
         vkGetDeviceQueue(V.dev, V.qf, 0, &V.q);
     }
     {
