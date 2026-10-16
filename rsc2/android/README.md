@@ -52,15 +52,37 @@ The APK is signed with a debug key that is made once in
 
 ## Game data
 
-Copy your game folder (with `default.xbe`, `Media`, `Layer0`, ...) to
+Android 11 and later do not let an app read files that `adb push` (or a PC)
+puts in its `Android/data` folder. Until the app can import a folder itself,
+copy the game into the app's internal storage *as the app* (the APK is
+debuggable, so `run-as` works):
 
-    /sdcard/Android/data/io.github.rsc2recomp/files/game/
+```sh
+A=~/Android/Sdk/platform-tools/adb
+cd <your game folder>          # default.xbe, Media, Layer0, ...
+tar -cf - . | $A exec-in run-as io.github.rsc2recomp \
+    sh -c 'mkdir -p files/game && tar -C files/game -xf -'
+```
 
-with a file manager, over USB, or with
-`adb push <game folder>/. /sdcard/Android/data/io.github.rsc2recomp/files/game/`.
-Start the app once first so that the folder exists. The log is written next
-to it, in `files/rsc2.log`. Settings, saves and the shader cache go in
-`files/config`, `files/data` and `files/cache`.
+That is `/data/data/io.github.rsc2recomp/files/game`. The app uses it when
+`game/default.xbe` is there, and otherwise falls back to
+`/sdcard/Android/data/io.github.rsc2recomp/files`. Next to `game/`:
+
+- `rsc2.log`: stderr and stdout. They also go to logcat, tag `RSC2`.
+- `rsc2.env`: `NAME=value` lines applied at start, e.g. `RECOMP_FPS_OVERLAY=1`
+  or `RECOMP_VK_SCALE=1`. Write it with
+  `echo RECOMP_VK_SCALE=1 | $A exec-in run-as io.github.rsc2recomp sh -c 'cat > files/rsc2.env'`.
+- `config/`, `data/`, `cache/`: settings, saves and the shader cache.
+
+The phone must be unlocked with the screen on. SDL waits for a visible
+surface before it starts the game.
+
+## First device test (OnePlus, Snapdragon 8 Gen 3 / Adreno 750, Android 15)
+
+- Runs: intro movies, menus and races, with the Xbox controller over
+  Bluetooth and the right controls.
+- Menus and movies run at about 58 fps (GPU 2 ms/frame). Races run at 14–15
+  fps at the default 2× scale, GPU-bound at ~43 ms/frame.
 
 ## What differs from Linux
 
@@ -74,5 +96,6 @@ to it, in `files/rsc2.log`. Settings, saves and the shader cache go in
   settings.
 - **One guest thread at a time** (`RECOMP_GUEST_LOCK=1`, the ARM default).
 
-Not done yet: touch controls (use a Bluetooth or USB controller), the
-launcher, testing on real devices.
+Not done yet: race performance on mobile GPUs, touch controls (use a
+Bluetooth or USB controller), the launcher, and importing the game folder
+from the phone itself.

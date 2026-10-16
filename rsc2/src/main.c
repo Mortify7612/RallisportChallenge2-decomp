@@ -781,6 +781,62 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
 #include <SDL_system.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <android/log.h>
+#include <errno.h>
+#include <string.h>
+
+/* stderr and stdout go nowhere in an Android app. Both are pointed at a pipe
+ * whose reader copies every line to logcat (tag RSC2) and, once it is open,
+ * to rsc2.log. */
+static FILE *s_alog_file;
+
+static void *alog_pump(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    char buf[4096];
+    size_t have = 0;
+    for (;;) {
+        ssize_t n = read(fd, buf + have, sizeof buf - 1 - have);
+        char *start, *nl;
+        if (n <= 0)
+            break;
+        have += (size_t)n;
+        buf[have] = 0;
+        start = buf;
+        while ((nl = strchr(start, '\n')) || have - (size_t)(start - buf) >= sizeof buf - 1) {
+            if (nl)
+                *nl = 0;
+            __android_log_write(ANDROID_LOG_INFO, "RSC2", start);
+            if (s_alog_file) {
+                fputs(start, s_alog_file);
+                fputc('\n', s_alog_file);
+                fflush(s_alog_file);
+            }
+            start = nl ? nl + 1 : buf + have;
+            if (!nl)
+                break;
+        }
+        have -= (size_t)(start - buf);
+        memmove(buf, start, have);
+    }
+    return NULL;
+}
+
+static void alog_start(void)
+{
+    int p[2];
+    pthread_t t;
+    if (pipe(p) != 0)
+        return;
+    dup2(p[1], 2);
+    dup2(p[1], 1);
+    close(p[1]);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    if (pthread_create(&t, NULL, alog_pump, (void *)(intptr_t)p[0]) == 0)
+        pthread_detach(t);
+}
 
 /* Android: SDLActivity loads libmain.so and calls SDL_main on its own
  * thread. Everything lives in the app's external files directory,
@@ -801,16 +857,32 @@ static void android_setup(void)
     };
     size_t i;
 
+    alog_start();
+    fprintf(stderr, "[ANDROID] external files dir: %s\n", base ? base : "(none)");
+    /* The game folder may also be in internal storage: files copied into the
+     * external one by adb are not readable by the app (Android 11+), so a
+     * development copy goes in with `run-as`, which only reaches internal. */
+    {
+        const char *in = SDL_AndroidGetInternalStoragePath();
+        char x[1024];
+        snprintf(x, sizeof x, "%s/game/default.xbe", in ? in : "");
+        if (in && access(x, R_OK) == 0)
+            base = in;
+    }
     if (!base)
         base = SDL_AndroidGetInternalStoragePath();
-    if (!base)
+    if (!base) {
+        fprintf(stderr, "[ANDROID] no storage path: %s\n", SDL_GetError());
         return;
-    if (chdir(base) != 0)
+    }
+    if (chdir(base) != 0) {
+        fprintf(stderr, "[ANDROID] cannot enter %s: %s\n", base, strerror(errno));
         return;
+    }
     snprintf(p, sizeof p, "%s/rsc2.log", base);
-    if (freopen(p, "w", stderr))
-        setvbuf(stderr, NULL, _IOLBF, 0);
-    freopen(p, "a", stdout);
+    s_alog_file = fopen(p, "w");
+    if (!s_alog_file)
+        fprintf(stderr, "[ANDROID] cannot write %s: %s\n", p, strerror(errno));
     setenv("HOME", base, 0);
     for (i = 0; i < sizeof xdg / sizeof xdg[0]; i++) {
         snprintf(p, sizeof p, "%s/%s", base, xdg[i][1]);
@@ -819,6 +891,28 @@ static void android_setup(void)
     }
     mkdir("game", 0755);
     fprintf(stderr, "[ANDROID] files in %s; game data expected in %s/game\n", base, base);
+    /* rsc2.env: NAME=value per line, the environment a desktop user would
+     * set on the command line (RECOMP_FPS_OVERLAY=1, a replay, stats).
+     * Lines starting with # are skipped. */
+    {
+        FILE *f = fopen("rsc2.env", "r");
+        char line[1024];
+        while (f && fgets(line, sizeof line, f)) {
+            char *eq = strchr(line, '='), *end = line + strcspn(line, "\r\n");
+            *end = 0;
+            if (line[0] == '#' || !eq || eq == line)
+                continue;
+            *eq = 0;
+            setenv(line, eq + 1, 1);
+            fprintf(stderr, "[ANDROID] rsc2.env: %s=%s\n", line, eq + 1);
+        }
+        if (f)
+            fclose(f);
+    }
+    /* Landscape only. SDL sets the activity's orientation itself when the
+     * window is created (overriding the manifest) and, for a resizable
+     * window without this hint, follows the phone's rotation setting. */
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
     /* No desktop launcher here yet; the defaults below, full screen. */
     setenv("RSC2_LAUNCHER", "0", 0);
     setenv("RECOMP_FULLSCREEN", "1", 0);

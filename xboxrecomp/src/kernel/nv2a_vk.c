@@ -5630,7 +5630,12 @@ static int swapchain_create(void)
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
                   | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    ci.preTransform = caps.currentTransform;
+    /* Identity: frames are drawn upright and the compositor turns them to
+     * the panel. currentTransform would promise they were already rotated --
+     * on an Android phone held in landscape that showed them sideways and
+     * squashed. (Desktop surfaces report identity anyway.) */
+    ci.preTransform = (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)
+                    ? VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR : caps.currentTransform;
     ci.compositeAlpha = (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
                       ? VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
                       : (VkCompositeAlphaFlagBitsKHR)(caps.supportedCompositeAlpha & -caps.supportedCompositeAlpha);
