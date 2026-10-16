@@ -147,6 +147,67 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
+/* RECOMP_WIDESCREEN=1: the title draws 16:9 squeezed into a 4:3 frame
+ * (anamorphic), so the window is 16:9 and the frame is stretched to it. */
+static int fb_wide(void)
+{
+    const char *v = getenv("RECOMP_WIDESCREEN");
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+/* RECOMP_FULLSCREEN=1 opens fullscreen; F11 toggles. Borderless over the
+ * whole monitor rather than a mode change, as the SDL hosts do it
+ * (SDL_WINDOW_FULLSCREEN_DESKTOP): no flicker, and Alt+Tab just works. */
+static WINDOWPLACEMENT s_placement;
+static int s_fullscreen;
+
+static void fb_set_fullscreen(HWND h, int on)
+{
+    LONG style = GetWindowLongA(h, GWL_STYLE);
+
+    if (on == s_fullscreen)
+        return;
+    if (on) {
+        MONITORINFO mi;
+        memset(&mi, 0, sizeof mi);
+        mi.cbSize = sizeof mi;
+        s_placement.length = sizeof s_placement;
+        if (!GetWindowPlacement(h, &s_placement)
+                || !GetMonitorInfoA(MonitorFromWindow(h, MONITOR_DEFAULTTOPRIMARY), &mi))
+            return;
+        SetWindowLongA(h, GWL_STYLE, (style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
+        SetWindowPos(h, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
+                     mi.rcMonitor.right - mi.rcMonitor.left,
+                     mi.rcMonitor.bottom - mi.rcMonitor.top,
+                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    } else {
+        SetWindowLongA(h, GWL_STYLE, (style & ~WS_POPUP) | WS_OVERLAPPEDWINDOW);
+        SetWindowPlacement(h, &s_placement);
+        SetWindowPos(h, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                     | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+    }
+    s_fullscreen = on;
+}
+
+/* Where the frame goes in a client area: as large as fits, aspect kept. */
+static void fb_fit(const RECT *cr, RECT *out)
+{
+    int cw = cr->right - cr->left, ch = cr->bottom - cr->top;
+    int aw = fb_wide() ? 16 : 4, ah = fb_wide() ? 9 : 3, w, h;
+
+    if ((long long)cw * ah > (long long)ch * aw) {
+        h = ch;
+        w = (int)((long long)ch * aw / ah);
+    } else {
+        w = cw;
+        h = (int)((long long)cw * ah / aw);
+    }
+    out->left = cr->left + (cw - w) / 2;
+    out->top = cr->top + (ch - h) / 2;
+    out->right = out->left + w;
+    out->bottom = out->top + h;
+}
+
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -162,6 +223,10 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if (w == VK_F11 && !(l & 0x40000000)) {   /* not auto-repeat */
+            fb_set_fullscreen(h, !s_fullscreen);
+            return 0;
+        }
         if ((unsigned)w < 256)
             s_key_down[w] = 1;
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
@@ -268,6 +333,26 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+/* GDI: the frame scaled into the window, aspect kept, black around it. */
+static void fb_blit(HWND hwnd, HDC hdc, const BITMAPINFO *bi)
+{
+    RECT cr, d;
+
+    GetClientRect(hwnd, &cr);
+    fb_fit(&cr, &d);
+    if (d.left > cr.left)
+        PatBlt(hdc, cr.left, cr.top, d.left - cr.left, cr.bottom - cr.top, BLACKNESS);
+    if (d.right < cr.right)
+        PatBlt(hdc, d.right, cr.top, cr.right - d.right, cr.bottom - cr.top, BLACKNESS);
+    if (d.top > cr.top)
+        PatBlt(hdc, cr.left, cr.top, cr.right - cr.left, d.top - cr.top, BLACKNESS);
+    if (d.bottom < cr.bottom)
+        PatBlt(hdc, cr.left, d.bottom, cr.right - cr.left, cr.bottom - d.bottom, BLACKNESS);
+    StretchDIBits(hdc, d.left, d.top, d.right - d.left, d.bottom - d.top,
+                  0, 0, (int)s_fb_width, (int)s_fb_height,
+                  s_rgb, bi, DIB_RGB_COLORS, SRCCOPY);
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
     HWND hwnd;
@@ -291,9 +376,24 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         if (!(vp && strcmp(vp, "0") == 0) && nv2a_vk_instance_handle())
             s_vk_window = 1;
     }
-    r.left = 0; r.top = 0;
-    r.right = (LONG)s_fb_width * (s_vk_window ? 2 : 1);
-    r.bottom = (LONG)s_fb_height * (s_vk_window ? 2 : 1);
+    /* Twice the frame (1280x960, or 1280x720 for 16:9) like the SDL hosts,
+     * in real pixels: DPI-aware, so the scaled-display stretch does not blur
+     * it, and sized up by the display's scale so it keeps its apparent size. */
+    {
+        HDC sdc;
+        int dpi = 96;
+        SetProcessDPIAware();
+        sdc = GetDC(NULL);
+        if (sdc) {
+            dpi = GetDeviceCaps(sdc, LOGPIXELSX);
+            ReleaseDC(NULL, sdc);
+        }
+        if (dpi < 96)
+            dpi = 96;
+        r.left = 0; r.top = 0;
+        r.right = MulDiv(fb_wide() ? 1280 : (int)s_fb_width * 2, dpi, 96);
+        r.bottom = MulDiv(fb_wide() ? 720 : (int)s_fb_height * 2, dpi, 96);
+    }
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
     hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -304,7 +404,13 @@ static DWORD WINAPI fb_thread(LPVOID unused)
         InterlockedExchange(&s_fb_running, 0);
         return 0;
     }
+    {
+        const char *fs = getenv("RECOMP_FULLSCREEN");
+        if (fs && *fs && strcmp(fs, "0") != 0)
+            fb_set_fullscreen(hwnd, 1);
+    }
     hdc = GetDC(hwnd);
+    SetStretchBltMode(hdc, COLORONCOLOR);
     if (s_vk_window) {
         RECT cr;
         GetClientRect(hwnd, &cr);
@@ -345,18 +451,14 @@ static DWORD WINAPI fb_thread(LPVOID unused)
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
             if (!s_vk_window)
-                StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                              0, 0, (int)s_fb_width, (int)s_fb_height,
-                              s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+                fb_blit(hwnd, hdc, &bi);
         } else if (s_fb_va && s_fb_pitch && s_rgb && !s_vk_window) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
                 (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
-            StretchDIBits(hdc, 0, 0, (int)s_fb_width, (int)s_fb_height,
-                          0, 0, (int)s_fb_width, (int)s_fb_height,
-                          s_rgb, &bi, DIB_RGB_COLORS, SRCCOPY);
+            fb_blit(hwnd, hdc, &bi);
         }
         {
             /* One dump a few seconds in, so the title has had time to render

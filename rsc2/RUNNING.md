@@ -53,9 +53,13 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
 
 ## Windows (cross-built on Linux, tested under Wine only)
 
-The Vulkan renderer needs three things the MinGW sysroot lacks; they live in
-`../third_party/mingw` (rebuild steps below): the Vulkan headers, an import
-library for the system's `vulkan-1.dll`, and a static glslang.
+The MinGW sysroot is missing four things the Windows build needs. They live in
+`../third_party/mingw` (rebuild steps below):
+
+- the Vulkan headers
+- an import library for the system's `vulkan-1.dll`
+- a static glslang
+- a static SDL2, for the launcher window
 
 ```sh
 TP=$PWD/third_party/mingw
@@ -65,27 +69,48 @@ cmake -S rsc2 -B rsc2/build-win -G Ninja \
       -DXBOXRECOMP_GLSLANG_INCLUDE=$TP/include \
       -DXBOXRECOMP_GLSLANG_LIB=$TP/lib/libglslang.a \
       -DXBOXRECOMP_GLSLANG_RL_LIB=$TP/lib/libglslang-default-resource-limits.a \
-      "-DXBOXRECOMP_GLSLANG_EXTRA_LIBS=$TP/lib/libSPIRV.a;$TP/lib/libMachineIndependent.a;$TP/lib/libOSDependent.a;$TP/lib/libGenericCodeGen.a;$TP/lib/libMachineIndependent.a;stdc++"
+      "-DXBOXRECOMP_GLSLANG_EXTRA_LIBS=$TP/lib/libSPIRV.a;$TP/lib/libMachineIndependent.a;$TP/lib/libOSDependent.a;$TP/lib/libGenericCodeGen.a;$TP/lib/libMachineIndependent.a;stdc++" \
+      -DSDL2_DIR=$TP/lib/cmake/SDL2
 ninja -C rsc2/build-win
 ```
 
-`rsc2/build-win/rsc2.exe` is self-contained (static MinGW runtime, glslang
-linked in; needs only the GPU driver's `vulkan-1.dll`) and needs the game
-folder next to it as `game`. Under Wine it renders with Vulkan on the host
-GPU and reaches the menus at ~55 fps.
+`rsc2/build-win/rsc2.exe` is self-contained. It uses a static MinGW runtime
+with glslang and SDL2 linked in, and needs only the GPU driver's
+`vulkan-1.dll`. Put the game folder next to it as `game`. Under Wine it
+renders with Vulkan on the host GPU and reaches the menus at about 55 fps.
+
+On Windows, as on Linux:
+
+- The launcher comes first and saves to `%APPDATA%\rsc2\settings.ini`.
+  Without `-DSDL2_DIR` the build still works, but it has no launcher window;
+  the saved settings still apply.
+- 16:9 opens a 1280x720 window. The window size scales with the display's
+  DPI setting.
+- The display mode setting (`RECOMP_FULLSCREEN=1`) gives borderless
+  fullscreen on the monitor. F11 toggles it.
 
 Known Windows issues:
 - A profile saved by the Linux build is listed but "Unable to load".
 - A second launch can stall rebuilding its Z: cache; delete
   `%LOCALAPPDATA%\xboxrecomp\Cache` between runs.
 
-Rebuilding `third_party/mingw`: glslang from tag `vulkan-sdk-1.4.363.0`
-(`third_party/src/glslang`) built with the same toolchain file and
-`-DBUILD_SHARED_LIBS=OFF -DENABLE_OPT=OFF -DENABLE_HLSL=OFF
--DGLSLANG_TESTS=OFF -DENABLE_GLSLANG_BINARIES=OFF`, installed there; the
-headers are copies of `/usr/include/{vulkan,vk_video}`; the import library
-is `x86_64-w64-mingw32-dlltool -d third_party/vulkan-1.def -l
-third_party/mingw/lib/libvulkan-1.a`.
+Rebuilding `third_party/mingw`:
+
+- **glslang:** tag `vulkan-sdk-1.4.363.0` (`third_party/src/glslang`).
+  Build it with the same toolchain file and these options, then install it
+  there:
+  `-DBUILD_SHARED_LIBS=OFF -DENABLE_OPT=OFF -DENABLE_HLSL=OFF -DGLSLANG_TESTS=OFF -DENABLE_GLSLANG_BINARIES=OFF`
+- **SDL2:** release 2.32.10 (`SDL2-2.32.10.tar.gz` from libsdl-org/SDL on
+  GitHub). Build it with the same toolchain file and these options:
+  `-DCMAKE_BUILD_TYPE=Release -DSDL_SHARED=OFF -DSDL_STATIC=ON -DSDL_TEST=OFF -DCMAKE_INSTALL_PREFIX=third_party/mingw`
+  then run `ninja install`.
+- **Vulkan headers:** copies of `/usr/include/{vulkan,vk_video}`.
+- **Vulkan import library:** generated from those headers (core 1.0–1.3
+  plus the Win32 surface and swapchain functions):
+  ```sh
+  python3 rsc2/tools/mingw_vulkan_def.py third_party/mingw/include third_party/vulkan-1.def
+  x86_64-w64-mingw32-dlltool -d third_party/vulkan-1.def -l third_party/mingw/lib/libvulkan-1.a
+  ```
 
 ## Useful switches (environment variables)
 

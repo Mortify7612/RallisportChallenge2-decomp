@@ -125,8 +125,10 @@ if(MSVC)
 endif()
 
 # The launcher embeds its fonts (generated headers, so any C compiler builds
-# it) and uses stb_truetype; SDL2 comes in through the xboxrecomp targets on
-# POSIX hosts.
+# it) and uses stb_truetype and SDL2. On POSIX hosts SDL2 is there already
+# (the runtime uses it); a Windows build gets the launcher window when it can
+# find a static SDL2 (-DSDL2_DIR=.../lib/cmake/SDL2, see RUNNING.md) and only
+# applies the saved settings without one.
 set(RSC2_GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/rsc2_gen)
 file(MAKE_DIRECTORY ${RSC2_GEN_DIR})
 foreach(font Regular Bold)
@@ -145,6 +147,16 @@ set_source_files_properties(src/launcher.c PROPERTIES
 if(NOT WIN32)
     find_package(SDL2 REQUIRED)
     target_link_libraries(${PROJECT_NAME} PRIVATE SDL2::SDL2)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE RSC2_LAUNCHER_SDL=1)
+else()
+    find_package(SDL2 CONFIG QUIET)
+    if(TARGET SDL2::SDL2-static)
+        message(STATUS "rsc2: launcher window with static SDL2 ${SDL2_VERSION}")
+        target_link_libraries(${PROJECT_NAME} PRIVATE SDL2::SDL2-static)
+        target_compile_definitions(${PROJECT_NAME} PRIVATE RSC2_LAUNCHER_SDL=1)
+    else()
+        message(STATUS "rsc2: no static SDL2 -- the launcher window is left out")
+    endif()
 endif()
 
 # ── Game-specific additions ─────────────────────────────────────

@@ -14,8 +14,9 @@
  *
  * The window is SDL2 with text from stb_truetype and an embedded Noto Sans
  * (generated headers, rsc2/cmake/embed_bin.cmake).
- * Mouse, keyboard and controller all drive it. Windows builds have no SDL2
- * yet: there the saved settings still apply and the window is skipped.
+ * Mouse, keyboard and controller all drive it. A Windows build links a
+ * static SDL2 for it; built without one (RSC2_LAUNCHER_SDL unset), the saved
+ * settings still apply and the window is skipped.
  */
 #include "launcher.h"
 
@@ -301,14 +302,16 @@ static int row_disabled(int i)
     return i == O_GPU && s_opt[i].n < 2;
 }
 
-/* ── the window (SDL2 hosts) ──────────────────────────────── */
+/* ── the window (SDL2) ────────────────────────────────────── */
 
-#ifdef _WIN32
+#ifndef RSC2_LAUNCHER_SDL
 
 static int launcher_window(void) { return 1; }
 
 #else
 
+/* The game has its own entry point; SDL must not bring SDL_main. */
+#define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <math.h>
 #ifndef M_PI
@@ -796,6 +799,11 @@ static int launcher_window(void)
     Uint32 stick_next = 0;
     int stick_dir = 0;
 
+    SDL_SetMainReady();
+    /* Windows: sharp on scaled displays, laid out in points like the other
+     * hosts (the renderer's output size then carries the scale). */
+    SDL_SetHint("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2");
+    SDL_SetHint("SDL_WINDOWS_DPI_SCALING", "1");
     if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) != 0) {
         fprintf(stderr, "[LAUNCHER] SDL init failed (%s) -- starting the game\n", SDL_GetError());
         return 1;
@@ -955,7 +963,7 @@ static int launcher_window(void)
     return result;
 }
 
-#endif /* !_WIN32 */
+#endif /* RSC2_LAUNCHER_SDL */
 
 /* ── entry ────────────────────────────────────────────────── */
 
