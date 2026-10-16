@@ -1850,8 +1850,8 @@ static void settle_inflight(uint32_t va, uint32_t bytes, const Surf *except)
     }
 }
 
-/* A clear about to overwrite all of [va, va+bytes): copy-backs still in
- * flight for other surfaces lying wholly inside it are of no use any more.
+/* A clear about to overwrite all of [va, va+bytes): the copy-back still in
+ * flight for another surface over exactly those bytes is of no use any more.
  * Cancel them -- their entries in the flipped frame are voided, so they can
  * never land late -- instead of waiting for that frame (settle_inflight).
  * RSC2 clears its shadow map's memory through a linear surface every
@@ -1869,7 +1869,11 @@ static void drop_inflight(uint32_t va, uint32_t bytes, const Surf *except)
         return;
     for (i = 0; i < V.nsurf; i++) {
         Surf *q = &V.surf[i];
-        if (q == except || q->dirty != 2 || q->va < va || q->va + surf_bytes(q) > va + bytes)
+        /* Only the same bytes in another shape -- the one buffer drawn as
+         * two surfaces (RSC2's shadow map: linear clear, swizzled draw).
+         * Any surface merely lying inside the cleared range was a step too
+         * far: the pause menu's carousel lost both ends. */
+        if (q == except || q->dirty != 2 || q->va != va || surf_bytes(q) != bytes)
             continue;
         for (k = 0; k < VK_SLOTS; k++)
             if (V.pend[k].active)
