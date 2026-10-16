@@ -6242,9 +6242,11 @@ static void overlay_frame(uint32_t ox, uint32_t oy)
         b.srcOffsets[1].x = OV_W;
         b.srcOffsets[1].y = OV_H;
         b.srcOffsets[1].z = 1;
-        b.dstOffsets[0].x = (int32_t)(ox + 8 * k);
+        /* 20 pixels further in from the left than from the top: clear of
+         * a phone's rounded corner when the picture fills the screen. */
+        b.dstOffsets[0].x = (int32_t)(ox + 8 * k + 20);
         b.dstOffsets[0].y = (int32_t)(oy + 8 * k);
-        b.dstOffsets[1].x = (int32_t)(ox + 8 * k + OV_W * k);
+        b.dstOffsets[1].x = (int32_t)(ox + 8 * k + 20 + OV_W * k);
         b.dstOffsets[1].y = (int32_t)(oy + 8 * k + OV_H * k);
         b.dstOffsets[1].z = 1;
         if ((uint32_t)b.dstOffsets[1].x <= V.sc_ext.width && (uint32_t)b.dstOffsets[1].y <= V.sc_ext.height)
