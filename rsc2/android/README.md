@@ -81,8 +81,12 @@ surface before it starts the game.
 
 - Runs: intro movies, menus and races, with the Xbox controller over
   Bluetooth and the right controls.
-- Menus and movies run at about 58 fps (GPU 2 ms/frame). Races run at 14–15
-  fps at the default 2× scale, GPU-bound at ~43 ms/frame.
+- Menus and movies run at about 58 fps (GPU 2 ms/frame).
+- Races, measured with the race replay while driving: at first 14–15 fps
+  at the default 2× scale. Two fixes brought that to **46 fps at 2×** and
+  **~60 fps at 1×**. The swapchain was rebuilt every frame, because Android
+  reports "suboptimal" whenever the panel is rotated. The combiner shader
+  now runs at 16-bit precision.
 
 ## What differs from Linux
 

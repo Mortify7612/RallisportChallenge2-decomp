@@ -1374,8 +1374,20 @@ static int segment_submit(int readback, RbEnt *list, int *nrb)
         pi.pSwapchains = &V.swapchain;
         pi.pImageIndices = &V.sc_idx;
         pr = vkQueuePresentKHR(V.q, &pi);
-        if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR)
+        if (pr == VK_ERROR_OUT_OF_DATE_KHR)
             V.sc_dead = 1;
+        else if (pr == VK_SUBOPTIMAL_KHR) {
+            /* Rebuild only for a new size. Android says suboptimal on every
+             * present when the panel is rotated and the frames are not
+             * (identity preTransform, the compositor turns them): rebuilding
+             * for that cost a GPU sync and a driver round trip every frame. */
+            VkSurfaceCapabilitiesKHR caps;
+            if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, V.surface, &caps) != VK_SUCCESS
+                    || (caps.currentExtent.width != 0xFFFFFFFFu
+                        && (caps.currentExtent.width != V.sc_ext.width
+                            || caps.currentExtent.height != V.sc_ext.height)))
+                V.sc_dead = 1;
+        }
         V.present_pending = 0;
     }
     if (r != VK_SUCCESS) {
