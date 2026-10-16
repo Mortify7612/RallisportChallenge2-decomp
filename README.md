@@ -9,6 +9,19 @@ the Windows build is cross-compiled and so far tested under Wine.
 C code is generated locally from your `default.xbe` and is not part of this
 repository either.
 
+## Prebuilt binaries
+
+[Releases](https://github.com/Mortify7612/RallisportChallenge2-decomp/releases)
+have ready-built Linux (x86-64) and Windows (x64) packages. They contain the
+compiled program only, with the code translated from the game's executable
+built in, but no game data. Put your game files in a `game` folder next to
+the program, then start `run.sh` (Linux) or `rsc2.exe` (Windows).
+
+- The Linux binary is built on an up-to-date Arch-based system and needs
+  glibc 2.43+, SDL2, the Vulkan loader, glslang 16, SPIRV-Tools, libepoxy and
+  OpenSSL 3. On other distributions, build from source.
+- The Windows binary only needs a GPU driver with Vulkan 1.3.
+
 ## What works
 
 - Boot, intro movies, menus, profiles, career, stage loading and racing.
@@ -75,7 +88,9 @@ cross-build and more of the runtime switches.
 - stb_truetype by Sean Barrett — public domain / MIT.
 
 *RalliSport Challenge 2* is a trademark of its respective owners. This
-project contains no game assets. The code translated from the executable is
-generated on your machine; the one exception is the XDK library's
-`XInputGetState`, whose translated body `rsc2/src/rsc2_overrides.c` keeps so
-input can be recorded and replayed.
+project contains no game assets. In the source tree, the code translated from
+the executable is generated on your machine. There is one exception: the XDK
+library's `XInputGetState`, whose translated body `rsc2/src/rsc2_overrides.c`
+keeps so input can be recorded and replayed. The prebuilt release binaries
+contain the translated code compiled in, and are meant for owners of the
+game.
