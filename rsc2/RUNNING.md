@@ -16,17 +16,32 @@ PRIME offload (`prime-run`, with an inherited `VK_ICD_FILENAMES` dropped);
 directly works too and uses whatever Vulkan device the environment exposes.
 
 Opens a window (F11 = fullscreen; closing it quits) with sound through SDL2.
-Keyboard is pad 0:
+The keyboard is pad 0, alongside any real controller, and is laid out for
+driving with the game's default controller preset (PRESET 1):
 
-| Key | Pad |
-|---|---|
-| Arrows | D-pad |
-| Enter / Backspace | START / BACK |
-| Z X A S | A B X Y |
-| Q E | White / Black |
-| 1 / 3 | Left / right trigger (brake / throttle) |
-| Numpad 8 2 4 6 | Left stick |
-| I J K L | Right stick |
+| Key | Race | Menus | Pad |
+|---|---|---|---|
+| Left / Right | Steer (eased) | Left / right | Left stick |
+| Up / Down | Accelerate / brake | Up / down | Triggers + d-pad up/down |
+| Space | E-brake | Accept | A |
+| A / Z | Gear up / down | | B / X |
+| C | Change camera | | Black |
+| V | Look back | | Y |
+| R | Car reset | | White |
+| H | Horn | | Right stick click |
+| Esc | Pause menu | Back | Start in a race, Back in menus |
+| Enter | | Accept | Start |
+| Backspace | | Back | Back |
+
+Every key can be changed in the launcher (Controls, Key bindings), and
+"Keyboard steering" sets how fast the steering keys reach full lock. The
+arrows steer through the stick only: the game treats a held d-pad
+left/right as instant full lock, which the d-pad rows on the bindings page
+still offer. Esc knows a race from a menu because the game's menu input
+handler (`0x001DBF90`, hooked in `rsc2/src/recomp_manual.c`) only runs while
+a menu is up. The bindings reach the runtime as `RECOMP_KEYMAP`
+(`id=vk[+vk];...`, see `xboxrecomp/include/xbox/keymap.h`) and the easing
+as `RECOMP_KEY_STEER_MS`.
 
 What works: boot, intro movies with audio, title, profile create/save, career
 menus, stage loading, and driving a race (SS1 Cooper Hill) with HUD and timer.

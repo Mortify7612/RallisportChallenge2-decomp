@@ -92,17 +92,23 @@ extern ptrdiff_t g_xbox_mem_offset;
  *       g_eax = result;
  *   }
  */
+/* The menu system's input handler (0x001DBF90, thiscall: menu, dt), reached
+ * only through its vtable. It runs every frame a menu is on screen -- the
+ * front end and the pause menu, not the race -- so the keyboard's "menu" key
+ * (Esc) knows whether to pause (Start) or go back (Back); see
+ * xbox_InputMenuTick in xinput_device.c. */
+extern void sub_001DBF90(void);
+extern void xbox_InputMenuTick(void);
+static void menu_input(void)
+{
+    xbox_InputMenuTick();
+    sub_001DBF90();
+}
+
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va)
 {
-    /*
-     * TODO: Add your overrides here. Examples:
-     *
-     * if (xbox_va == 0x00012345) return traced_sub_00012345;
-     * if (xbox_va == 0x00067890) return stub_00067890;
-     * if (xbox_va == 0x000ABCDE) return fixed_sub_000ABCDE;
-     */
-
-    (void)xbox_va;
+    if (xbox_va == 0x001DBF90u)
+        return menu_input;
     return (recomp_func_t)0;
 }
 

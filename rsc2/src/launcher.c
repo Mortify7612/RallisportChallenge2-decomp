@@ -19,6 +19,7 @@
  * settings still apply and the window is skipped.
  */
 #include "launcher.h"
+#include "xbox/keymap.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,7 +38,7 @@ int nv2a_vk_device_names(char (*names)[256], int max);
 
 enum {
     O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS, O_FPSCOUNT, O_SHOW,
-    O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_KEYBOARD, O_RUMBLE,
+    O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_KEYBOARD, O_KEYS, O_STEER, O_RUMBLE,
     O_COUNT
 };
 
@@ -56,6 +57,34 @@ typedef struct {
 
 static Opt s_opt[O_COUNT];
 static char s_path[1024];
+
+/* The keyboard's bindings (xbox/keymap.h), edited on their own page and
+ * saved as one "keymap=" line. */
+static KeyMap s_keys;
+
+/* What the keyboard does in this game (xbox/keymap.h text form, keys in
+ * hex virtual-key codes), for its default controller preset (PRESET 1:
+ * sub_0016A770 case 0, also what a new profile gets).
+ *
+ * Left/right are the stick only, never the d-pad: in a race a held d-pad
+ * left/right is digital full lock and overrides the stick (0x25882D), which
+ * would undo the eased steering. The menus take the stick exactly like the
+ * d-pad (sub_001DBF90), so they still move. Up/down are the triggers for the
+ * race and the d-pad for the menus; the triggers do not navigate menus and
+ * the d-pad's up/down does nothing in a race. Accept is A or Start, cancel
+ * B or Back, so Space and Enter accept. Esc is the "menu" input: Start
+ * (pause) in a race, Back in the menus -- recomp_manual.c tells it which. */
+static const char k_rsc2_keymap[] =
+    "lx-=25;lx+=27;rt=26;lt=28;up=26;down=28;"  /* arrows */
+    "a=20;b=41;x=5A;black=43;y=56;white=52;"    /* Space A Z C V R */
+    "rs=48;start=0D;back=08;menu=1B;"           /* H, Enter, Backspace, Esc */
+    "left=;right=;ly+=;ly-=;ls=;rx-=;rx+=;ry+=;ry-=";
+
+static void keys_defaults(KeyMap *m)
+{
+    km_defaults(m);
+    km_parse(m, k_rsc2_keymap);
+}
 
 static void opt_add(Opt *o, const char *name, const char *val)
 {
@@ -186,10 +215,24 @@ static void opts_init(int list_gpus)
     o->def = 2;
 
     o = opt_def(O_KEYBOARD, "keyboard", "RECOMP_KEYBOARD", "CONTROLS", 1, "Keyboard",
-                "Play with the keyboard as controller 1: arrows steer, Z X A S are "
-                "A B X Y, 1 and 3 are the triggers, Enter is Start.");
+                "Play with the keyboard as controller 1, alongside any real "
+                "controller. The arrows drive and work the menus.");
     opt_add(o, "On", "1");
     opt_add(o, "Off", "0");
+
+    o = opt_def(O_KEYS, "keymap", "RECOMP_KEYMAP", NULL, 1, "Key bindings",
+                "Which key does what. Opens a page where every action can be "
+                "given one or two keys.");
+    opt_add(o, "Change\xE2\x80\xA6", "");
+
+    o = opt_def(O_STEER, "steering", "RECOMP_KEY_STEER_MS", NULL, 1, "Keyboard steering",
+                "How quickly a steering key turns the wheel to full lock. Gentle "
+                "makes small corrections easier; Instant is full lock at once.");
+    opt_add(o, "Instant", "0");
+    opt_add(o, "Quick", "90");
+    opt_add(o, "Normal", "160");
+    opt_add(o, "Gentle", "260");
+    o->def = 2;
 
     o = opt_def(O_RUMBLE, "rumble", "RECOMP_RUMBLE", NULL, 1, "Vibration",
                 "Controller rumble from the game.");
@@ -234,6 +277,7 @@ static void settings_load(void)
 #endif
     for (i = 0; i < O_COUNT; i++)
         s_opt[i].cur = s_opt[i].def;
+    keys_defaults(&s_keys);
     f = fopen(s_path, "r");
     if (!f)
         return;
@@ -246,6 +290,13 @@ static void settings_load(void)
         *eq = 0;
         end = eq + 1 + strcspn(eq + 1, "\r\n");
         *end = 0;
+        if (strcmp(line, "keymap") == 0) {
+            /* Saved before the "menu" input existed: that layout had Esc as
+             * Back, which would now press both. Keep the new defaults. */
+            if (strstr(eq + 1, "menu="))
+                km_parse(&s_keys, eq + 1);
+            continue;
+        }
         for (i = 0; i < O_COUNT; i++) {
             if (strcmp(s_opt[i].key, line) == 0) {
                 int k = opt_find(&s_opt[i], eq + 1);
@@ -292,8 +343,15 @@ static void settings_save(void)
         return;
     }
     fprintf(f, "# RalliSport Challenge 2 (recompiled) settings, written by the launcher.\n");
-    for (i = 0; i < O_COUNT; i++)
+    for (i = 0; i < O_COUNT; i++) {
+        if (i == O_KEYS) {
+            char km[1024];
+            km_format(&s_keys, km, sizeof km);
+            fprintf(f, "%s=%s\n", s_opt[i].key, km);
+            continue;
+        }
         fprintf(f, "%s=%s\n", s_opt[i].key, s_opt[i].val[s_opt[i].cur]);
+    }
     fclose(f);
 }
 
@@ -326,6 +384,11 @@ static void settings_apply(void)
             continue;
         env_put(o->env, v);
     }
+    if (!s_opt[O_KEYS].env_set) {
+        char km[1024];
+        km_format(&s_keys, km, sizeof km);
+        env_put("RECOMP_KEYMAP", km);
+    }
 }
 
 static int row_disabled(int i)
@@ -334,6 +397,9 @@ static int row_disabled(int i)
     if (s_opt[i].soon || s_opt[i].env_set)
         return 1;
     if (soft && vk_only(i))
+        return 1;
+    if ((i == O_KEYS || i == O_STEER)
+            && strcmp(s_opt[O_KEYBOARD].val[s_opt[O_KEYBOARD].cur], "0") == 0)
         return 1;
     return i == O_GPU && s_opt[i].n < 2;
 }
@@ -349,6 +415,7 @@ static int launcher_window(void) { return 1; }
 /* The game has its own entry point; SDL must not bring SDL_main. */
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
+#include "xbox/keymap.h"         /* again, for the SDL key table */
 #include <math.h>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -363,13 +430,16 @@ static int launcher_window(void) { return 1; }
 
 /* Layout in logical units; the renderer's pixels per unit is s_px. */
 #define WIN_W 1000
-#define WIN_H 760
+#define WIN_H 816
 #define ROW_H 42
 #define SEC_H 34
 #define COL_W 444
 #define COL0_X 40
 #define COL1_X 516
 #define TOP_Y 128
+#define HELP_Y 644                      /* the focused row's help text */
+#define FOOT_Y 702                      /* key hints; a rule below them */
+#define BTN_Y 752
 
 enum { B_DEFAULTS = O_COUNT, B_QUIT, B_START, FOCUS_COUNT };
 
@@ -387,7 +457,7 @@ static SDL_Renderer *s_ren;
 static float s_px = 1.0f;
 static Font s_body, s_bold, s_title, s_small, s_smallb;
 static int s_focus = B_START, s_hover = -1;
-static Box s_row_box[O_COUNT], s_btn_box[3];
+static Box s_row_box[O_COUNT], s_btn_box[B_START - B_DEFAULTS + 1];
 
 /* Colours. */
 static const SDL_Color C_BG0 = { 0x0E, 0x13, 0x1E, 255 }, C_BG1 = { 0x17, 0x1F, 0x30, 255 };
@@ -662,6 +732,13 @@ static void draw_row(int i, float x, float y)
         text(&s_small, vx + vw - text_w(&s_small, t, 0), cy + 3, t, C_MUTED, 0);
         return;
     }
+    if (i == O_KEYS) {
+        const char *t = o->name[0];
+        float tw = text_w(&s_bold, t, 0);
+        text(&s_bold, vx + vw - 14 - tw, cy, t, vc, 0);
+        arrow(vx + vw - 6, y + ROW_H * 0.5f - 1.5f, 1, ac);
+        return;
+    }
     {
         const char *t = o->name[o->cur];
         char res[64];
@@ -740,33 +817,373 @@ static void draw(void)
         if (o->env_set)
             snprintf(t, sizeof t, "%s  (Locked: the %s environment variable is set to \"%s\".)",
                      o->help, o->env, o->env_set);
+        else if (row_disabled(s_focus) && (s_focus == O_KEYS || s_focus == O_STEER))
+            snprintf(t, sizeof t, "%s  (Turn the keyboard on to use this.)", o->help);
         else if (row_disabled(s_focus) && !o->soon)
             snprintf(t, sizeof t, "%s  (Only used by the Vulkan renderer.)", o->help);
         else
             snprintf(t, sizeof t, "%s", o->help);
-        text_wrap(&s_body, 58, 592, WIN_W - 116, 22, t, C_MUTED);
+        text_wrap(&s_body, 58, HELP_Y, WIN_W - 116, 22, t, C_MUTED);
     } else {
         char t[1100];
         snprintf(t, sizeof t, "Settings are saved to %s", s_path);
-        text_wrap(&s_body, 58, 592, WIN_W - 116, 22, t, C_DIM);
+        text_wrap(&s_body, 58, HELP_Y, WIN_W - 116, 22, t, C_DIM);
     }
 
-    fill(48, 674, WIN_W - 96, 1, C_LINE);
+    fill(48, FOOT_Y + 28, WIN_W - 96, 1, C_LINE);
     {
         float hx = 48;
-        keycap(&hx, 646, "Enter", "start");
-        keycap(&hx, 646, "Esc", "quit");
-        keycap(&hx, 646, "Arrows", "choose and change");
-        keycap(&hx, 646, "A / Start", "on a controller");
+        keycap(&hx, FOOT_Y, "Enter", "start");
+        keycap(&hx, FOOT_Y, "Esc", "quit");
+        keycap(&hx, FOOT_Y, "Arrows", "choose and change");
+        keycap(&hx, FOOT_Y, "A / Start", "on a controller");
     }
-    draw_button(B_DEFAULTS, 48, 696, 130, "Defaults", 0);
-    draw_button(B_QUIT, WIN_W - 48 - 190 - 12 - 110, 696, 110, "Quit", 0);
-    draw_button(B_START, WIN_W - 48 - 190, 696, 190, "Start game", 1);
+    draw_button(B_DEFAULTS, 48, BTN_Y, 130, "Defaults", 0);
+    draw_button(B_QUIT, WIN_W - 48 - 190 - 12 - 110, BTN_Y, 110, "Quit", 0);
+    draw_button(B_START, WIN_W - 48 - 190, BTN_Y, 190, "Start game", 1);
+}
+
+/* ── the key bindings page ────────────────────────────────── */
+
+/* Rows are pad inputs, named for what they do with the game's default
+ * controller preset (PRESET 1); the pad input is shown beside the name,
+ * since another preset chosen in the game moves the actions around. Horn is
+ * the preset's sixth slot, read in the race but not traced further. */
+typedef struct { int in; const char *label; } KeyRow;
+
+static const KeyRow k_rows_l[] = {
+    { KM_LX_NEG, "Steer left" },     { KM_LX_POS, "Steer right" },
+    { KM_RT, "Accelerate" },         { KM_LT, "Brake / reverse" },
+    { KM_A, "E-brake" },             { KM_B, "Gear up" },
+    { KM_X, "Gear down" },           { KM_BLACK, "Change camera" },
+    { KM_Y, "Look back" },           { KM_WHITE, "Car reset" },
+    { KM_RTHUMB, "Horn" },           { KM_MENU, "Pause / menu back" },
+};
+
+static const KeyRow k_rows_r[] = {
+    { KM_UP, "Menu up" },            { KM_DOWN, "Menu down" },
+    { KM_START, "Start / accept" },  { KM_BACK, "Menu back" },
+    { KM_LEFT, "Steer left, full lock" }, { KM_RIGHT, "Steer right, full lock" },
+    { KM_LY_POS, "Left stick up" },  { KM_LY_NEG, "Left stick down" },
+    { KM_RX_NEG, "Right stick left" }, { KM_RX_POS, "Right stick right" },
+    { KM_RY_POS, "Right stick up" }, { KM_RY_NEG, "Right stick down" },
+};
+
+#define KROW_H 36
+#define KCAP_W 100
+
+static int s_page;                      /* 0 settings, 1 keys */
+static int s_kfocus;                    /* row * 2 + slot, or KB_RESET / KB_DONE */
+static int s_capture;                   /* waiting for a key for s_kfocus */
+static char s_knote[160];
+static Box s_kslot_box[KM_COUNT][KM_SLOTS], s_kbtn_box[2];
+
+enum { KB_RESET = 1000, KB_DONE };
+
+static int krow_count(int col)
+{
+    return col ? (int)(sizeof k_rows_r / sizeof k_rows_r[0])
+               : (int)(sizeof k_rows_l / sizeof k_rows_l[0]);
+}
+
+/* Row r of the combined list: the left column, then the right. */
+static const KeyRow *krow(int r, int *col)
+{
+    int nl = krow_count(0);
+    *col = r >= nl;
+    return r < nl ? &k_rows_l[r] : &k_rows_r[r - nl];
+}
+
+static int krows(void) { return krow_count(0) + krow_count(1); }
+
+static const char *kname(int vk)
+{
+    static char hex[8];
+    const char *n = km_key_name(vk);
+    if (n)
+        return n;
+    snprintf(hex, sizeof hex, "0x%02X", vk);
+    return hex;
+}
+
+static void kcap(float x, float y, int vk, int foc, int cap)
+{
+    const char *t = cap ? "Press a key" : vk ? kname(vk) : "\xE2\x80\x94";
+    const Font *f = cap || !vk ? &s_small : &s_bold;
+    float tw = text_w(f, t, 0);
+    if (foc)
+        rrect(x - 2, y - 2, KCAP_W + 4, 32, 8, C_ACCENT);
+    rrect(x, y, KCAP_W, 28, 6, cap ? (SDL_Color){ 0x4A, 0x2C, 0x14, 255 } : C_PILL);
+    text(f, x + (KCAP_W - tw) * 0.5f, y + (cap || !vk ? 7 : 4), t,
+         vk || cap ? C_TEXT : C_DIM, 0);
+}
+
+static void keys_draw(void)
+{
+    static const char *heads[2] = { "DRIVING", "MENUS & OTHER" };
+    int col, r, n = 0;
+
+    background();
+    text(&s_title, 48, 26, "Keyboard controls", C_TEXT, 0);
+    text(&s_body, 50, 70, "Each action can have two keys, and one key can do several things.",
+         C_MUTED, 0);
+    fill(48, 102, 56, 3, C_ACCENT);
+    fill(104, 103, WIN_W - 152, 1, C_LINE);
+
+    for (col = 0; col < 2; col++) {
+        float x = col ? COL1_X : COL0_X, y = TOP_Y;
+        text(&s_smallb, x + 18, y + 10, heads[col], C_ACCENT, 1.6f);
+        y += SEC_H;
+        for (r = 0; r < krow_count(col); r++, n++) {
+            const KeyRow *k = col ? &k_rows_r[r] : &k_rows_l[r];
+            int s, rowfoc = s_kfocus / 2 == n && s_kfocus < KB_RESET;
+            float lx;
+            if (rowfoc)
+                rrect(x, y, COL_W, KROW_H, 8, C_ROW);
+            lx = text(&s_body, x + 18, y + 7, k->label, C_TEXT, 0);
+            if (strcmp(k->label, km_pad_name[k->in]) != 0
+                    && lx + 8 + text_w(&s_small, km_pad_name[k->in], 0) < x + COL_W - 2 * KCAP_W - 20)
+                text(&s_small, lx + 8, y + 10, km_pad_name[k->in], C_DIM, 0);
+            for (s = 0; s < KM_SLOTS; s++) {
+                float sx = x + COL_W - (KM_SLOTS - s) * (KCAP_W + 6);
+                int foc = s_kfocus == n * 2 + s;
+                Box *b = &s_kslot_box[n][s];
+                b->x = sx; b->y = y + 4; b->w = KCAP_W; b->h = 28;
+                kcap(sx, y + 4, s_keys.key[k->in][s], foc, foc && s_capture);
+            }
+            y += KROW_H + 2;
+        }
+    }
+
+    /* What the focused key does, or what is happening. */
+    {
+        char t[400];
+        if (s_knote[0]) {
+            snprintf(t, sizeof t, "%s", s_knote);
+        } else if (s_kfocus < KB_RESET) {
+            int c, s = s_kfocus & 1, j, used = 0;
+            const KeyRow *k = krow(s_kfocus / 2, &c);
+            int vk = s_keys.key[k->in][s];
+            if (s_capture) {
+                snprintf(t, sizeof t, "Press the key for %s (%s). Esc cancels.",
+                         k->label, km_pad_name[k->in]);
+            } else {
+                used = snprintf(t, sizeof t, "%s is the controller's %s. Enter or click "
+                                "to change, Delete to clear.", k->label, km_pad_name[k->in]);
+                /* A key on several rows is on purpose (the arrows), but
+                 * should never be a surprise. */
+                for (j = 0; vk && j < KM_COUNT && used < (int)sizeof t; j++) {
+                    int q;
+                    if (j == k->in)
+                        continue;
+                    for (q = 0; q < KM_SLOTS; q++)
+                        if (s_keys.key[j][q] == vk) {
+                            used += snprintf(t + used, sizeof t - (size_t)used,
+                                             "  %s also presses %s.", kname(vk), km_pad_name[j]);
+                            break;
+                        }
+                }
+            }
+        } else {
+            snprintf(t, sizeof t, "%s", s_kfocus == KB_RESET
+                     ? "Puts every key back to the default layout."
+                     : "Back to the settings.");
+        }
+        text_wrap(&s_body, 58, HELP_Y, WIN_W - 116, 22, t, C_MUTED);
+    }
+
+    fill(48, FOOT_Y + 28, WIN_W - 96, 1, C_LINE);
+    {
+        float hx = 48;
+        keycap(&hx, FOOT_Y, "Enter", "change");
+        keycap(&hx, FOOT_Y, "Delete", "clear");
+        keycap(&hx, FOOT_Y, "Esc", "back");
+        keycap(&hx, FOOT_Y, "Arrows", "move");
+    }
+    {
+        /* draw_button keeps its boxes for the settings page; these are ours. */
+        int sf = s_focus;
+        s_focus = s_kfocus == KB_RESET ? B_DEFAULTS : s_kfocus == KB_DONE ? B_START : -1;
+        draw_button(B_DEFAULTS, 48, BTN_Y, 150, "Reset keys", 0);
+        draw_button(B_START, WIN_W - 48 - 190, BTN_Y, 190, "Done", 1);
+        s_kbtn_box[0] = s_btn_box[B_DEFAULTS - B_DEFAULTS];
+        s_kbtn_box[1] = s_btn_box[B_START - B_DEFAULTS];
+        s_focus = sf;
+    }
+}
+
+static void keys_open(void)
+{
+    s_page = 1;
+    s_kfocus = 0;
+    s_capture = 0;
+    s_knote[0] = 0;
+}
+
+static void keys_move(int dr, int ds)
+{
+    int n = krows(), nl = krow_count(0), r, s;
+    s_knote[0] = 0;
+    if (s_kfocus >= KB_RESET) {
+        if (ds)
+            s_kfocus = ds < 0 ? KB_RESET : KB_DONE;
+        else if (dr < 0)
+            s_kfocus = (n - 1) * 2;
+        else
+            s_kfocus = 0;
+        return;
+    }
+    r = s_kfocus / 2;
+    s = s_kfocus & 1;
+    if (dr) {
+        r += dr;
+        if (r < 0 || r >= n) {
+            s_kfocus = KB_DONE;
+            return;
+        }
+    } else {
+        /* Across: slot 0, slot 1, then the other column's row. */
+        s += ds;
+        if (s > 1) {
+            s = 0;
+            r = r < nl ? nl + (r < krow_count(1) ? r : krow_count(1) - 1) : r - nl;
+        } else if (s < 0) {
+            s = 1;
+            r = r < nl ? nl + (r < krow_count(1) ? r : krow_count(1) - 1) : r - nl;
+        }
+        if (r >= n)
+            r = n - 1;
+    }
+    s_kfocus = r * 2 + s;
+}
+
+static void keys_set(int vk)
+{
+    int c;
+    const KeyRow *k = krow(s_kfocus / 2, &c);
+    int s = s_kfocus & 1, other = s_keys.key[k->in][!s];
+    s_capture = 0;
+    if (!vk || km_key_reserved(vk)) {
+        snprintf(s_knote, sizeof s_knote, "%s cannot be used: %s",
+                 vk ? kname(vk) : "That key",
+                 vk ? "the game window keeps F3, F9, F10 and F11 for itself."
+                    : "it has no code the game can read.");
+        return;
+    }
+    s_keys.key[k->in][s] = (unsigned char)vk;
+    if (other == vk)                    /* the same key twice is once */
+        s_keys.key[k->in][!s] = 0;
+    s_knote[0] = 0;
+}
+
+static void keys_clear(void)
+{
+    int c;
+    const KeyRow *k;
+    if (s_kfocus >= KB_RESET)
+        return;
+    k = krow(s_kfocus / 2, &c);
+    s_keys.key[k->in][s_kfocus & 1] = 0;
+}
+
+static int keys_hit(float x, float y)
+{
+    int r, s;
+    for (r = 0; r < krows(); r++)
+        for (s = 0; s < KM_SLOTS; s++)
+            if (in_box(&s_kslot_box[r][s], x, y))
+                return r * 2 + s;
+    if (in_box(&s_kbtn_box[0], x, y)) return KB_RESET;
+    if (in_box(&s_kbtn_box[1], x, y)) return KB_DONE;
+    return -1;
+}
+
+static void keys_activate(void)
+{
+    s_knote[0] = 0;
+    if (s_kfocus == KB_RESET)
+        keys_defaults(&s_keys);
+    else if (s_kfocus == KB_DONE)
+        s_page = 0;
+    else
+        s_capture = 1;
+}
+
+/* One event on the keys page. */
+static void keys_event(const SDL_Event *ev)
+{
+    switch (ev->type) {
+    case SDL_KEYDOWN:
+        if (s_capture) {
+            if (ev->key.keysym.sym == SDLK_ESCAPE)
+                s_capture = 0;
+            else if (!ev->key.repeat)
+                keys_set(km_sdl_to_vk(ev->key.keysym.sym));
+            break;
+        }
+        switch (ev->key.keysym.sym) {
+        case SDLK_UP:     keys_move(-1, 0); break;
+        case SDLK_DOWN:   keys_move(1, 0); break;
+        case SDLK_LEFT:   keys_move(0, -1); break;
+        case SDLK_RIGHT:  keys_move(0, 1); break;
+        case SDLK_TAB:    keys_move(0, ev->key.keysym.mod & KMOD_SHIFT ? -1 : 1); break;
+        case SDLK_RETURN: case SDLK_KP_ENTER: case SDLK_SPACE:
+            keys_activate();
+            break;
+        case SDLK_DELETE: case SDLK_BACKSPACE:
+            keys_clear();
+            break;
+        case SDLK_ESCAPE: s_page = 0; break;
+        default: break;
+        }
+        break;
+    case SDL_MOUSEMOTION: {
+        int h = s_capture ? -1 : keys_hit(ev->motion.x, ev->motion.y);
+        if (h >= 0)
+            s_kfocus = h;
+        break;
+    }
+    case SDL_MOUSEBUTTONDOWN: {
+        int h = keys_hit(ev->button.x, ev->button.y);
+        if (h < 0) {
+            s_capture = 0;
+            break;
+        }
+        s_kfocus = h;
+        if (ev->button.button == SDL_BUTTON_RIGHT && h < KB_RESET) {
+            s_capture = 0;
+            keys_clear();
+        } else if (ev->button.button == SDL_BUTTON_LEFT) {
+            keys_activate();
+        }
+        break;
+    }
+    case SDL_CONTROLLERBUTTONDOWN:
+        if (s_capture)
+            break;
+        switch (ev->cbutton.button) {
+        case SDL_CONTROLLER_BUTTON_DPAD_UP:    keys_move(-1, 0); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_DOWN:  keys_move(1, 0); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_LEFT:  keys_move(0, -1); break;
+        case SDL_CONTROLLER_BUTTON_DPAD_RIGHT: keys_move(0, 1); break;
+        case SDL_CONTROLLER_BUTTON_A:          keys_activate(); break;
+        case SDL_CONTROLLER_BUTTON_X:          keys_clear(); break;
+        case SDL_CONTROLLER_BUTTON_B:          s_page = 0; break;
+        default: break;
+        }
+        break;
+    default:
+        break;
+    }
 }
 
 static void change(int i, int d)
 {
     Opt *o = &s_opt[i];
+    if (i == O_KEYS && !row_disabled(i)) {
+        keys_open();
+        return;
+    }
     if (i >= O_COUNT || row_disabled(i) || o->n < 2)
         return;
     o->cur = (o->cur + d + o->n) % o->n;
@@ -821,7 +1238,7 @@ static int hit(float x, float y)
     for (i = 0; i < O_COUNT; i++)
         if (in_box(&s_row_box[i], x, y))
             return i;
-    for (i = 0; i < 3; i++)
+    for (i = 0; i <= B_START - B_DEFAULTS; i++)
         if (in_box(&s_btn_box[i], x, y))
             return B_DEFAULTS + i;
     return -1;
@@ -870,6 +1287,10 @@ static int launcher_window(void)
     }
     if (getenv("RSC2_LAUNCHER_FOCUS"))   /* screenshots of a focused row */
         s_focus = atoi(getenv("RSC2_LAUNCHER_FOCUS"));
+    if (getenv("RSC2_LAUNCHER_KEYS")) {  /* ... and of the keys page */
+        keys_open();
+        s_kfocus = atoi(getenv("RSC2_LAUNCHER_KEYS"));
+    }
     for (i = 0; i < SDL_NumJoysticks() && i < 8; i++)
         if (SDL_IsGameController(i))
             pads[i] = SDL_GameControllerOpen(i);
@@ -878,7 +1299,10 @@ static int launcher_window(void)
         SDL_Event ev;
         SDL_SetRenderDrawColor(s_ren, C_BG0.r, C_BG0.g, C_BG0.b, 255);
         SDL_RenderClear(s_ren);
-        draw();
+        if (s_page)
+            keys_draw();
+        else
+            draw();
         if (getenv("RSC2_LAUNCHER_SHOT")) {
             /* RSC2_LAUNCHER_SHOT=<file.bmp>: the first frame, then quit. */
             SDL_Surface *sf = SDL_CreateRGBSurfaceWithFormat(0, ow, oh, 32,
@@ -893,7 +1317,7 @@ static int launcher_window(void)
         SDL_RenderPresent(s_ren);
         if (!SDL_WaitEventTimeout(&ev, 50)) {
             /* Held stick: repeat. */
-            if (stick_dir && SDL_GetTicks() >= stick_next) {
+            if (stick_dir && !s_page && SDL_GetTicks() >= stick_next) {
                 if (stick_dir & 1) move_focus(stick_dir == 1 ? -1 : 1);
                 else side(stick_dir == 2 ? -1 : 1);
                 stick_next = SDL_GetTicks() + 140;
@@ -901,6 +1325,10 @@ static int launcher_window(void)
             continue;
         }
         do {
+            if (s_page && ev.type != SDL_QUIT && ev.type != SDL_CONTROLLERDEVICEADDED) {
+                keys_event(&ev);
+                continue;
+            }
             switch (ev.type) {
             case SDL_QUIT:
                 result = 0;
@@ -914,7 +1342,7 @@ static int launcher_window(void)
                 case SDLK_RIGHT:  side(1); break;
                 case SDLK_SPACE:  result = activate(s_focus); break;
                 case SDLK_RETURN: case SDLK_KP_ENTER:
-                    result = s_focus >= O_COUNT ? activate(s_focus) : 1;
+                    result = s_focus >= O_COUNT || s_focus == O_KEYS ? activate(s_focus) : 1;
                     break;
                 case SDLK_ESCAPE: result = 0; break;
                 default: break;

@@ -566,6 +566,7 @@ void xbox_FramebufferWindowStart(void)
  * All SDL video calls stay on the window thread. */
 #include <SDL.h>
 #include <SDL_vulkan.h>
+#include "../../include/xbox/keymap.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -659,33 +660,6 @@ int xbox_FramebufferKeyDown(int vk)
     return s_key_down[vk] != 0;
 }
 
-/* SDL key -> Win32 virtual-key code: letters and digits are their uppercase
- * ASCII, the rest by table. 0 for keys with no counterpart. */
-static int sdl_to_vk(SDL_Keycode k)
-{
-    if (k >= SDLK_a && k <= SDLK_z) return 'A' + (int)(k - SDLK_a);
-    if (k >= SDLK_0 && k <= SDLK_9) return '0' + (int)(k - SDLK_0);
-    if (k >= SDLK_KP_1 && k <= SDLK_KP_9) return 0x61 + (int)(k - SDLK_KP_1);
-    if (k >= SDLK_F1 && k <= SDLK_F12) return 0x70 + (int)(k - SDLK_F1);
-    switch (k) {
-    case SDLK_KP_0:      return 0x60;
-    case SDLK_RETURN:
-    case SDLK_KP_ENTER:  return 0x0D;
-    case SDLK_BACKSPACE: return 0x08;
-    case SDLK_TAB:       return 0x09;
-    case SDLK_ESCAPE:    return 0x1B;
-    case SDLK_SPACE:     return 0x20;
-    case SDLK_LEFT:      return 0x25;
-    case SDLK_UP:        return 0x26;
-    case SDLK_RIGHT:     return 0x27;
-    case SDLK_DOWN:      return 0x28;
-    case SDLK_LSHIFT: case SDLK_RSHIFT: return 0x10;
-    case SDLK_LCTRL:  case SDLK_RCTRL:  return 0x11;
-    case SDLK_LALT:   case SDLK_RALT:   return 0x12;
-    default:             return 0;
-    }
-}
-
 int xbox_FramebufferDumpBmp(const char *path)
 {
     FILE *f;
@@ -723,7 +697,6 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
-static int sdl_to_vk(SDL_Keycode k);
 
 /* RECOMP_WIDESCREEN=1: the title draws 4:3-sized frames anamorphic, shown
  * at 16:9. */
@@ -810,7 +783,8 @@ static void fb_events(SDL_Window *win, int *resized)
             video_close();
             _Exit(0);
         } else if (ev.type == SDL_KEYDOWN || ev.type == SDL_KEYUP) {
-            int vk = sdl_to_vk(ev.key.keysym.sym);
+            /* The table is shared with launchers that edit the bindings. */
+            int vk = km_sdl_to_vk(ev.key.keysym.sym);
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F10
                     && !ev.key.repeat) {
                 /* The renderer's flight recorder (RECOMP_VK_FLIGHT). */

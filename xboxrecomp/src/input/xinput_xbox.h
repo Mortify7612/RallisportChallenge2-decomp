@@ -105,6 +105,12 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
 BOOL xbox_InputIsConnected(DWORD dwPort);
 
 /**
+ * The title's menus are running (call from their per-frame input handler).
+ * The keyboard's "menu" input sends BACK while they are, START otherwise.
+ */
+void xbox_InputMenuTick(void);
+
+/**
  * Get controller capabilities.
  */
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);

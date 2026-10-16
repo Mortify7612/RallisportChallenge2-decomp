@@ -11,6 +11,7 @@
  */
 
 #include "xinput_xbox.h"
+#include "../../include/xbox/keymap.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,13 +29,19 @@
  * turns it on. It only ever answers for port 0, and is merged on top of a
  * pad connected there, so a real controller keeps working.
  *
- * The keys are the ones a Dreamcast or Saturn emulator would pick, which is
+ * Which key presses which pad input is a table (xbox/keymap.h). Without
+ * RECOMP_KEYMAP it is the layout a Dreamcast or Saturn emulator would pick,
  * the closest thing to a convention here:
  *
  *   arrows        d-pad             Enter      START
  *   Z X A S       A B X Y           Backspace  BACK
  *   Q E           white black       1 3        triggers
  *   numpad 8/2/4/6 left thumb       I/K/J/L    right thumb
+ *
+ * RECOMP_KEY_STEER_MS=<ms> eases the left stick's X axis instead of
+ * snapping it: a key takes that long to reach full lock and half that to
+ * come back. A racing title is all but undrivable when a tap is a full
+ * swerve.
  *
  * Keys come from the framebuffer window, which only receives them while it
  * has the focus, so typing in another window does not drive the game.
@@ -49,6 +56,20 @@ static BOOL keyboard_enabled(void)
     return on ? TRUE : FALSE;
 }
 
+static const KeyMap *keymap(void)
+{
+    static KeyMap m;
+    static int loaded;
+    if (!loaded) {
+        const char *v = getenv("RECOMP_KEYMAP");
+        km_defaults(&m);
+        if (v && *v)
+            km_parse(&m, v);
+        loaded = 1;
+    }
+    return &m;
+}
+
 /* The framebuffer window records what is held; see src/video/fb_present.c.
  *
  * GetAsyncKeyState was the first attempt and reads nothing here -- under
@@ -61,54 +82,139 @@ static BOOL keyboard_enabled(void)
  * module's include path. */
 extern int xbox_FramebufferKeyDown(int vk);
 
-static BOOL key_down(int vk)
+/* The "menu" input (KM_MENU) is the key a PC player reaches for to pause:
+ * Start in play, but Back in the title's menus, where Start would accept
+ * whatever is highlighted. The title says when its menus run by calling
+ * this from their per-frame input handler; a quarter of a second without
+ * a call is play. */
+static volatile DWORD s_menu_tick;
+
+void xbox_InputMenuTick(void)
 {
-    return xbox_FramebufferKeyDown(vk) ? TRUE : FALSE;
+    DWORD t = GetTickCount(), last = s_menu_tick;
+    static int trace = -1;
+    if (trace < 0)
+        trace = getenv("RECOMP_MENU_TRACE") != NULL;
+    /* RECOMP_MENU_TRACE: each return to the menus, after how long without. */
+    if (trace && (!last || (DWORD)(t - last) >= 250))
+        fprintf(stderr, "  [MENU] menus active again after %lu ms\n",
+                last ? (unsigned long)(t - last) : 0ul);
+    s_menu_tick = t ? t : 1;
 }
 
-/* A thumb axis from two keys, at the full deflection a digital key implies. */
+static int menu_active(void)
+{
+    DWORD t = s_menu_tick;
+    return t && (DWORD)(GetTickCount() - t) < 250;
+}
+
+/* Any of the keys bound to pad input `in`. */
+static BOOL bound_down(int in)
+{
+    const KeyMap *m = keymap();
+    int s;
+    for (s = 0; s < KM_SLOTS; s++)
+        if (m->key[in][s] && xbox_FramebufferKeyDown(m->key[in][s]))
+            return TRUE;
+    return FALSE;
+}
+
+/* A thumb axis from two inputs, at the full deflection a digital key implies. */
 static SHORT axis_from_keys(int negative, int positive)
 {
     int v = 0;
-    if (key_down(negative)) v -= 32767;
-    if (key_down(positive)) v += 32767;
+    if (bound_down(negative)) v -= 32767;
+    if (bound_down(positive)) v += 32767;
     return (SHORT)v;
+}
+
+/* The left stick's X axis eased toward where the keys point (see above).
+ * Driven by the clock, not by calls: the title polls once a frame at
+ * whatever the frame rate is, and other callers poll in between. */
+static SHORT steer_axis(void)
+{
+    static int ms = -1;
+    static float pos;
+    static DWORD last;
+    DWORD now;
+    float target, dt, step;
+
+    if (ms < 0) {
+        const char *v = getenv("RECOMP_KEY_STEER_MS");
+        ms = v && *v ? atoi(v) : 0;
+        if (ms < 0)
+            ms = 0;
+    }
+    target = (float)axis_from_keys(KM_LX_NEG, KM_LX_POS) / 32767.0f;
+    if (ms == 0)
+        return (SHORT)(target * 32767.0f);
+
+    now = GetTickCount();
+    dt = last ? (float)(DWORD)(now - last) : 0.0f;
+    last = now;
+    if (dt > 100.0f)        /* a stall is not a reason to swerve */
+        dt = 100.0f;
+    /* Out toward lock at 1/ms, back toward the centre twice as fast --
+     * including on the way through it to the other side. */
+    if (target != 0.0f && (pos == 0.0f || (pos > 0.0f) == (target > 0.0f))) {
+        step = dt / (float)ms;
+        if (pos < target)      pos = pos + step > target ? target : pos + step;
+        else if (pos > target) pos = pos - step < target ? target : pos - step;
+    } else {
+        step = 2.0f * dt / (float)ms;
+        if (pos > 0.0f)      pos = pos - step < 0.0f ? 0.0f : pos - step;
+        else if (pos < 0.0f) pos = pos + step > 0.0f ? 0.0f : pos + step;
+    }
+    return (SHORT)(pos * 32767.0f);
 }
 
 static void keyboard_state(XBOX_INPUT_STATE *pState)
 {
+    static const struct { int in; WORD bit; } digital[] = {
+        { KM_UP, XBOX_GAMEPAD_DPAD_UP },       { KM_DOWN, XBOX_GAMEPAD_DPAD_DOWN },
+        { KM_LEFT, XBOX_GAMEPAD_DPAD_LEFT },   { KM_RIGHT, XBOX_GAMEPAD_DPAD_RIGHT },
+        { KM_START, XBOX_GAMEPAD_START },      { KM_BACK, XBOX_GAMEPAD_BACK },
+        { KM_LTHUMB, XBOX_GAMEPAD_LEFT_THUMB }, { KM_RTHUMB, XBOX_GAMEPAD_RIGHT_THUMB },
+    };
+    static const struct { int in, idx; } analog[] = {
+        { KM_A, XBOX_BUTTON_A },         { KM_B, XBOX_BUTTON_B },
+        { KM_X, XBOX_BUTTON_X },         { KM_Y, XBOX_BUTTON_Y },
+        { KM_BLACK, XBOX_BUTTON_BLACK }, { KM_WHITE, XBOX_BUTTON_WHITE },
+        { KM_LT, XBOX_BUTTON_LTRIGGER }, { KM_RT, XBOX_BUTTON_RTRIGGER },
+    };
     static DWORD packet;
     WORD b = 0;
+    size_t i;
 
     memset(pState, 0, sizeof(*pState));
 
-    if (key_down(VK_UP))     b |= XBOX_GAMEPAD_DPAD_UP;
-    if (key_down(VK_DOWN))   b |= XBOX_GAMEPAD_DPAD_DOWN;
-    if (key_down(VK_LEFT))   b |= XBOX_GAMEPAD_DPAD_LEFT;
-    if (key_down(VK_RIGHT))  b |= XBOX_GAMEPAD_DPAD_RIGHT;
-    if (key_down(VK_RETURN)) b |= XBOX_GAMEPAD_START;
-    if (key_down(VK_BACK))   b |= XBOX_GAMEPAD_BACK;
-    if (key_down(VK_SHIFT))  b |= XBOX_GAMEPAD_LEFT_THUMB;
-    if (key_down(VK_CONTROL))b |= XBOX_GAMEPAD_RIGHT_THUMB;
+    for (i = 0; i < sizeof digital / sizeof digital[0]; i++)
+        if (bound_down(digital[i].in))
+            b |= digital[i].bit;
+    {
+        /* Which of the two it means is settled when it goes down and kept
+         * while it is held: Start opens the pause menu, and that menu must
+         * not then see the same press turn into Back. */
+        static int held_as = 0;          /* 0 up, 1 Start, 2 Back */
+        if (bound_down(KM_MENU)) {
+            if (!held_as)
+                held_as = menu_active() ? 2 : 1;
+            b |= held_as == 2 ? XBOX_GAMEPAD_BACK : XBOX_GAMEPAD_START;
+        } else {
+            held_as = 0;
+        }
+    }
     pState->Gamepad.wButtons = b;
 
     /* Analog on the console, so a key is 255 rather than a flag -- a title
      * that reads these as a pressure never sees a press if they are 1. */
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_A]        = key_down('Z') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_B]        = key_down('X') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_X]        = key_down('A') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_Y]        = key_down('S') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE]    = key_down('Q') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_BLACK]    = key_down('E') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = key_down('1') ? 255 : 0;
-    pState->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = key_down('3') ? 255 : 0;
+    for (i = 0; i < sizeof analog / sizeof analog[0]; i++)
+        pState->Gamepad.bAnalogButtons[analog[i].idx] = bound_down(analog[i].in) ? 255 : 0;
 
-    /* W/A/S/D would collide with the face buttons above, so the left thumb
-     * shares the arrow keys' row on the numeric pad instead. */
-    pState->Gamepad.sThumbLX = axis_from_keys(VK_NUMPAD4, VK_NUMPAD6);
-    pState->Gamepad.sThumbLY = axis_from_keys(VK_NUMPAD2, VK_NUMPAD8);
-    pState->Gamepad.sThumbRX = axis_from_keys('J', 'L');
-    pState->Gamepad.sThumbRY = axis_from_keys('K', 'I');
+    pState->Gamepad.sThumbLX = steer_axis();
+    pState->Gamepad.sThumbLY = axis_from_keys(KM_LY_NEG, KM_LY_POS);
+    pState->Gamepad.sThumbRX = axis_from_keys(KM_RX_NEG, KM_RX_POS);
+    pState->Gamepad.sThumbRY = axis_from_keys(KM_RY_NEG, KM_RY_POS);
 
     /* The title's input layer looks for button edges, so the packet number
      * has to move whenever the state does or a press is never noticed. */
