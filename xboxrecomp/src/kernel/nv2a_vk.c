@@ -183,6 +183,9 @@ typedef struct Surf_ {
     uint64_t hnow;              /* guest bytes this epoch (surf_hash_now) */
     uint32_t hnow_ep, hnow_bytes;
     int hash_valid;
+    uint64_t shash;             /* hash_sparse of the reference bytes */
+    uint32_t sfull_ep;          /* epoch `hash` was last confirmed in full */
+    int shash_valid;
     uint32_t last_use;
     uint32_t gen;               /* changes whenever its contents do */
     /* Since its last copy-back it has only been cleared, whole, to one
@@ -1097,6 +1100,42 @@ static uint64_t surf_hash_now(Surf *s)
     return s->hnow;
 }
 
+/* A surface's reference hash -- what guest RAM held when it was last made
+ * the truth (a copy-back, an upload) -- and the check against it. Where
+ * texture checks are sparse (tex_hash_sparse), big surfaces are too: 1/16 of
+ * the bytes each epoch, the full hash every TEX_FULL_EPOCHS, staggered. */
+static int surf_sparse(const Surf *s)
+{
+    return tex_hash_sparse() && surf_bytes(s) >= TEX_SPARSE_MIN;
+}
+
+static void surf_ref(Surf *s, uint64_t full)
+{
+    s->hash = full;
+    s->hash_valid = 1;
+    s->shash_valid = surf_sparse(s);
+    if (s->shash_valid) {
+        s->shash = hash_sparse(guest(s->va), surf_bytes(s));
+        s->sfull_ep = V.epoch;
+    }
+}
+
+/* 1 while guest RAM still holds the reference bytes. */
+static int surf_same(Surf *s)
+{
+    if (!s->hash_valid)
+        return 0;
+    if (s->shash_valid && surf_sparse(s) && V.epoch - s->sfull_ep < TEX_FULL_EPOCHS
+            && (V.epoch + (uint32_t)(s - V.surf)) % TEX_FULL_EPOCHS != 0) {
+        V.st_surf_hash_kb += (surf_bytes(s) >> 10) / 16;
+        return hash_sparse(guest(s->va), surf_bytes(s)) == s->shash;
+    }
+    if (surf_hash_now(s) != s->hash)
+        return 0;
+    surf_ref(s, s->hash);
+    return 1;
+}
+
 /* Between a swizzled guest surface and linear rows: `to_guest` swizzles
  * rows into guest, otherwise unswizzles guest into rows. */
 static void surf_swizzle(Surf *s, uint8_t *g, uint8_t *lin, uint32_t rows, int to_guest)
@@ -1512,8 +1551,7 @@ static void write_back(const RbEnt *list, int n, int deferred)
             s->dirty = 0;
             s->dirty_rows = 0;
         }
-        s->hash = surf_hash_now(s);
-        s->hash_valid = 1;
+        surf_ref(s, surf_hash_now(s));
     }
 }
 
@@ -2876,7 +2914,7 @@ static int rt_cube(const Nv2aVkTex *d, uint32_t bytes, VkImageView *view, uint32
             if (q != face[f] && q->dirty && va < q->va + surf_bytes(q) && va + fbytes > q->va)
                 return 0;
         }
-        if (!face[f]->dirty && (!face[f]->hash_valid || surf_hash_now(face[f]) != face[f]->hash))
+        if (!face[f]->dirty && !surf_same(face[f]))
             return 0;
     }
     n = d->width * V.scale;
@@ -3520,22 +3558,18 @@ static Surf *surf_get(const Nv2aVkState *st)
                           VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
                           VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         surf_upload(s);
-        s->hash = surf_hash(s);
-        s->hash_valid = 1;
+        surf_ref(s, surf_hash(s));
     } else if (!s->dirty && s != V.cur_cs) {
         /* Not drawn since its last copy-back: guest RAM is the truth, and the
          * title (or a copy) may have written it since. */
-        uint64_t h;
         if (rows > s->rows)
             s->rows = rows;
         /* About to be cleared on the GPU by alias_resolve (all callers are
          * begin_target's): uploading guest RAM first is wasted -- RSC2's
          * shadow map, 1 MB a frame. */
         if (alias_clear_pending(s))
-            h = s->hash, s->hash_valid = 0;
-        else
-            h = surf_hash_now(s);
-        if (!alias_clear_pending(s) && (!s->hash_valid || h != s->hash)) {
+            s->hash_valid = 0;
+        else if (!surf_same(s)) {
             static int trace = -1;
             static uint32_t shown;
             if (trace < 0)
@@ -3546,8 +3580,7 @@ static Surf *surf_get(const Nv2aVkState *st)
                         s->bpp, s->rows, s->hash_valid ? "changed" : "unknown");
             segment_begin();
             surf_upload(s);
-            s->hash = h;
-            s->hash_valid = 1;
+            surf_ref(s, surf_hash_now(s));
         }
     }
     if (rows > s->rows)
