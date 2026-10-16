@@ -57,6 +57,10 @@
 #include <xbox/xboxrecomp.h>
 #include "launcher.h"
 
+#ifndef CONTEXT_PC
+#define CONTEXT_PC(c) ((c)->Rip)      /* Win32 x64 CONTEXT */
+#endif
+
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
  * the individual headers directly:
@@ -312,7 +316,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         }
 
         fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
-            (unsigned long long)ep->ContextRecord->Rip,
+            (unsigned long long)CONTEXT_PC(ep->ContextRecord),
             (unsigned long long)fault_addr,
             ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
         fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n",
@@ -321,7 +325,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
             g_ebx, g_esi, g_edi);
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
             (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
-        print_guest_context((void *)ep->ContextRecord->Rip);
+        print_guest_context((void *)CONTEXT_PC(ep->ContextRecord));
         xbox_PeekSample("crash peek");
 
         /*

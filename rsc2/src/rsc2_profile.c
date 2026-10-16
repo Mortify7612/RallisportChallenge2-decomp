@@ -43,7 +43,11 @@ static void on_prof(int sig, siginfo_t *si, void *uc)
     if (i >= MAX_SAMPLES)
         return;
     s_samples[i].tid = (uint32_t)syscall(SYS_gettid);
+#if defined(__aarch64__)
+    s_samples[i].rip = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.pc;
+#else
     s_samples[i].rip = (uintptr_t)((ucontext_t *)uc)->uc_mcontext.gregs[REG_RIP];
+#endif
 }
 
 struct bucket { uint32_t tid; uintptr_t key; const char *name; uint32_t n; };

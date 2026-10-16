@@ -193,12 +193,12 @@ int xbox_Nv2aIrqOwns(uint32_t va)
 
 int xbox_Nv2aIrqHandleMmio(void *ctx, uint32_t va)
 {
-#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
+#ifdef MMIO_FAULT_HOST
     if (!xbox_Nv2aIrqOwns(va))
         return 0;
     if (!mmio_emulate((PCONTEXT)ctx, va - NV2A_BASE, NULL, reg_read, reg_write)) {
         static int shown;
-        const uint8_t *ip = (const uint8_t *)((PCONTEXT)ctx)->Rip;
+        const uint8_t *ip = (const uint8_t *)CONTEXT_PC((PCONTEXT)ctx);
         if (shown++ < 20)
             fprintf(stderr, "  [NV2A-IRQ] undecoded access at +0x%06X: "
                     "%02X %02X %02X %02X %02X %02X\n", va - NV2A_BASE,

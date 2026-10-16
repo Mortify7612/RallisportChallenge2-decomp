@@ -1,5 +1,5 @@
 /*
- * mmio_decode.h -- one x86-64 instruction decoder for trapped MMIO.
+ * mmio_decode.h -- the instruction decoder for trapped MMIO (x86-64, AArch64).
  *
  * A device whose registers need semantics cannot be plain memory: the reads
  * have to be answered and the writes have to be seen. The way that works here
@@ -28,18 +28,173 @@
 
 #include <stdint.h>
 
-/* Win32, and Linux x86-64 where the sigaction VEH in win32_compat.c hands
- * handlers the same CONTEXT fields. */
-#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
+/* Hosts with a fault path: Win32, and Linux/Android on x86-64 or AArch64,
+ * where the sigaction VEH in win32_compat.c fills a CONTEXT from the signal
+ * frame. Device models test MMIO_FAULT_HOST before trapping their pages. */
+#if defined(_WIN32) || (defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__)))
+#define MMIO_FAULT_HOST 1
+#endif
+
+#ifdef MMIO_FAULT_HOST
 #if defined(_WIN32)
 #include <windows.h>
 #else
 #include "win32_compat.h"
 #endif
 
+#ifndef CONTEXT_PC
+#define CONTEXT_PC(c) ((c)->Rip)
+#endif
+
 /* Service one register access. dev is passed straight back to the callbacks. */
 typedef uint64_t (*mmio_read_fn)(void *dev, uint32_t off, int size);
 typedef void     (*mmio_write_fn)(void *dev, uint32_t off, uint64_t val, int size);
+
+#if defined(__aarch64__)
+/* AArch64: every access is one fixed-width load or store, and compares
+ * happen in registers afterwards, so there are no flags to fake -- only the
+ * transfer, the base register writeback of the indexed forms, and the PC.
+ *
+ * Covered: LDR/STR of every size and sign-extension in the unsigned-offset,
+ * unscaled, pre- and post-index, unprivileged and register-offset forms, for
+ * general and SIMD&FP registers; and the single-register acquire/release
+ * forms (LDAR, STLR, LDAPR). Pairs, exclusives and atomics return 0. */
+static inline void mmio_a64_set(PCONTEXT ctx, int rt, uint64_t v)
+{
+    if (rt != 31)                       /* xzr: the value goes nowhere */
+        ctx->X[rt] = v;
+}
+
+static inline uint64_t mmio_a64_get(PCONTEXT ctx, int rt)
+{
+    return rt == 31 ? 0 : ctx->X[rt];
+}
+
+static inline uint64_t *mmio_a64_base(PCONTEXT ctx, int rn)
+{
+    return rn == 31 ? &ctx->Sp : &ctx->X[rn];
+}
+
+static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
+                               mmio_read_fn rd, mmio_write_fn wr)
+{
+    uint32_t in = *(const uint32_t *)(uintptr_t)ctx->Pc;
+    int size = (int)(in >> 30), rt = (int)(in & 31), rn = (int)((in >> 5) & 31);
+    int vreg = (int)((in >> 26) & 1), opc = (int)((in >> 22) & 3);
+    int bytes, load, sext = 0, wide = 0;
+    int64_t wb = 0;
+    int writeback = 0;
+
+    if (!rd || !wr)
+        return 0;
+
+    if ((in & 0x3F000000u) == 0x08000000u) {     /* load/store exclusive class */
+        int o2 = (in >> 23) & 1, l = (in >> 22) & 1, o1 = (in >> 21) & 1;
+        int o0 = (in >> 15) & 1;
+        if (!(o2 == 1 && o1 == 0 && o0 == 1))    /* LDAR / STLR only */
+            return 0;
+        bytes = 1 << size;
+        if (l)
+            mmio_a64_set(ctx, rt, rd(dev, off, bytes));
+        else
+            wr(dev, off, mmio_a64_get(ctx, rt), bytes);
+        ctx->Pc += 4;
+        return 1;
+    }
+
+    if ((in & 0x38000000u) != 0x38000000u)       /* not a single-register load/store */
+        return 0;
+
+    switch ((in >> 24) & 3) {
+    case 1:                                      /* unsigned 12-bit offset */
+        break;
+    case 0:
+        if (in & (1u << 21)) {
+            if (((in >> 10) & 3) == 2)           /* register offset */
+                break;
+            /* LDAPR: the RCpc acquire load, in the atomic-ops space */
+            if (!vreg && ((in >> 10) & 0x3F) == 0x30 && ((in >> 16) & 31) == 31
+                    && ((in >> 22) & 3) == 2) {
+                mmio_a64_set(ctx, rt, rd(dev, off, 1 << size));
+                ctx->Pc += 4;
+                return 1;
+            }
+            return 0;                            /* atomics */
+        }
+        switch ((in >> 10) & 3) {
+        case 0: case 2: break;                   /* unscaled, unprivileged */
+        case 1: case 3:                          /* post- / pre-index */
+            writeback = 1;
+            wb = (int64_t)((int32_t)(in << 11) >> 23);    /* imm9 */
+            break;
+        }
+        break;
+    default:
+        return 0;
+    }
+
+    if (vreg) {
+        bytes = (opc & 2) ? (size == 0 ? 16 : 0) : 1 << size;
+        if (!bytes || !ctx->HasV)
+            return 0;
+        load = opc & 1;
+        if (load) {
+            uint64_t lo = rd(dev, off, bytes > 8 ? 8 : bytes);
+            uint64_t hi = bytes > 8 ? rd(dev, off + 8, 8) : 0;
+            ctx->V[rt][0] = lo;                  /* a scalar load clears the rest */
+            ctx->V[rt][1] = hi;
+        } else {
+            uint64_t lo = ctx->V[rt][0];
+            if (bytes < 8)
+                lo &= (1ULL << (bytes * 8)) - 1;
+            wr(dev, off, lo, bytes > 8 ? 8 : bytes);
+            if (bytes > 8)
+                wr(dev, off + 8, ctx->V[rt][1], 8);
+        }
+    } else {
+        bytes = 1 << size;
+        switch (opc) {
+        case 0: load = 0; break;
+        case 1: load = 1; break;
+        case 2:
+            if (size == 3) {                     /* PRFM: nothing to do */
+                ctx->Pc += 4;
+                return 1;
+            }
+            load = 1; sext = 1; wide = 1;        /* LDRSB/LDRSH/LDRSW -> Xt */
+            break;
+        default:
+            if (size >= 2)
+                return 0;
+            load = 1; sext = 1; wide = 0;        /* LDRSB/LDRSH -> Wt */
+            break;
+        }
+        if (load) {
+            uint64_t v = rd(dev, off, bytes);
+            if (bytes < 8)
+                v &= (1ULL << (bytes * 8)) - 1;
+            if (sext) {
+                int sh = 64 - bytes * 8;
+                v = (uint64_t)((int64_t)(v << sh) >> sh);
+                if (!wide)
+                    v &= 0xFFFFFFFFULL;
+            }
+            mmio_a64_set(ctx, rt, v);
+        } else {
+            uint64_t v = mmio_a64_get(ctx, rt);
+            if (bytes < 8)
+                v &= (1ULL << (bytes * 8)) - 1;
+            wr(dev, off, v, bytes);
+        }
+    }
+
+    if (writeback)
+        *mmio_a64_base(ctx, rn) += (uint64_t)wb;
+    ctx->Pc += 4;
+    return 1;
+}
+
+#else /* x86-64 */
 
 static inline uint64_t *mmio_ctx_reg(PCONTEXT c, int reg)
 {
@@ -306,5 +461,6 @@ static inline int mmio_emulate(PCONTEXT ctx, uint32_t off, void *dev,
     }
 }
 
-#endif /* _WIN32 || linux x86-64 */
+#endif /* x86-64 */
+#endif /* MMIO_FAULT_HOST */
 #endif /* MMIO_DECODE_H */

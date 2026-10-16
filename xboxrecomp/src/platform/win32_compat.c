@@ -2026,8 +2026,11 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
 }
 
-#if defined(__linux__) && defined(__x86_64__)
+#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
 #include <ucontext.h>
+#if defined(__aarch64__)
+#include <asm/sigcontext.h>
+#endif
 
 /* Vectored exception handlers over sigaction.
  *
@@ -2046,10 +2049,89 @@ static PVECTORED_EXCEPTION_HANDLER s_veh[VEH_MAX];
 static int s_veh_count;
 static int s_veh_installed;
 
+#if defined(__x86_64__)
 static const int s_veh_gregs[16] = {
     REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
     REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15,
 };
+
+/* The faulting thread's registers into the CONTEXT, and 1 if the access
+ * was a write (page-fault error code bit 1). */
+static int veh_load(CONTEXT *ctx, ucontext_t *uc)
+{
+    greg_t *g = uc->uc_mcontext.gregs;
+    uint64_t *r = &ctx->Rax;
+    int i;
+    for (i = 0; i < 16; i++)
+        r[i] = (uint64_t)g[s_veh_gregs[i]];
+    ctx->Rip = (uint64_t)g[REG_RIP];
+    ctx->EFlags = (uint32_t)g[REG_EFL];
+    return (g[REG_ERR] & 2) ? 1 : 0;
+}
+
+static void veh_store(const CONTEXT *ctx, ucontext_t *uc)
+{
+    greg_t *g = uc->uc_mcontext.gregs;
+    const uint64_t *r = &ctx->Rax;
+    int k;
+    for (k = 0; k < 16; k++)
+        g[s_veh_gregs[k]] = (greg_t)r[k];
+    g[REG_RIP] = (greg_t)ctx->Rip;
+    g[REG_EFL] = (greg_t)((g[REG_EFL] & ~0xFFFFFFFFLL) | ctx->EFlags);
+}
+#else
+/* AArch64 keeps the extra state as a chain of tagged records in
+ * __reserved: the fault syndrome (ESR, whose WnR bit says write) and the
+ * SIMD&FP registers. */
+static struct _aarch64_ctx *veh_record(ucontext_t *uc, uint32_t magic)
+{
+    unsigned char *p = (unsigned char *)uc->uc_mcontext.__reserved;
+    unsigned char *end = p + sizeof(uc->uc_mcontext.__reserved);
+    while (p + sizeof(struct _aarch64_ctx) <= end) {
+        struct _aarch64_ctx *h = (struct _aarch64_ctx *)p;
+        if (h->magic == 0 || h->size == 0)
+            break;
+        if (h->magic == magic)
+            return h;
+        p += h->size;
+    }
+    return NULL;
+}
+
+static int veh_load(CONTEXT *ctx, ucontext_t *uc)
+{
+    struct esr_context *esr = (struct esr_context *)veh_record(uc, ESR_MAGIC);
+    struct fpsimd_context *fp = (struct fpsimd_context *)veh_record(uc, FPSIMD_MAGIC);
+    int i, write = 0;
+    for (i = 0; i < 31; i++)
+        ctx->X[i] = uc->uc_mcontext.regs[i];
+    ctx->Sp = uc->uc_mcontext.sp;
+    ctx->Pc = uc->uc_mcontext.pc;
+    ctx->Pstate = uc->uc_mcontext.pstate;
+    ctx->HasV = fp != NULL;
+    if (fp)
+        memcpy(ctx->V, fp->vregs, sizeof(ctx->V));
+    if (esr) {
+        uint32_t ec = (uint32_t)(esr->esr >> 26) & 0x3F;
+        if (ec == 0x24 || ec == 0x25)          /* data abort, lower/same EL */
+            write = (esr->esr >> 6) & 1;       /* WnR */
+    }
+    return write;
+}
+
+static void veh_store(const CONTEXT *ctx, ucontext_t *uc)
+{
+    struct fpsimd_context *fp = (struct fpsimd_context *)veh_record(uc, FPSIMD_MAGIC);
+    int i;
+    for (i = 0; i < 31; i++)
+        uc->uc_mcontext.regs[i] = ctx->X[i];
+    uc->uc_mcontext.sp = ctx->Sp;
+    uc->uc_mcontext.pc = ctx->Pc;
+    uc->uc_mcontext.pstate = ctx->Pstate;
+    if (fp && ctx->HasV)
+        memcpy(fp->vregs, ctx->V, sizeof(ctx->V));
+}
+#endif
 
 static DWORD veh_code(int sig, int si_code)
 {
@@ -2073,38 +2155,27 @@ static DWORD veh_code(int sig, int si_code)
 static void veh_signal(int sig, siginfo_t *si, void *ucv)
 {
     ucontext_t *uc = (ucontext_t *)ucv;
-    greg_t *g = uc->uc_mcontext.gregs;
     EXCEPTION_RECORD rec;
     CONTEXT ctx;
     EXCEPTION_POINTERS ep;
-    uint64_t *r = &ctx.Rax;
-    int i, saved_errno = errno;
+    int i, write, saved_errno = errno;
 
+    write = veh_load(&ctx, uc);
     memset(&rec, 0, sizeof(rec));
     rec.ExceptionCode = veh_code(sig, si->si_code);
-    rec.ExceptionAddress = (PVOID)(uintptr_t)g[REG_RIP];
+    rec.ExceptionAddress = (PVOID)(uintptr_t)CONTEXT_PC(&ctx);
     if (rec.ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
-        /* Page-fault error code bit 1: the access was a write. */
         rec.NumberParameters = 2;
-        rec.ExceptionInformation[0] = (g[REG_ERR] & 2) ? 1 : 0;
+        rec.ExceptionInformation[0] = (ULONG_PTR)write;
         rec.ExceptionInformation[1] = (ULONG_PTR)si->si_addr;
     }
-
-    for (i = 0; i < 16; i++)
-        r[i] = (uint64_t)g[s_veh_gregs[i]];
-    ctx.Rip = (uint64_t)g[REG_RIP];
-    ctx.EFlags = (uint32_t)g[REG_EFL];
 
     ep.ExceptionRecord = &rec;
     ep.ContextRecord = &ctx;
 
     for (i = 0; i < s_veh_count; i++) {
         if (s_veh[i] && s_veh[i](&ep) == EXCEPTION_CONTINUE_EXECUTION) {
-            int k;
-            for (k = 0; k < 16; k++)
-                g[s_veh_gregs[k]] = (greg_t)r[k];
-            g[REG_RIP] = (greg_t)ctx.Rip;
-            g[REG_EFL] = (greg_t)((g[REG_EFL] & ~0xFFFFFFFFLL) | ctx.EFlags);
+            veh_store(&ctx, uc);
             errno = saved_errno;
             return;
         }

@@ -15,15 +15,12 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
-/* The MMIO hook is a Win32-VEH x86-64 instruction decoder. On Linux x86-64
- * the VEH is the sigaction shim in win32_compat.c, which hands over the same
- * CONTEXT fields; other POSIX hosts have no fault path yet. */
-#if defined(_WIN32) || (defined(__linux__) && defined(__x86_64__))
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include "win32_compat.h"
-#endif
+/* The MMIO hook decodes the faulting instruction under a Win32 VEH -- on
+ * Linux the sigaction shim in win32_compat.c. x86-64 uses the decoder below;
+ * AArch64 the shared one in mmio_decode.h. Hosts without a fault path have
+ * no hook. */
+#include "../platform/mmio_decode.h"
+#ifdef MMIO_FAULT_HOST
 
 /* APU MMIO base in Xbox VA space */
 #define APU_MMIO_BASE  0xFE800000u
@@ -36,6 +33,7 @@ static int g_apu_mmio_read_count = 0;
 static int g_apu_mmio_write_count = 0;
 static int g_apu_mmio_decode_fail = 0;
 
+#if !defined(__aarch64__)
 /* ============================================================
  * x86-64 register access helpers (same as NV2A hook)
  * ============================================================ */
@@ -93,6 +91,39 @@ static void apu_set_flags(PCONTEXT ctx, uint64_t result, int size, int cf)
  * Instruction decoder for APU MMIO access
  * ============================================================ */
 
+#endif /* !aarch64 helpers */
+
+#if defined(__aarch64__)
+static uint64_t apu_rd(void *dev, uint32_t off, int size)
+{
+    (void)dev;
+    g_apu_mmio_read_count++;
+    return mcpx_apu_mmio_read(g_apu_state, off, (unsigned)size);
+}
+
+static void apu_wr(void *dev, uint32_t off, uint64_t val, int size)
+{
+    (void)dev;
+    g_apu_mmio_write_count++;
+    mcpx_apu_mmio_write(g_apu_state, off, val, (unsigned)size);
+}
+
+static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
+{
+    const uint8_t *ip = (const uint8_t *)ctx->Pc;
+    (void)is_write;
+    if (!g_apu_state)
+        return false;
+    if (mmio_emulate(ctx, mmio_offset, NULL, apu_rd, apu_wr))
+        return true;
+    if (++g_apu_mmio_decode_fail <= 20) {
+        fprintf(stderr, "[APU] MMIO decode fail at PC=%p offset=0x%X: %02X %02X %02X %02X\n",
+                (void *)ip, mmio_offset, ip[0], ip[1], ip[2], ip[3]);
+        fflush(stderr);
+    }
+    return false;
+}
+#else
 static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
@@ -344,6 +375,7 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
     }
     return false;
 }
+#endif /* x86-64 */
 
 /* ============================================================
  * Public API (called from VEH in main.c)
@@ -375,4 +407,4 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
     return ok;
 }
 
-#endif /* _WIN32 || linux x86-64 */
+#endif /* MMIO_FAULT_HOST */

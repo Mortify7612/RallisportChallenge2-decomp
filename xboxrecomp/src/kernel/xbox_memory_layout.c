@@ -20,6 +20,7 @@
 #include "xbox_memory_layout.h"
 #include "kernel.h"
 #include "guest_vmem.h"
+#include "../platform/mmio_decode.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -366,6 +367,31 @@ static void ac97_clear_reset_bits(void)
     }
 }
 
+#if defined(__aarch64__)
+/* AArch64 has no trap flag a signal handler can set, so the write cannot be
+ * stepped. With the page open the handler performs the faulting store itself,
+ * through the MMIO decoder with plain memory behind it, and then does what
+ * the step's second half would. */
+static uint64_t plain_rd(void *base, uint32_t off, int size)
+{
+    uint64_t v = 0;
+    memcpy(&v, (char *)base + off, (size_t)size);
+    return v;
+}
+
+static void plain_wr(void *base, uint32_t off, uint64_t v, int size)
+{
+    memcpy((char *)base + off, &v, (size_t)size);
+}
+
+/* 1 if the store at the fault was performed and the thread moved past it. */
+static int step_store(PEXCEPTION_POINTERS ep, void *page, uintptr_t fault)
+{
+    return mmio_emulate(ep->ContextRecord, (uint32_t)(fault - (uintptr_t)page),
+                        page, plain_rd, plain_wr);
+}
+#endif
+
 static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 {
     DWORD code = ep->ExceptionRecord->ExceptionCode;
@@ -379,6 +405,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
      * because another thread must not mistake its own single-step for this
      * one -- and re-protecting from the wrong thread would strand this one
      * mid-step. */
+#if !defined(__aarch64__)
     if (code == EXCEPTION_SINGLE_STEP && s_ac97_stepping) {
         s_ac97_stepping = 0;
         ac97_clear_reset_bits();
@@ -386,6 +413,7 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
         ep->ContextRecord->EFlags &= ~0x100u;   /* clear TF */
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+#endif
 
     if (code == EXCEPTION_ACCESS_VIOLATION
             && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
@@ -396,8 +424,20 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
             if (!VirtualProtect(g_ac97_page, AC97_TRAP_BYTES,
                                 PAGE_READWRITE, &old))
                 return EXCEPTION_CONTINUE_SEARCH;
+#if defined(__aarch64__)
+            if (!step_store(ep, g_ac97_page, fault)) {
+                /* Leave the page open: the write goes through when the
+                 * instruction re-runs, without the reset bit model. */
+                fprintf(stderr, "  AC97: undecoded write at %p; trap off\n",
+                        (void *)CONTEXT_PC(ep->ContextRecord));
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+            ac97_clear_reset_bits();
+            VirtualProtect(g_ac97_page, AC97_TRAP_BYTES, PAGE_READONLY, &old);
+#else
             s_ac97_stepping = 1;
             ep->ContextRecord->EFlags |= 0x100u;   /* TF: step the write */
+#endif
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
@@ -1505,7 +1545,7 @@ static LONG CALLBACK readtrap_veh(PEXCEPTION_POINTERS ep)
         const char *name = "?";
 #if defined(__linux__)
         Dl_info di;
-        if (dladdr((void *)(uintptr_t)ep->ContextRecord->Rip, &di) && di.dli_sname)
+        if (dladdr((void *)(uintptr_t)CONTEXT_PC(ep->ContextRecord), &di) && di.dli_sname)
             name = di.dli_sname;
 #endif
         fprintf(stderr, "[READTRAP] %s at %08X by %s (guest esp %08X)\n",
@@ -1652,6 +1692,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
     if (!g_watch_page)
         return EXCEPTION_CONTINUE_SEARCH;
 
+#if !defined(__aarch64__)
     if (code == EXCEPTION_SINGLE_STEP && s_watch_stepping) {
         s_watch_stepping = 0;
         watch_report();
@@ -1659,6 +1700,7 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
         ep->ContextRecord->EFlags &= ~0x100u;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+#endif
 
     if (code == EXCEPTION_ACCESS_VIOLATION
             && ep->ExceptionRecord->ExceptionInformation[0] == 1) {
@@ -1668,9 +1710,16 @@ static LONG CALLBACK watch_veh(PEXCEPTION_POINTERS ep)
                 && fault < (uintptr_t)g_watch_page + 4096) {
             if (!VirtualProtect(g_watch_page, 4096, PAGE_READWRITE, &old))
                 return EXCEPTION_CONTINUE_SEARCH;
+            s_watch_rip = (uintptr_t)CONTEXT_PC(ep->ContextRecord);
+#if defined(__aarch64__)
+            if (step_store(ep, g_watch_page, fault)) {
+                watch_report();
+                VirtualProtect(g_watch_page, 4096, PAGE_READONLY, &old);
+            }
+#else
             s_watch_stepping = 1;
-            s_watch_rip = (uintptr_t)ep->ContextRecord->Rip;
             ep->ContextRecord->EFlags |= 0x100u;
+#endif
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
