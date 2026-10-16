@@ -48,6 +48,10 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
 - `RECOMP_VK_DEVICE=N`: pick a Vulkan device by index (listed at start).
 - `RECOMP_VK_VSYNC=1`: FIFO presentation instead of mailbox.
 - `RECOMP_FLIP_HZ=N`: flip pacing (default 60; 0 = unpaced).
+- `RECOMP_GAMMA=0`: ignore the game's gamma ramp. The console's video DAC
+  maps every pixel through the ramp the game sets; RalliSport Challenge 2's
+  race ramp lifts and warms the shadows and midtones. It's applied when
+  presenting, and to recordings. `RECOMP_GAMMA_TRACE=1` prints each ramp.
 - `RECOMP_VK_MSAA=2|4|8`: multisample anti-aliasing. Applies to the 640-wide
   scene targets; each pass resolves into the image everything else reads.
 - `RECOMP_VK_ANISO=N`: anisotropic filtering, up to 16. Used where the game

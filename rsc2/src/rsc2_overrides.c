@@ -789,3 +789,98 @@ void sub_00325ED3(void)
     esp += 16; return; /* ret 12 */
 }
 #undef esp
+
+/* ── D3D gamma ramp upload (0x0036C636: eax = &register base, edx = ramp) ─
+ *
+ * D3D keeps the title's gamma ramp (256 red, then 256 green, then 256 blue
+ * bytes) and loads it into the video DAC's palette at vblank; on the
+ * console every pixel goes through it on its way to the TV. Nothing scans
+ * out through a DAC here, so the ramp also goes to the renderer, which
+ * applies it when it presents (nv2a_vk_set_gamma). Then the DAC writes, as
+ * the original makes them.
+ */
+extern void nv2a_vk_set_gamma(const uint8_t *r, const uint8_t *g, const uint8_t *b);
+
+#define eax g_eax
+#define ecx g_ecx
+#define edx g_edx
+#define esp g_esp
+void sub_0036C636(void)
+{
+    uint8_t ramp[3][256];
+    uint32_t regs = MEM32(eax), base = edx, i, c;
+
+    for (c = 0; c < 3; c++)
+        for (i = 0; i < 256; i++)
+            ramp[c][i] = MEM8(edx + c * 0x100 + i);
+    nv2a_vk_set_gamma(ramp[0], ramp[1], ramp[2]);
+    MEM8(regs + 0x6813C8) = 0;
+    for (i = 0; i < 256; i++) {
+        if (!(i & 7))
+            (void)MEM32(regs + 0x3240);     /* the original's read-back */
+        MEM8(regs + 0x6813C9) = ramp[0][i];
+        MEM8(regs + 0x6813C9) = ramp[1][i];
+        MEM8(regs + 0x6813C9) = ramp[2][i];
+    }
+    /* Registers as the original's loop leaves them. */
+    ecx = regs;
+    eax = base + 0x200;
+    edx = 0x100;
+    esp += 4; /* ret */
+}
+#undef eax
+#undef ecx
+#undef edx
+#undef esp
+
+/* ── D3D SetGammaRamp (0x00365590, stdcall: flags, pRamp) ──────────────
+ *
+ * Where the title's ramps arrive. RalliSport Challenge 2 blends between two
+ * per-scene ramps and sets the result; without D3DSGR_IMMEDIATE (2) D3D only
+ * marks it for the vblank handler, which never loads it here, so the
+ * renderer takes it now (nv2a_vk_set_gamma). The rest is the original:
+ * nothing if it equals the ramp being shown, else into the device's next
+ * slot, then loaded at once (sub_0036C636) or flagged for vblank.
+ */
+extern void sub_0036C636(void);
+
+#define eax g_eax
+#define ecx g_ecx
+#define edx g_edx
+#define esp g_esp
+void sub_00365590(void)
+{
+    uint32_t flags = MEM32(esp + 4), ramp = MEM32(esp + 8);
+    uint32_t dev = MEM32(0x00375418u), blk = dev + 0x1C28u;
+    uint32_t slot = MEM32(dev + 0x2478u) & 1, shown = MEM32(dev + 0x240Cu);
+    uint32_t cur = blk + 0x1DCu + shown * 0x300u, dst = blk + 0x1DCu + slot * 0x300u, i;
+    uint8_t r[256], g[256], b[256];
+
+    for (i = 0; i < 256; i++) {
+        r[i] = MEM8(ramp + i);
+        g[i] = MEM8(ramp + 0x100 + i);
+        b[i] = MEM8(ramp + 0x200 + i);
+    }
+    nv2a_vk_set_gamma(r, g, b);
+    for (i = 0; i < 0xC0; i++)
+        if (MEM32(cur + i * 4) != MEM32(ramp + i * 4))
+            break;
+    if (i < 0xC0) {
+        for (i = 0; i < 0xC0; i++)
+            MEM32(dst + i * 4) = MEM32(ramp + i * 4);
+        MEM32(blk + 0x7E4u) = slot;
+        if (flags & 2) {
+            eax = blk;
+            edx = dst;
+            PUSH32(esp, 0x003655F7u); RECOMP_ABI_CALL(0x0036C636u, sub_0036C636);
+        } else {
+            MEM32(blk + 0x7DCu + slot * 4) = 1;
+        }
+    }
+    eax = blk;
+    esp += 12; /* ret 8 */
+}
+#undef eax
+#undef ecx
+#undef edx
+#undef esp

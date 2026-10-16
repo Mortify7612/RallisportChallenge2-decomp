@@ -15,6 +15,24 @@
  * Off unless RECOMP_FB_WINDOW is set.
  */
 #include <stdint.h>
+#include <stddef.h>
+
+/* The title's gamma ramp (kernel/nv2a_vk.c): on the console the DAC maps
+ * every pixel through it, so frames shown or recorded from guest memory go
+ * through it here. 0xXXRRGGBB pixels. */
+extern int nv2a_gamma_ramp(uint8_t out[3][256]);
+static void fb_gamma(uint32_t *px, size_t n)
+{
+    uint8_t g[3][256];
+    size_t i;
+    if (!px || !nv2a_gamma_ramp(g))
+        return;
+    for (i = 0; i < n; i++) {
+        uint32_t v = px[i];
+        px[i] = (v & 0xFF000000u) | (uint32_t)g[0][(v >> 16) & 0xFF] << 16
+              | (uint32_t)g[1][(v >> 8) & 0xFF] << 8 | g[2][v & 0xFF];
+    }
+}
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -447,9 +465,11 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              * the dump path and GDI see one consistent image even if the
              * next flip lands mid-blit. */
             LONG idx = s_present_idx;
-            if (s_present[idx])
+            if (s_present[idx]) {
                 memcpy(s_rgb, s_present[idx],
                        (size_t)s_fb_width * s_fb_height * 4);
+                fb_gamma(s_rgb, (size_t)s_fb_width * s_fb_height);
+            }
             if (!s_vk_window)
                 fb_blit(hwnd, hdc, &bi);
         } else if (s_fb_va && s_fb_pitch && s_rgb && !s_vk_window) {
@@ -854,6 +874,7 @@ static void *fb_vk_loop(SDL_Window *win)
             int f = __atomic_load_n(&s_flips, __ATOMIC_RELAXED);
             if (idx >= 0 && s_present[idx] && f != copied_flip) {
                 memcpy(s_rgb, s_present[idx], (size_t)s_fb_width * s_fb_height * 4);
+                fb_gamma(s_rgb, (size_t)s_fb_width * s_fb_height);
                 copied_flip = f;
                 video_frame(s_rgb);
             }
@@ -967,6 +988,7 @@ static void *fb_thread(void *unused)
         idx = __atomic_load_n(&s_present_idx, __ATOMIC_ACQUIRE);
         if (idx >= 0 && s_present[idx]) {
             memcpy(s_rgb, s_present[idx], (size_t)s_fb_width * s_fb_height * 4);
+            fb_gamma(s_rgb, (size_t)s_fb_width * s_fb_height);
         } else if (s_fb_va && s_fb_pitch) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory. */
             fb_convert_rows(s_rgb, (const uint8_t *)((uintptr_t)s_fb_va

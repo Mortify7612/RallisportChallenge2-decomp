@@ -41,6 +41,8 @@ void nv2a_vk_clear(const Nv2aVkState *s, uint32_t f, uint32_t c, uint32_t z)
 void nv2a_vk_flush(void) { }
 void nv2a_vk_present(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
 void nv2a_vk_zpass(int enable) { (void)enable; }
+void nv2a_vk_set_gamma(const uint8_t *r, const uint8_t *g, const uint8_t *b) { (void)r; (void)g; (void)b; }
+int nv2a_gamma_ramp(uint8_t out[3][256]) { (void)out; return 0; }
 void xbox_FlightDumpRequest(void) { }
 void nv2a_vk_report_clear(void) { }
 void nv2a_vk_report_get(uint32_t va, uint64_t stamp) { (void)va; (void)stamp; }
@@ -235,6 +237,17 @@ static struct {
     VkSampler post_samp;
     VkPipeline up_pipe;             /* resolved image -> multisampled twin */
     uint32_t st_ms_refresh, st_ao;
+    /* The title's gamma ramp, applied when presenting (gamma_*). */
+    uint8_t gm[3][256];         /* the one in use (presenter thread) */
+    int gm_on;                  /* not the identity, and not RECOMP_GAMMA=0 */
+    uint32_t gm_seq_seen;
+    int gm_lut_dirty;
+    VkImage gm_lut, gm_img;
+    VkDeviceMemory gm_lut_mem, gm_img_mem;
+    VkImageView gm_lut_view, gm_img_view;
+    uint32_t gm_w, gm_h;
+    VkPipeline gm_pipe;
+    int dump_gamma;             /* the pending dump is pre-gamma: apply it */
     /* RECOMP_VK_AO: ambient occlusion on the presented scene (ao_*). */
     int ao_on;
     float ao_radius, ao_intensity, ao_bias, ao_far, ao_near, ao_tan;
@@ -1001,7 +1014,7 @@ static void reports_resolve(void)
         static uint32_t seen;
         if (trace < 0)
             trace = getenv("RECOMP_REPORT_TRACE") != NULL;
-        if (trace && (seen++ % 200) < 12)
+        if (trace && ((seen++ % 200) < 12 || getenv("RECOMP_REPORT_TRACE_ALL")))
             fprintf(stderr, "[REPORT] vk at 0x%08X: %u pixels (%u queries)\n",
                     V.reps[i].va, count, V.reps[i].q1 - V.reps[i].q0);
         memcpy(g, &V.reps[i].stamp, 8);
@@ -1359,6 +1372,11 @@ static void vk_sync_inner(int readback)
                     line[x * 3 + 0] = src[x * 4 + (bgr ? 0 : 2)];
                     line[x * 3 + 1] = src[x * 4 + 1];
                     line[x * 3 + 2] = src[x * 4 + (bgr ? 2 : 0)];
+                    if (V.dump_gamma) {          /* as the window shows it */
+                        line[x * 3 + 0] = V.gm[2][line[x * 3 + 0]];
+                        line[x * 3 + 1] = V.gm[1][line[x * 3 + 1]];
+                        line[x * 3 + 2] = V.gm[0][line[x * 3 + 2]];
+                    }
                 }
                 fwrite(line, 1, row, f);
             }
@@ -1368,6 +1386,7 @@ static void vk_sync_inner(int readback)
                     V.present_dump_path, w, h);
         }
         V.present_dump_px = NULL;
+        V.dump_gamma = 0;
     }
     V.vtx.used = V.idx.used = V.ubo.used = V.stage.used = V.rb.used = 0;
     vkResetDescriptorPool(V.dev, V.dpool, 0);
@@ -2756,14 +2775,23 @@ static int tex_get(const Nv2aVkTex *t, VkImageView *view, uint32_t *levels_out)
             VkBufferImageCopy *c = &regs[nregs++];
             nv2a_pb_tex_decode(&d, f, d.min_level + lv, lw, lh, (uint32_t *)dst);
             {
-                /* RECOMP_VK_TEX_DUMP=<hex address>: that texture's level 0,
-                 * every face, as BMPs in the working directory. */
-                static long want = -2;
-                if (want == -2) {
+                /* RECOMP_VK_TEX_DUMP=<hex address>[,<hex>...]: those
+                 * textures' levels, every face, as BMPs in the working
+                 * directory (each time they are uploaded). */
+                static uint32_t want[8];
+                static int nwant = -1, wi;
+                int hit = 0;
+                if (nwant < 0) {
                     const char *e = getenv("RECOMP_VK_TEX_DUMP");
-                    want = e ? (long)strtoul(e, NULL, 16) : -1;
+                    nwant = 0;
+                    while (e && *e && nwant < 8) {
+                        want[nwant++] = (uint32_t)strtoul(e, (char **)&e, 16);
+                        while (*e == ',') e++;
+                    }
                 }
-                if (want >= 0 && (uint32_t)want == d.offset) {
+                for (wi = 0; wi < nwant; wi++)
+                    hit |= want[wi] == d.offset;
+                if (hit) {
                     char path[64];
                     FILE *df;
                     snprintf(path, sizeof path, "texdump_%08X_f%u_l%u.bmp", d.offset, f, lv);
@@ -3113,7 +3141,8 @@ static Zeta *zeta_get(uint32_t key, uint32_t w, uint32_t samples, uint32_t h)
     z->samples = samples;
     s_img_samples = samples;
     i = image_create(z->w * V.sx, z->h * V.scale, 1, 1, V.dsfmt,
-                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
+                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT
+                     | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0,
                      VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
                      &z->img, &z->mem, &z->view);
     s_img_samples = 1;
@@ -4134,6 +4163,18 @@ static int const_upload(VkDeviceSize *off)
     return 1;
 }
 
+/* RECOMP_VK_ZPASS_TRACE=<frame>: that frame's visibility-test draws and the
+ * report slots they answer. */
+static int zpass_trace(void)
+{
+    static long at = -2;
+    if (at == -2) {
+        const char *e = getenv("RECOMP_VK_ZPASS_TRACE");
+        at = e ? atol(e) : -1;
+    }
+    return at >= 0 && nv2a_pb_presented_frames() == (uint32_t)at;
+}
+
 static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                         uint32_t ninputs, const void *v, uint32_t nv,
                         const uint32_t *idx, uint32_t nidx)
@@ -4476,13 +4517,118 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     vkCmdSetStencilWriteMask(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK,
                              st->st_write ? (st->st_wmask & 0xFF) : 0);
     vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_ref & 0xFF);
+    if (zpass_trace() && V.cur_zs && st->st_test && st->st_write && (st->st_wmask & 0xFF)
+            && !V.zpass && V.cur_cs && V.cur_cs->w == 640)
+        fprintf(stderr, "[ZPASS] F%u stencil-write prog %08X nidx %u depth %u %X st func %X ref %X mask %X"
+                " wmask %X ops fail %X zfail %X zpass %X cm %08X at %u %X\n", nv2a_pb_presented_frames(),
+                prog, nidx, st->depth_test, st->depth_func, st->st_func, st->st_ref, st->st_mask,
+                st->st_wmask, st->st_fail, st->st_zfail, st->st_zpass, st->color_mask,
+                st->alpha_test, st->alpha_ref);
     if (V.zpass && V.nq < VK_MAX_QUERIES) {
         uint32_t q = V.nq++;
         V.st_qdraws++;
         V.qsamples[q] = (uint8_t)V.cur_samples;
+        if (zpass_trace())
+            fprintf(stderr, "[ZPASS] F%u q%u prog %08X surf %08X zeta %08X nidx %u depth %u %X %u st %u %X %X mask %X"
+                    " cm %08X at %u %X %X clip %u,%u,%u,%u\n", nv2a_pb_presented_frames(), q, prog,
+                    st->color_va, st->zeta_key, nidx, st->depth_test, st->depth_func, st->depth_mask,
+                    st->st_test, st->st_func, st->st_ref, st->st_mask, st->color_mask, st->alpha_test,
+                    st->alpha_func, st->alpha_ref, st->clip_x, st->clip_y, st->clip_w, st->clip_h);
         vkCmdBeginQuery(V.dcb, V.qpool, q, V.precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
         vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
         vkCmdEndQuery(V.dcb, V.qpool, q);
+        if (zpass_trace() && getenv("RECOMP_VK_ZPASS_PROBE") && st->st_test && st->st_func == 0x202) {
+            /* Which stencil values lie under this test: the same draw
+             * against each, counted in a pool of its own. */
+            static const uint32_t refs[6] = { 0x00, 0x01, 0x14, 0xC8, 0xC9, 0xFF };
+            static VkQueryPool dq;
+            uint64_t res[6];
+            int k;
+            if (!dq) {
+                VkQueryPoolCreateInfo qci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+                qci.queryType = VK_QUERY_TYPE_OCCLUSION;
+                qci.queryCount = 6;
+                vkCreateQueryPool(V.dev, &qci, NULL, &dq);
+            }
+            end_rendering();
+            vkCmdResetQueryPool(V.dcb, dq, 0, 6);
+            begin_target(st);
+            vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            {
+                uint32_t doff[2] = { (uint32_t)uoff, (uint32_t)coff };
+                vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1, &set, 2, doff);
+            }
+            vkCmdBindVertexBuffers(V.dcb, 0, 1, &V.vtx.buf, &voff);
+            vkCmdBindIndexBuffer(V.dcb, V.idx.buf, ioff, VK_INDEX_TYPE_UINT32);
+            vkCmdSetViewport(V.dcb, 0, 1, &vpt);
+            vkCmdSetScissor(V.dcb, 0, 1, &sc);
+            for (k = 0; k < 6; k++) {
+                vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, refs[k]);
+                vkCmdBeginQuery(V.dcb, dq, (uint32_t)k, 0);
+                vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+                vkCmdEndQuery(V.dcb, dq, (uint32_t)k);
+            }
+            vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_ref & 0xFF);
+            {
+                /* The test quad itself, made visible (colour writes on,
+                 * no stencil), to see where it lies. */
+                Nv2aVkState vis = *st;
+                VkPipeline vp2;
+                vis.color_mask = 0x01010101u;
+                vis.st_test = 0;
+                vp2 = pipeline(V.cur_cs ? V.cur_cs->fmt : VK_FORMAT_UNDEFINED, V.cur_zs != NULL,
+                               &vis, vs, prog, ninputs);
+                if (vp2) {
+                    vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, vp2);
+                    vkCmdSetStencilTestEnable(V.dcb, VK_FALSE);
+                    vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+                    mark_drawn(st);
+                }
+            }
+            {
+                /* And the stencil buffer itself, as a PGM. */
+                uint32_t w = 640 * V.sx, h = 480 * V.scale;
+                VkDeviceSize off;
+                uint8_t *px = (uint8_t *)ring_alloc(&V.rb, (VkDeviceSize)w * h, 16, &off);
+                Zeta *zz = V.cur_zs;
+                if (px && zz) {
+                    VkBufferImageCopy c;
+                    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+                    end_rendering();
+                    mb.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+                    memset(&c, 0, sizeof c);
+                    c.bufferOffset = off;
+                    c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+                    c.imageSubresource.layerCount = 1;
+                    c.imageExtent.width = w;
+                    c.imageExtent.height = h;
+                    c.imageExtent.depth = 1;
+                    vkCmdCopyImageToBuffer(V.dcb, zz->img, VK_IMAGE_LAYOUT_GENERAL, V.rb.buf, 1, &c);
+                    vk_sync(0);
+                    {
+                        char path[64];
+                        FILE *f;
+                        snprintf(path, sizeof path, "stencil_F%u.pgm", nv2a_pb_presented_frames());
+                        f = fopen(path, "wb");
+                        if (f) {
+                            fprintf(f, "P5 %u %u 255\n", w, h);
+                            fwrite(px, 1, (size_t)w * h, f);
+                            fclose(f);
+                        }
+                    }
+                }
+            }
+            vk_sync(0);
+            if (vkGetQueryPoolResults(V.dev, dq, 0, 6, sizeof res, res, 8,
+                                      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
+                fprintf(stderr, "[ZPASS] stencil under the test: 00:%llu 01:%llu 14:%llu C8:%llu C9:%llu FF:%llu\n",
+                        (unsigned long long)res[0], (unsigned long long)res[1], (unsigned long long)res[2],
+                        (unsigned long long)res[3], (unsigned long long)res[4], (unsigned long long)res[5]);
+            return;
+        }
     } else if (s_flight > 0 && s_dlog && V.fqpool && V.nfq < VK_MAX_QUERIES) {
         /* Flight recorder: how many samples this draw actually wrote. */
         uint32_t q = V.nfq++;
@@ -4819,6 +4965,188 @@ void nv2a_vk_zpass(int enable)
     V.zpass = enable != 0;
 }
 
+/* The title's gamma ramp (D3D SetGammaRamp; see rsc2_overrides.c). On the
+ * console the DAC maps every pixel through it on the way to the TV --
+ * RalliSport Challenge 2's race ramp lifts the shadows and midtones and warms
+ * them, much of its look. Handed to the presenter through a sequence lock;
+ * RECOMP_GAMMA_TRACE prints each new one, RECOMP_GAMMA=0 ignores them. */
+static volatile uint32_t s_gm_seq;
+static uint8_t s_gm_next[3][256];
+
+void nv2a_vk_set_gamma(const uint8_t *r, const uint8_t *g, const uint8_t *b)
+{
+    static uint8_t last[3][256];
+    static int have;
+    if (have && !memcmp(last[0], r, 256) && !memcmp(last[1], g, 256) && !memcmp(last[2], b, 256))
+        return;
+    memcpy(last[0], r, 256);
+    memcpy(last[1], g, 256);
+    memcpy(last[2], b, 256);
+    have = 1;
+    if (getenv("RECOMP_GAMMA_TRACE")) {
+        int i;
+        fprintf(stderr, "[GAMMA] new ramp, every 15th entry r/g/b:");
+        for (i = 0; i < 256; i += 15)
+            fprintf(stderr, " %u:%u/%u/%u", i, r[i], g[i], b[i]);
+        fputc('\n', stderr);
+    }
+    __atomic_add_fetch(&s_gm_seq, 1, __ATOMIC_ACQ_REL);     /* odd: writing */
+    memcpy(s_gm_next, last, sizeof s_gm_next);
+    __atomic_add_fetch(&s_gm_seq, 1, __ATOMIC_ACQ_REL);     /* even: done */
+}
+
+/* The title's current ramp, for the other ways a frame leaves (the plain
+ * window, video recording): 1 when it is not the identity. Any thread. */
+int nv2a_gamma_ramp(uint8_t out[3][256])
+{
+    static int off = -1;
+    uint32_t seq;
+    int i, c, id = 1;
+    if (off < 0) {
+        const char *e = getenv("RECOMP_GAMMA");
+        off = e && strcmp(e, "0") == 0;
+    }
+    seq = __atomic_load_n(&s_gm_seq, __ATOMIC_ACQUIRE);
+    if (off || !seq || (seq & 1))
+        return 0;
+    memcpy(out, s_gm_next, 3 * 256);
+    if (__atomic_load_n(&s_gm_seq, __ATOMIC_ACQUIRE) != seq)
+        return 0;
+    for (c = 0; c < 3 && id; c++)
+        for (i = 0; i < 256; i++)
+            if (out[c][i] != i) {
+                id = 0;
+                break;
+            }
+    return !id;
+}
+
+/* The newest ramp, if there is one the presenter has not taken. */
+static void gamma_poll(void)
+{
+    static int off = -1;
+    uint32_t seq = __atomic_load_n(&s_gm_seq, __ATOMIC_ACQUIRE);
+    uint8_t t[3][256];
+    int i, c;
+    if (off < 0) {
+        const char *e = getenv("RECOMP_GAMMA");
+        off = e && strcmp(e, "0") == 0;
+    }
+    if (off || seq == V.gm_seq_seen || (seq & 1))
+        return;
+    memcpy(t, s_gm_next, sizeof t);
+    if (__atomic_load_n(&s_gm_seq, __ATOMIC_ACQUIRE) != seq)
+        return;                 /* torn: next frame */
+    V.gm_seq_seen = seq;
+    memcpy(V.gm, t, sizeof t);
+    V.gm_on = 0;
+    for (c = 0; c < 3; c++)
+        for (i = 0; i < 256; i++)
+            if (t[c][i] != i)
+                V.gm_on = 1;
+    V.gm_lut_dirty = 1;
+}
+
+/* The presented region of `s` through the ramp, into gm_img; returns the
+ * image to present from (`s->img` when there is no ramp to apply). */
+static VkImage gamma_apply(Surf *s, uint32_t w, uint32_t h)
+{
+    static const char *fs_src =
+        "#version 450\n"
+        "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+        "layout(set = 0, binding = 1) uniform sampler2D lut;\n"
+        "layout(location = 0) out vec4 o;\n"
+        "void main() {\n"
+        "    vec4 c = texelFetch(src, ivec2(gl_FragCoord.xy), 0);\n"
+        "    ivec3 i = ivec3(clamp(c.rgb, 0.0, 1.0) * 255.0 + 0.5);\n"
+        "    o = vec4(texelFetch(lut, ivec2(i.r, 0), 0).r, texelFetch(lut, ivec2(i.g, 0), 0).g,\n"
+        "             texelFetch(lut, ivec2(i.b, 0), 0).b, c.a);\n"
+        "}\n";
+    VkDescriptorSet set;
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    float pc[12];
+
+    gamma_poll();
+    if (!V.gm_on || !V.post_pl || s->fmt != VK_FORMAT_B8G8R8A8_UNORM)
+        return s->img;
+    if (!V.gm_pipe) {
+        VkShaderModule fs = glsl_module(fs_src, 1);
+        V.gm_pipe = fs ? post_pipeline(fs, VK_FORMAT_B8G8R8A8_UNORM, 1, 0) : VK_NULL_HANDLE;
+        if (fs)
+            vkDestroyShaderModule(V.dev, fs, NULL);
+        if (!V.gm_pipe) {
+            V.gm_on = 0;
+            fprintf(stderr, "  [VK] gamma ramp shader failed -- presenting without it\n");
+            return s->img;
+        }
+    }
+    if (!V.gm_lut) {
+        if (!image_create(256, 1, 1, 1, VK_FORMAT_R8G8B8A8_UNORM,
+                          VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0,
+                          VK_IMAGE_ASPECT_COLOR_BIT, &V.gm_lut, &V.gm_lut_mem, &V.gm_lut_view))
+            return s->img;
+        barrier_image(V.ucb, V.gm_lut, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        V.gm_lut_dirty = 1;
+    }
+    if (V.gm_lut_dirty) {
+        VkDeviceSize off;
+        uint8_t *p = (uint8_t *)ring_alloc(&V.stage, 1024, 16, &off);
+        VkBufferImageCopy c;
+        int i;
+        if (!p)
+            return s->img;
+        for (i = 0; i < 256; i++) {
+            p[i * 4 + 0] = V.gm[0][i];
+            p[i * 4 + 1] = V.gm[1][i];
+            p[i * 4 + 2] = V.gm[2][i];
+            p[i * 4 + 3] = 255;
+        }
+        memset(&c, 0, sizeof c);
+        c.bufferOffset = off;
+        c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        c.imageSubresource.layerCount = 1;
+        c.imageExtent.width = 256;
+        c.imageExtent.height = 1;
+        c.imageExtent.depth = 1;
+        vkCmdCopyBufferToImage(V.ucb, V.stage.buf, V.gm_lut, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        V.gm_lut_dirty = 0;
+    }
+    if (!V.gm_img || V.gm_w != w || V.gm_h != h) {
+        if (V.gm_img)
+            retire(V.gm_img, V.gm_img_mem, V.gm_img_view);
+        V.gm_img = VK_NULL_HANDLE;
+        if (!image_create(w, h, 1, 1, VK_FORMAT_B8G8R8A8_UNORM,
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0,
+                          VK_IMAGE_ASPECT_COLOR_BIT, &V.gm_img, &V.gm_img_mem, &V.gm_img_view))
+            return s->img;
+        V.gm_w = w;
+        V.gm_h = h;
+        barrier_image(V.dcb, V.gm_img, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    }
+    set = post_set(s->view, V.gm_lut_view);
+    if (!set)
+        return s->img;
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    memset(pc, 0, sizeof pc);
+    ao_pass(V.gm_img_view, VK_NULL_HANDLE, w, h, V.gm_pipe, set, pc);
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    V.last_set = VK_NULL_HANDLE;
+    return V.gm_img;
+}
+
 void nv2a_vk_report_clear(void)
 {
     V.rep_acc = 0;
@@ -4829,6 +5157,9 @@ void nv2a_vk_report_get(uint32_t va, uint64_t stamp)
 {
     if (V.state <= 0)
         return;
+    if (zpass_trace())
+        fprintf(stderr, "[ZPASS] F%u report %08X <- q%u..q%u\n", nv2a_pb_presented_frames(),
+                va, V.rep_first, V.nq);
     if (V.nreps == VK_MAX_REPORTS)
         vk_sync(0);
     if (V.nreps == VK_MAX_REPORTS)
@@ -5113,6 +5444,8 @@ static void hires_dump(uint32_t va, uint32_t pitch)
     V.dump_w = s->w * V.sx;
     V.dump_h = rows * V.scale;
     V.dump_bgr = s->fmt == VK_FORMAT_B8G8R8A8_UNORM || s->fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    gamma_poll();
+    V.dump_gamma = V.gm_on;
 }
 
 /* Blit the surface the title just finished into the window. */
@@ -5229,8 +5562,12 @@ void nv2a_vk_present(uint32_t va, uint32_t pitch)
     b.dstOffsets[1].x = (int32_t)(ox + dw);
     b.dstOffsets[1].y = (int32_t)(oy + dh);
     b.dstOffsets[1].z = 1;
-    vkCmdBlitImage(V.dcb, s->img, VK_IMAGE_LAYOUT_GENERAL, V.sc_img[V.sc_idx],
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    {
+        /* Through the title's gamma ramp first, as the console's DAC. */
+        VkImage src = gamma_apply(s, sw * V.sx, sh * V.scale);
+        vkCmdBlitImage(V.dcb, src, VK_IMAGE_LAYOUT_GENERAL, V.sc_img[V.sc_idx],
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    }
     if (getenv("RECOMP_VK_PRESENT_DUMP")) {
         barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,

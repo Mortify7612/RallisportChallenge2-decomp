@@ -3164,7 +3164,7 @@ static int vk_program_batch(void)
             const char *e = getenv("RECOMP_VSH_DUMP");
             want = e ? (long)strtoul(e, NULL, 16) : -1;
         }
-        if (want >= 0 && (uint32_t)want == h && shown < 24) {
+        if (want >= 0 && (uint32_t)want == h && shown < (getenv("RECOMP_VSH_DUMP_N") ? atoi(getenv("RECOMP_VSH_DUMP_N")) : 24)) {
             uint32_t vv;
             shown++;
             fprintf(stderr, "[VSHDUMP] F%u prog %08X nv %u prim %u inputs", s_presented, h, nv, s_gpu.prim);
