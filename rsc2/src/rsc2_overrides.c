@@ -757,3 +757,35 @@ void sub_0037E590(void)
             MEM8(pstate + (uint32_t)i) = 0;
     }
 }
+
+/* ── DirectSound SetI3DL2Listener (0x00325ED3, stdcall: pDS, pds3dl, dwApply) ─
+ *
+ * The title moves its reverb with the car -- in-car, tunnels, forest,
+ * valleys, building walls, an arena -- by handing DirectSound an I3DL2
+ * listener. On the console that becomes coefficients for the reverb in the
+ * GP's DSP program, which does not run here; the APU's own reverb takes the
+ * parameters instead (mcpx_apu_set_i3dl2). Then the original body: the
+ * interface wrapper's `this` adjustment and CDirectSound::SetI3DL2Listener
+ * (0x00325C90), which keeps the title's view of the listener exact.
+ */
+extern void mcpx_apu_set_i3dl2(const uint32_t p[12]);
+extern void sub_00325C90(void);
+
+#define esp g_esp
+void sub_00325ED3(void)
+{
+    uint32_t pds = MEM32(esp + 4), p = MEM32(esp + 8), apply = MEM32(esp + 12), i;
+
+    if (p) {
+        uint32_t v[12];
+        for (i = 0; i < 12; i++)
+            v[i] = MEM32(p + i * 4);
+        mcpx_apu_set_i3dl2(v);
+    }
+    PUSH32(esp, apply);
+    PUSH32(esp, p);
+    PUSH32(esp, pds ? pds - 8 : 0);
+    PUSH32(esp, 0x00325EF0u); RECOMP_ABI_CALL(0x00325C90u, sub_00325C90);
+    esp += 16; return; /* ret 12 */
+}
+#undef esp

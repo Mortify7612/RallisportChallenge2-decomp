@@ -170,8 +170,9 @@ static void opts_init(int list_gpus)
     opt_add(o, "Off", "0");
 
     o = opt_def(O_REVERB, "reverb", "RECOMP_APU_REVERB", NULL, 1, "Reverb",
-                "Room echo on the sounds the game sends to its reverb, standing in "
-                "for the Xbox audio DSP effects.");
+                "The game's own room echo for each place on the track (tunnels, "
+                "forest, valleys, in the car), rebuilt from its settings. Normal is "
+                "the original level.");
     opt_add(o, "Off", "0");
     opt_add(o, "Light", "0.15");
     opt_add(o, "Normal", "0.3");

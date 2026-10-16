@@ -17,7 +17,8 @@ repository either.
   clock).
 - Optional extras the original never had: MSAA, anisotropic filtering and
   ambient occlusion.
-- Sound through SDL2: per-voice resampling, speaker mixdown, reverb.
+- Sound through SDL2: per-voice resampling, speaker mixdown, and the game's
+  per-environment I3DL2 reverb (tunnels, forest, valleys, in the car).
 - Keyboard and SDL game controllers, with rumble.
 - A pre-game launcher for resolution, aspect ratio, GPU, display mode, frame
   rate limit, audio and controls.

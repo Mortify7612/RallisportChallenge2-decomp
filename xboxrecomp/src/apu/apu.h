@@ -31,6 +31,13 @@ void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned 
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);
 
+/* The title's I3DL2 listener (DirectSound SetI3DL2Listener: the DSI3DL2LISTENER
+ * struct as its 12 raw dwords -- lRoom, lRoomHF, flRoomRolloffFactor,
+ * flDecayTime, flDecayHFRatio, lReflections, flReflectionsDelay, lReverb,
+ * flReverbDelay, flDiffusion, flDensity, flHFReference). The reverb on the
+ * I3DL2 send follows it. Any thread. */
+void mcpx_apu_set_i3dl2(const uint32_t p[12]);
+
 /* ============================================================
  * Software mixer - DirectSound buffer bridge
  *

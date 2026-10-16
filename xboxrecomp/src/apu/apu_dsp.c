@@ -26,6 +26,7 @@
 #include "fpconv.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -162,76 +163,250 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
  * undoes it), and the result goes through a soft limiter instead of being
  * hard-clipped.
  *
- * ponytail: not the title's DSP program -- no per-title effects, and the
- * reverb is a fixed Freeverb, not the I3DL2 parameters the title set.
- * RECOMP_APU_MIXDOWN_ALL=0 restores the old two-bin read, RECOMP_APU_REVERB=<wet>
- * sets the reverb level (0 turns it off). */
+ * The reverb follows the title's I3DL2 listener (mcpx_apu_set_i3dl2, from
+ * DirectSound's SetI3DL2Listener), which it changes as the car moves between
+ * environments. On the console it is the reverb in the GP's DSP program;
+ * here an I3DL2 reverb in C stands in for it: the room's HF cut on the way
+ * in, early reflections from a tapped delay at the reflections delay and
+ * level, and a late reverb -- input diffusers, then an eight-line feedback
+ * delay network -- at the reverb delay and level, decaying in the title's
+ * decay time, its HF part in decay time x HF ratio. The levels follow the
+ * EAX/I3DL2 reading OpenAL Soft uses (reflections and reverb relative to
+ * room, the late reverb's energy normalised for its decay). Not the DSP
+ * program's exact sound, but its parameters.
+ *
+ * RECOMP_APU_MIXDOWN_ALL=0 restores the old two-bin read. RECOMP_APU_REVERB
+ * scales the reverb: 0.3 (the launcher's Normal) is the title's level, 0 is
+ * off. RECOMP_APU_I3DL2_TRACE prints each listener the title sets. */
 
-#define FV_COMBS 8
-#define FV_APS   4
-static const int fv_comb_len[FV_COMBS] = { 1215, 1293, 1390, 1476, 1548, 1623, 1695, 1760 };
-static const int fv_ap_len[FV_APS] = { 605, 480, 371, 245 };
-#define FV_SPREAD 25
+#define RV_RATE     48000.0f
+#define RV_LINES    8
+#define RV_DIFF     4
+#define RV_PRE_MAX  32768           /* > 0.3 s + 0.1 s + taps at 48 kHz */
+#define RV_LINE_MAX 8192
+#define RV_TAPS     6
+
+static const float rv_line_ms[RV_LINES] = { 29.7f, 37.1f, 41.1f, 43.7f, 53.1f, 61.3f, 67.9f, 73.3f };
+static const float rv_diff_ms[RV_DIFF] = { 4.77f, 3.59f, 2.73f, 1.73f };
+static const float rv_tap_ms[RV_TAPS] = { 0.0f, 3.1f, 5.3f, 7.7f, 11.2f, 13.9f };
+static const float rv_tap_g[RV_TAPS] = { 1.0f, 0.83f, 0.71f, 0.62f, 0.52f, 0.45f };
+
+/* What the parameters become; `cur` glides to `want` (no zipper noise when
+ * the environment changes). */
+typedef struct {
+    float in_lp;                /* room HF: one-pole coefficient */
+    float refl, late;           /* output levels */
+    float fb[RV_LINES];         /* per-line decay gain */
+    float damp[RV_LINES];       /* per-line HF damping coefficient */
+    float diff;                 /* diffuser allpass coefficient */
+    float refl_delay, late_delay;   /* samples */
+} RvCoef;
 
 typedef struct {
-    float *comb[2][FV_COMBS], comb_lp[2][FV_COMBS];
-    int comb_i[2][FV_COMBS], comb_n[2][FV_COMBS];
-    float *ap[2][FV_APS];
-    int ap_i[2][FV_APS], ap_n[2][FV_APS];
+    float pre[RV_PRE_MAX];
+    int pre_i;
+    float line[RV_LINES][RV_LINE_MAX];
+    int line_n[RV_LINES], line_i[RV_LINES];
+    float line_lp[RV_LINES];
+    float diff[RV_DIFF][1024];
+    int diff_n[RV_DIFF], diff_i[RV_DIFF];
+    float in_lp_z;
+    RvCoef cur, want;
+    volatile int pending;       /* a new listener waits in `next` */
+    uint32_t next[12];
 } Reverb;
 
-static Reverb s_rv;
+static Reverb *s_rv;
 static float s_rv_wet = -1.0f;
+/* RECOMP_APU_REVERB_STATS: once a second, the dry mix, the I3DL2 send and
+ * the reverb's output, in dB. */
+static int s_rv_stats;
+static double s_rv_e[3];
+static int s_rv_n;
 
-static void reverb_init(void)
+static float mb_gain(float mb) { return powf(10.0f, mb / 2000.0f); }
+static int32_t clampi(int32_t v, int32_t lo, int32_t hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/* One-pole lowpass y = (1-a) x + a y with gain `g` (< 1) at `hz` (OpenAL
+ * Soft's lpCoeffCalc). */
+static float lp_coef(float g, float hz)
 {
-    const char *e = getenv("RECOMP_APU_REVERB");
-    int c, k;
-    s_rv_wet = e && *e ? (float)atof(e) : 0.3f;
-    if (s_rv_wet <= 0.0f)
-        return;
-    for (c = 0; c < 2; c++) {
-        for (k = 0; k < FV_COMBS; k++) {
-            s_rv.comb_n[c][k] = fv_comb_len[k] + c * FV_SPREAD;
-            s_rv.comb[c][k] = (float *)calloc((size_t)s_rv.comb_n[c][k], sizeof(float));
-        }
-        for (k = 0; k < FV_APS; k++) {
-            s_rv.ap_n[c][k] = fv_ap_len[k] + c * FV_SPREAD;
-            s_rv.ap[c][k] = (float *)calloc((size_t)s_rv.ap_n[c][k], sizeof(float));
-        }
+    float w = 2.0f * 3.14159265f * hz / RV_RATE, cw = cosf(w), gs, a;
+    if (g >= 0.9999f)
+        return 0.0f;
+    if (g < 0.001f)
+        g = 0.001f;
+    gs = g * g;
+    a = (1.0f - gs * cw - sqrtf(2.0f * gs * (1.0f - cw) - gs * gs * (1.0f - cw * cw))) / (1.0f - gs);
+    return a < 0.0f ? 0.0f : a > 0.99f ? 0.99f : a;
+}
+
+static void rv_coefs(const uint32_t p[12], RvCoef *c)
+{
+    float f[12];
+    /* I3DL2's ranges: the title's blends between environments can step
+     * past them. */
+    int32_t room = clampi((int32_t)p[0], -10000, 0), room_hf = clampi((int32_t)p[1], -10000, 0);
+    int32_t refl = clampi((int32_t)p[5], -10000, 1000), rev = clampi((int32_t)p[7], -10000, 2000);
+    float decay, hf_ratio, hf_ref, density, diffusion;
+    int k;
+    memcpy(f, p, sizeof f);
+    decay = f[3] < 0.1f ? 0.1f : f[3] > 20.0f ? 20.0f : f[3];
+    hf_ratio = f[4] < 0.1f ? 0.1f : f[4] > 2.0f ? 2.0f : f[4];
+    hf_ref = f[11] < 20.0f ? 5000.0f : f[11] > 20000.0f ? 20000.0f : f[11];
+    diffusion = f[9] < 0.0f ? 0.0f : f[9] > 100.0f ? 1.0f : f[9] / 100.0f;
+    density = f[10] < 0.0f ? 0.0f : f[10] > 100.0f ? 1.0f : f[10] / 100.0f;
+    (void)density;              /* the line lengths stay put: no clicks */
+    c->in_lp = lp_coef(mb_gain((float)room_hf), hf_ref);
+    c->refl = room <= -10000 ? 0.0f : mb_gain((float)(room + refl));
+    c->late = room <= -10000 ? 0.0f : mb_gain((float)(room + rev));
+    c->diff = 0.6f * diffusion;
+    c->refl_delay = (f[6] < 0.0f ? 0.0f : f[6] > 0.3f ? 0.3f : f[6]) * RV_RATE;
+    c->late_delay = c->refl_delay + (f[8] < 0.0f ? 0.0f : f[8] > 0.1f ? 0.1f : f[8]) * RV_RATE;
+    for (k = 0; k < RV_LINES; k++) {
+        float len = rv_line_ms[k] * RV_RATE / 1000.0f;
+        float g = powf(10.0f, -3.0f * len / (decay * RV_RATE));
+        float ghf = powf(10.0f, -3.0f * len / (decay * hf_ratio * RV_RATE));
+        c->fb[k] = g;
+        c->damp[k] = ghf < g ? lp_coef(ghf / g, hf_ref) : 0.0f;
+    }
+    /* The late tail's energy, 1 / (1 - g^2), normalised away so lReverb is
+     * its level whatever the decay. */
+    {
+        float gm = 0.0f;
+        for (k = 0; k < RV_LINES; k++)
+            gm += c->fb[k] * c->fb[k];
+        gm /= RV_LINES;
+        c->late *= sqrtf(1.0f - gm);
     }
 }
 
-/* One mono sample in, a stereo pair of reverb out (Freeverb structure). */
+void mcpx_apu_set_i3dl2(const uint32_t p[12])
+{
+    static uint32_t last[12];
+    if (!memcmp(last, p, sizeof last))
+        return;
+    memcpy(last, p, sizeof last);
+    if (getenv("RECOMP_APU_I3DL2_TRACE")) {
+        float f[12];
+        memcpy(f, p, sizeof f);
+        fprintf(stderr, "[I3DL2] room %d hf %d rolloff %.2f decay %.2f hfratio %.2f refl %d @%.3f"
+                " reverb %d @%.3f diffusion %.0f density %.0f hfref %.0f\n",
+                (int32_t)p[0], (int32_t)p[1], f[2], f[3], f[4], (int32_t)p[5], f[6],
+                (int32_t)p[7], f[8], f[9], f[10], f[11]);
+    }
+    if (s_rv) {
+        memcpy(s_rv->next, p, sizeof s_rv->next);
+        __atomic_store_n(&s_rv->pending, 1, __ATOMIC_RELEASE);
+    }
+}
+
+static void reverb_init(void)
+{
+    /* DirectSound's default listener (its Generic preset) until the title
+     * sets one. */
+    static const uint32_t generic[12] = {
+        (uint32_t)-1000, (uint32_t)-100, 0x00000000u, 0x3FBEB852u /* 1.49 */,
+        0x3F547AE1u /* 0.83 */, (uint32_t)-2602, 0x3BE56042u /* 0.007 */, 200u,
+        0x3C343958u /* 0.011 */, 0x42C80000u /* 100 */, 0x42C80000u, 0x459C4000u /* 5000 */ };
+    const char *e = getenv("RECOMP_APU_REVERB");
+    int k;
+    s_rv_wet = e && *e ? (float)atof(e) / 0.3f : 1.0f;
+    s_rv_stats = getenv("RECOMP_APU_REVERB_STATS") != NULL;
+    if (s_rv_wet <= 0.0f)
+        return;
+    s_rv = (Reverb *)calloc(1, sizeof *s_rv);
+    if (!s_rv) {
+        s_rv_wet = 0.0f;
+        return;
+    }
+    for (k = 0; k < RV_LINES; k++)
+        s_rv->line_n[k] = (int)(rv_line_ms[k] * RV_RATE / 1000.0f);
+    for (k = 0; k < RV_DIFF; k++)
+        s_rv->diff_n[k] = (int)(rv_diff_ms[k] * RV_RATE / 1000.0f);
+    rv_coefs(generic, &s_rv->want);
+    s_rv->cur = s_rv->want;
+}
+
+static inline float rv_pre_at(const Reverb *r, float d)
+{
+    int i = r->pre_i - 1 - (int)d;
+    while (i < 0)
+        i += RV_PRE_MAX;
+    return r->pre[i];
+}
+
+/* One mono sample of the I3DL2 send in, a stereo pair of reverb out. */
 static void reverb_tick(float in, float *outl, float *outr)
 {
-    const float feedback = 0.80f, damp = 0.25f;
-    int c, k;
-    in *= 0.015f;
-    for (c = 0; c < 2; c++) {
-        float acc = 0.0f;
-        for (k = 0; k < FV_COMBS; k++) {
-            float *b = s_rv.comb[c][k];
-            int i = s_rv.comb_i[c][k];
-            float y = b[i];
-            s_rv.comb_lp[c][k] = y * (1.0f - damp) + s_rv.comb_lp[c][k] * damp;
-            b[i] = in + s_rv.comb_lp[c][k] * feedback;
-            if (++i >= s_rv.comb_n[c][k]) i = 0;
-            s_rv.comb_i[c][k] = i;
-            acc += y;
-        }
-        for (k = 0; k < FV_APS; k++) {
-            float *b = s_rv.ap[c][k];
-            int i = s_rv.ap_i[c][k];
-            float bo = b[i];
-            b[i] = acc + bo * 0.5f;
-            acc = bo - acc;
-            if (++i >= s_rv.ap_n[c][k]) i = 0;
-            s_rv.ap_i[c][k] = i;
-        }
-        if (c == 0) *outl = acc * 3.0f;
-        else        *outr = acc * 3.0f;
+    Reverb *r = s_rv;
+    RvCoef *c = &r->cur;
+    const float glide = 0.002f;         /* ~10 ms */
+    float x, el = 0.0f, er = 0.0f, ll = 0.0f, lr = 0.0f, sum = 0.0f;
+    float out[RV_LINES];
+    int k;
+
+    if (__atomic_load_n(&r->pending, __ATOMIC_ACQUIRE)) {
+        uint32_t p[12];
+        memcpy(p, r->next, sizeof p);
+        __atomic_store_n(&r->pending, 0, __ATOMIC_RELEASE);
+        rv_coefs(p, &r->want);
     }
+    c->in_lp += (r->want.in_lp - c->in_lp) * glide;
+    c->refl += (r->want.refl - c->refl) * glide;
+    c->late += (r->want.late - c->late) * glide;
+    c->diff += (r->want.diff - c->diff) * glide;
+    c->refl_delay += (r->want.refl_delay - c->refl_delay) * glide;
+    c->late_delay += (r->want.late_delay - c->late_delay) * glide;
+    for (k = 0; k < RV_LINES; k++) {
+        c->fb[k] += (r->want.fb[k] - c->fb[k]) * glide;
+        c->damp[k] += (r->want.damp[k] - c->damp[k]) * glide;
+    }
+
+    /* Room HF on the way in, then the shared pre-delay. */
+    r->in_lp_z = (1.0f - c->in_lp) * in + c->in_lp * r->in_lp_z;
+    r->pre[r->pre_i] = r->in_lp_z;
+    if (++r->pre_i >= RV_PRE_MAX)
+        r->pre_i = 0;
+
+    /* Early reflections: taps after the reflections delay, alternating. */
+    for (k = 0; k < RV_TAPS; k++) {
+        float v = rv_pre_at(r, c->refl_delay + rv_tap_ms[k] * RV_RATE / 1000.0f) * rv_tap_g[k];
+        if (k & 1) er += v; else el += v;
+    }
+    el *= c->refl * 0.6f;
+    er *= c->refl * 0.6f;
+
+    /* Late reverb: diffusers, then the feedback delay network. */
+    x = rv_pre_at(r, c->late_delay);
+    for (k = 0; k < RV_DIFF; k++) {
+        float *b = r->diff[k];
+        int i = r->diff_i[k];
+        float bo = b[i], v = x + c->diff * bo;
+        b[i] = v;
+        x = bo - c->diff * v;
+        if (++i >= r->diff_n[k]) i = 0;
+        r->diff_i[k] = i;
+    }
+    for (k = 0; k < RV_LINES; k++) {
+        float y = r->line[k][r->line_i[k]];
+        r->line_lp[k] = (1.0f - c->damp[k]) * y + c->damp[k] * r->line_lp[k];
+        out[k] = r->line_lp[k] * c->fb[k];
+        sum += out[k];
+    }
+    sum *= 2.0f / RV_LINES;             /* Householder: I - 2/N 11^T */
+    for (k = 0; k < RV_LINES; k++) {
+        int i = r->line_i[k];
+        r->line[k][i] = out[k] - sum + x;
+        if (++i >= r->line_n[k]) i = 0;
+        r->line_i[k] = i;
+        if (k & 1) lr += out[k] * ((k & 2) ? -1.0f : 1.0f);
+        else       ll += out[k] * ((k & 4) ? -1.0f : 1.0f);
+    }
+    ll *= c->late * 0.5f;
+    lr *= c->late * 0.5f;
+    *outl = el + ll;
+    *outr = er + lr;
 }
 
 /* Unity below 0.75, then a tanh knee that never quite reaches 1. */
@@ -281,6 +456,18 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
                 if (s_rv_wet > 0.0f) {
                     float rl, rr;
                     reverb_tick(mixbins[10][i] * gain[10], &rl, &rr);
+                    if (s_rv_stats) {
+                        s_rv_e[0] += (double)left * left + (double)right * right;
+                        s_rv_e[1] += (double)mixbins[10][i] * gain[10] * mixbins[10][i] * gain[10];
+                        s_rv_e[2] += (double)(s_rv_wet * rl) * (s_rv_wet * rl) + (double)(s_rv_wet * rr) * (s_rv_wet * rr);
+                        if (++s_rv_n == 48000) {
+                            fprintf(stderr, "[REVERB] dry %.1f dB, send %.1f dB, wet %.1f dB\n",
+                                    10 * log10(s_rv_e[0] / 48000 + 1e-12), 10 * log10(s_rv_e[1] / 48000 + 1e-12),
+                                    10 * log10(s_rv_e[2] / 48000 + 1e-12));
+                            s_rv_e[0] = s_rv_e[1] = s_rv_e[2] = 0;
+                            s_rv_n = 0;
+                        }
+                    }
                     left += s_rv_wet * rl;
                     right += s_rv_wet * rr;
                 }
