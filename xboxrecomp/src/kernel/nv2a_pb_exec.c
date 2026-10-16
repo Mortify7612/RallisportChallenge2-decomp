@@ -4245,6 +4245,23 @@ static void flip_pace(void)
     next += period;
 }
 
+/* SET_BEGIN_END(END): draw what the batch accumulated. Three ways a batch
+ * can have arrived, and only one is in use at a time: vertices completed by
+ * SET_VERTEX4F, a payload written with INLINE_ARRAY, or indices into the
+ * title's own arrays. */
+static void end_batch(void)
+{
+    if (s_gpu.imm_count)
+        draw_immediate();
+    else if (s_gpu.inline_count)
+        draw_inline_array();
+    else
+        draw_primitive();
+    s_gpu.prim = 0;
+    s_gpu.inline_count = 0;
+    s_gpu.imm_count = 0;
+}
+
 /* The stream address of the current batch's BEGIN_END (for the draw log). */
 extern uint32_t g_nv2a_cmd_va;
 uint32_t g_nv2a_draw_pb_va;
@@ -4491,6 +4508,15 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         break;
 
     case NV097_SET_BEGIN_END:
+        /* A BEGIN while a batch is still open ends that batch first. D3D
+         * splits a big DrawVerticesUP this way: one method header carries at
+         * most 2047 words, so RalliSport Challenge 2's tree sprites (63 quads
+         * a chunk) arrive as BEGIN, INLINE_ARRAY, BEGIN, INLINE_ARRAY, END.
+         * Restarting threw the first chunk away, and whole stands of 2D trees
+         * vanished whenever two sprite runs merged past 63 quads. */
+        if (param && s_gpu.prim &&
+            (s_gpu.imm_count || s_gpu.inline_count || s_gpu.idx_count))
+            end_batch();
         if (param) {
             g_nv2a_draw_pb_va = g_nv2a_cmd_va;
             s_gpu.prim = param;
@@ -4498,18 +4524,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
         } else {
-            /* Three ways a batch can have arrived, and only one is in use at
-             * a time: vertices completed by SET_VERTEX4F, a payload written
-             * with INLINE_ARRAY, or indices into the title's own arrays. */
-            if (s_gpu.imm_count)
-                draw_immediate();
-            else if (s_gpu.inline_count)
-                draw_inline_array();
-            else
-                draw_primitive();
-            s_gpu.prim = 0;
-            s_gpu.inline_count = 0;
-            s_gpu.imm_count = 0;
+            end_batch();
         }
         break;
 
