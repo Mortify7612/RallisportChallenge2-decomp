@@ -2185,7 +2185,14 @@ static int vk_init(void)
         e = getenv("RECOMP_VK_PIPELINE");
         V.pipelined = e ? atoi(e) != 0 : 1;
         pci.queueFamilyIndex = V.qf;
+        /* Not transient on Android: Adreno's driver takes it as leave to
+         * hand the command memory back to the kernel at every pool reset
+         * and allocate it again (5% of the executor thread, every frame). */
+#if defined(__ANDROID__)
+        pci.flags = 0;
+#else
         pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+#endif
         cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cai.commandBufferCount = 2;
         qci.queryType = VK_QUERY_TYPE_OCCLUSION;
@@ -3328,6 +3335,23 @@ static void surf_upload(Surf *s)
     V.st_surf_up++;
 }
 
+/* alias_resolve's GPU clear: a clear-only surface over exactly cs's bytes
+ * that it will copy into cs. Then cs's bytes in guest RAM are of no use. */
+static int alias_clear_pending(const Surf *cs)
+{
+    uint32_t bytes = cs->swz ? cs->w * cs->h * cs->bpp : cs->rows * cs->pitch;
+    int i;
+    if (!V.rt_direct)
+        return 0;
+    for (i = 0; i < V.nsurf; i++) {
+        const Surf *q = &V.surf[i];
+        if (q != cs && q->dirty && q->clear_only && q->va == cs->va && surf_bytes(q) == bytes
+                && q->bpp == cs->bpp && q->fmt == cs->fmt)
+            return 1;
+    }
+    return 0;
+}
+
 static Surf *surf_get(const Nv2aVkState *st)
 {
     VkFormat fmt = surf_format(st);
@@ -3431,8 +3455,14 @@ static Surf *surf_get(const Nv2aVkState *st)
         uint64_t h;
         if (rows > s->rows)
             s->rows = rows;
-        h = surf_hash_now(s);
-        if (!s->hash_valid || h != s->hash) {
+        /* About to be cleared on the GPU by alias_resolve (all callers are
+         * begin_target's): uploading guest RAM first is wasted -- RSC2's
+         * shadow map, 1 MB a frame. */
+        if (alias_clear_pending(s))
+            h = s->hash, s->hash_valid = 0;
+        else
+            h = surf_hash_now(s);
+        if (!alias_clear_pending(s) && (!s->hash_valid || h != s->hash)) {
             static int trace = -1;
             static uint32_t shown;
             if (trace < 0)
