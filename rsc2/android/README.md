@@ -83,12 +83,21 @@ surface before it starts the game.
   Bluetooth and the right controls.
 - Menus and movies run at about 58 fps (GPU 2 ms/frame).
 - Races, measured with the race replay while driving, at the default 2×:
-  14–15 fps at first, **61 fps** now. Three fixes:
+  14–15 fps at first, **69–70 fps** now (phone cooled to 45 °C before each
+  run; a hot phone throttles and loses several fps). Fixes, in order:
   - The swapchain was rebuilt every frame, because Android reports
     "suboptimal" whenever the panel is rotated (46 fps).
   - The combiner shader runs at 16-bit precision.
   - A full clear now cancels a superseded shadow-map copy-back instead of
     waiting a frame for it (61 fps).
+  - Texture changes are checked sparsely on Android: 1/16 of each texture
+    every frame, plus a full check every 30 frames (+5%).
+  - Vertex fetch writes each vertex once, and runs of bulk pushbuffer
+    methods are handled in one call (+6%).
+
+Profiling: `simpleperf` from the NDK (`app_profiler.py -p io.github.rsc2recomp`)
+works on the debuggable APK. `build_apk.sh` keeps line tables in the
+unstripped `rsc2/build-android/libmain.so` for it.
 
 ## What differs from Linux
 

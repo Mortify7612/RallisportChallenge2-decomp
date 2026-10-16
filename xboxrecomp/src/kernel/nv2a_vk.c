@@ -253,6 +253,8 @@ typedef struct {
     uint32_t bytes;
     uint64_t hash;
     uint32_t epoch;             /* segment it was last validated in */
+    uint64_t shash;             /* hash_sparse of the same bytes */
+    uint32_t full_epoch;        /* when `hash` was last computed in full */
     uint32_t last_use;          /* frame */
     uint32_t levels;
     VkImage img;
@@ -445,6 +447,7 @@ static struct {
     int nhtex;
     uint32_t st_rt_copies;      /* surfaces copied on the GPU to sample */
     uint32_t st_passes;         /* render passes begun (tilers pay per pass) */
+    int cb_reset;               /* command buffers reset one by one, not by pool */
     uint32_t st_pass_clears;    /* vkCmdClearAttachments inside a pass */
     uint32_t st_alias_clears;   /* aliased clears carried over on the GPU */
     uint8_t *present_dump_px;
@@ -457,6 +460,7 @@ static struct {
     VkSampler last_samps[8];
     /* stats */
     uint32_t st_draws, st_tris, st_syncs, st_tex_up, st_tex_hash_mb, st_surf_up;
+    uint32_t st_surf_hash_kb;   /* surface bytes hashed (surf_hash_now) */
     uint32_t st_compiles, st_pipes_new;
     double st_compile_ms, st_pipe_ms;
 } V;
@@ -819,6 +823,38 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n)
     return h0 ^ (h1 * 31) ^ (h2 * 1009) ^ (h3 * 65599) ^ n;
 }
 
+/* 64 bytes of every kilobyte, and the last 64: a texture streamed into
+ * memory that held another changes every kilobyte, so this sees it at a
+ * sixteenth of the memory traffic. tex_get backs it with a full hash every
+ * TEX_FULL_EPOCHS, for writes that miss the sampled bytes. */
+#define TEX_SPARSE_MIN   (64u << 10)
+#define TEX_FULL_EPOCHS  30u
+static uint64_t hash_sparse(const uint8_t *p, size_t n)
+{
+    uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
+    size_t off;
+    for (off = 0; off + 64 <= n; off += 1024)
+        h = h * 31 + hash_bytes(p + off, 64);
+    return h * 31 + hash_bytes(p + n - 64, 64);
+}
+
+/* RECOMP_VK_TEX_HASH=sparse|full: how textures are checked for changes each
+ * epoch. Sparse by default on Android, where hashing every texture in full
+ * was a quarter of the pushbuffer thread; full elsewhere. */
+static int tex_hash_sparse(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_TEX_HASH");
+#if defined(__ANDROID__)
+        on = !(e && strcmp(e, "full") == 0);
+#else
+        on = e && strcmp(e, "sparse") == 0;
+#endif
+    }
+    return on;
+}
+
 static uint8_t *guest(uint32_t va)
 {
     return (uint8_t *)((uintptr_t)va + xbox_GetMemoryOffset());
@@ -1054,6 +1090,7 @@ static uint64_t surf_hash_now(Surf *s)
     uint32_t bytes = surf_bytes(s);
     if (s->hnow_ep != V.epoch + 1 || s->hnow_bytes != bytes) {
         s->hnow = hash_bytes(guest(s->va), bytes);
+        V.st_surf_hash_kb += bytes >> 10;
         s->hnow_ep = V.epoch + 1;
         s->hnow_bytes = bytes;
     }
@@ -1430,7 +1467,8 @@ static void slot_wait(Slot *sl, int kick, uint32_t nts)
                     V.gpu_ms += (double)(ts[k + 1] - ts[k]) * V.limits.timestampPeriod * 1e-6;
         vkResetQueryPool(V.dev, sl->tspool, 0, nts);
     }
-    vkResetCommandPool(V.dev, sl->pool, 0);
+    if (!V.cb_reset)
+        vkResetCommandPool(V.dev, sl->pool, 0);
 }
 
 /* Copy-backs that have landed into guest RAM. `deferred`: they are a
@@ -1446,16 +1484,22 @@ static void write_back(const RbEnt *list, int n, int deferred)
         mr.size = VK_WHOLE_SIZE;
         vkInvalidateMappedMemoryRanges(V.dev, 1, &mr);
     }
-    /* The bytes change under any surface aliasing them, too. */
-    for (i = 0; i < V.nsurf; i++)
-        V.surf[i].hnow_ep = 0;
     for (i = 0; i < n; i++) {
         Surf *s = list[i].s;
         uint32_t y, rows = list[i].rows;
+        int k;
         /* Gone (evicted, recreated), or emptied meanwhile (alias_resolve
          * moved its contents to another surface). */
         if (s->img != list[i].img || !s->dirty)
             continue;
+        /* The bytes change under any surface aliasing them, too -- only
+         * those: invalidating every surface's hash made each of them be
+         * hashed again the next epoch (6 MB a frame in a race). */
+        for (k = 0; k < V.nsurf; k++) {
+            Surf *q = &V.surf[k];
+            if (q->hnow_ep && q->va < s->va + surf_bytes(s) && s->va < q->va + surf_bytes(q))
+                q->hnow_ep = 0;
+        }
         if (s->swz)
             surf_swizzle(s, guest(s->va), V.rb.map + list[i].off, rows, 1);
         else
@@ -2185,14 +2229,17 @@ static int vk_init(void)
         e = getenv("RECOMP_VK_PIPELINE");
         V.pipelined = e ? atoi(e) != 0 : 1;
         pci.queueFamilyIndex = V.qf;
-        /* Not transient on Android: Adreno's driver takes it as leave to
-         * hand the command memory back to the kernel at every pool reset
-         * and allocate it again (5% of the executor thread, every frame). */
-#if defined(__ANDROID__)
-        pci.flags = 0;
-#else
-        pci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-#endif
+        /* RECOMP_VK_CB_RESET=1: command buffers reset one by one as they are
+         * begun, the pool never as a whole. Adreno's pool reset shows as 5%
+         * of the executor (kernel allocations), but resetting buffers one by
+         * one measured 2 fps slower on a Snapdragon 8 Gen 3 (59.8 against
+         * 61.9, alternating runs), so the pool reset stays the default. */
+        {
+            const char *e = getenv("RECOMP_VK_CB_RESET");
+            V.cb_reset = e && strcmp(e, "1") == 0;
+        }
+        pci.flags = V.cb_reset ? VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT
+                               : VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
         cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cai.commandBufferCount = 2;
         qci.queryType = VK_QUERY_TYPE_OCCLUSION;
@@ -3033,16 +3080,42 @@ static int tex_get(const Nv2aVkTex *t, VkImageView *view, uint32_t *levels_out)
         *levels_out = e->levels;
         return 1;
     }
-    h = hash_bytes(guest(d.offset), bytes);
-    if (d.palette && (d.color == 0x0B))
-        h ^= hash_bytes(guest(d.palette), 1024) * 3;
-    V.st_tex_hash_mb += bytes >> 10;
-    if (e->used && e->hash == h && e->bytes == bytes) {
-        e->epoch = V.epoch;
-        e->last_use = V.frame;
-        *view = e->view;
-        *levels_out = e->levels;
-        return 1;
+    {
+        /* Sparse check of a big texture known in full: unchanged samples,
+         * and a full hash not yet due (staggered by the entry's slot). */
+        uint32_t ix = (uint32_t)(e - V.tex);
+        uint64_t hs = 0;
+        int sparse = tex_hash_sparse() && bytes >= TEX_SPARSE_MIN;
+        if (sparse) {
+            hs = hash_sparse(guest(d.offset), bytes);
+            if (d.palette && (d.color == 0x0B))
+                hs ^= hash_bytes(guest(d.palette), 1024) * 3;
+            V.st_tex_hash_mb += (bytes >> 10) / 16;
+            if (e->used && e->bytes == bytes && e->shash == hs
+                    && V.epoch - e->full_epoch < TEX_FULL_EPOCHS
+                    && (V.epoch + ix) % TEX_FULL_EPOCHS != 0) {
+                e->epoch = V.epoch;
+                e->last_use = V.frame;
+                *view = e->view;
+                *levels_out = e->levels;
+                return 1;
+            }
+        }
+        h = hash_bytes(guest(d.offset), bytes);
+        if (d.palette && (d.color == 0x0B))
+            h ^= hash_bytes(guest(d.palette), 1024) * 3;
+        V.st_tex_hash_mb += bytes >> 10;
+        if (e->used && e->hash == h && e->bytes == bytes) {
+            e->epoch = V.epoch;
+            e->full_epoch = V.epoch;
+            e->shash = sparse ? hs : 0;
+            e->last_use = V.frame;
+            *view = e->view;
+            *levels_out = e->levels;
+            return 1;
+        }
+        e->shash = sparse ? hs : 0;
+        e->full_epoch = V.epoch;
     }
 
     /* New or changed: decode every face and level into the staging ring. */
@@ -6297,13 +6370,14 @@ void nv2a_vk_flush(void)
             fprintf(stderr, "  [VK] frame %u (last 120): draws %u tris %u syncs %u tex uploads %u"
                     " hashed %u MB surf uploads %u textures %u pipelines %d gpu-wait %.1f ms/frame"
                     " rt copies %u alias clears %u kicks %u gpu %.2f ms/frame spec %u/%u"
-                    " passes %u clears %u\n",
+                    " passes %u clears %u surf hashed %u MB\n",
                     V.frame, V.st_draws, V.st_tris, V.st_syncs, V.st_tex_up,
                     V.st_tex_hash_mb >> 10, V.st_surf_up, V.ntex, V.npipes, V.st_wait_ms / 120.0,
                     V.st_rt_copies, V.st_alias_clears, V.st_kicks, V.gpu_ms / 120.0,
                     V.st_spec_draws, V.st_spec_draws + V.st_uber_draws,
-                    V.st_passes, V.st_pass_clears);
+                    V.st_passes, V.st_pass_clears, V.st_surf_hash_kb >> 10);
             V.st_passes = V.st_pass_clears = 0;
+            V.st_surf_hash_kb = 0;
             V.st_wait_ms = 0;
             V.st_rt_copies = 0;
             V.st_alias_clears = 0;

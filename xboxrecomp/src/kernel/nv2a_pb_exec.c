@@ -574,11 +574,10 @@ static void fetch_attr_run(const VertexAttr *a, uint32_t lo, const uint32_t *idx
     const uint8_t *base;
     uint32_t j, i, n, maxi;
 
-    for (j = 0; j < nv; j++) {
-        float *o = out + (size_t)j * ostride;
-        o[0] = o[1] = o[2] = 0.0f;
-        o[3] = 1.0f;
-    }
+    /* The fast paths below write all four components of every vertex --
+     * the attribute's, then the (0, 0, 0, 1) defaults -- so only the slow
+     * path needs the defaults first. Filling them for every vertex before
+     * overwriting them was 5% of the executor on a phone. */
     if (!a->size || !a->stride || !a->offset)
         goto slow;                  /* inline offset 0 is legal: per vertex */
     if (s_gpu.inline_active) {
@@ -600,34 +599,52 @@ static void fetch_attr_run(const VertexAttr *a, uint32_t lo, const uint32_t *idx
         float *o = out + (size_t)j * ostride; \
         body \
     }
+/* Components n..3 of a vertex: the (0, 0, 0, 1) defaults. */
+#define FETCH_REST(n) \
+    do { if ((n) < 1) o[0] = 0.0f; if ((n) < 2) o[1] = 0.0f; \
+         if ((n) < 3) o[2] = 0.0f; if ((n) < 4) o[3] = 1.0f; } while (0)
     switch (a->type) {
     case 0:
         FETCH_LOOP(o[0] = (float)p[2] / 255.0f; o[1] = (float)p[1] / 255.0f;
                    o[2] = (float)p[0] / 255.0f; o[3] = (float)p[3] / 255.0f;)
         return;
-    case 2:
-        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = ((const float *)p)[i];)
-        return;
+    case 2: {
+        /* Unrolled for the sizes titles use: positions, normals, UVs. */
+        const float *f;
+        switch (n) {
+        case 4: FETCH_LOOP(f = (const float *)p; o[0] = f[0]; o[1] = f[1]; o[2] = f[2]; o[3] = f[3];) return;
+        case 3: FETCH_LOOP(f = (const float *)p; o[0] = f[0]; o[1] = f[1]; o[2] = f[2]; o[3] = 1.0f;) return;
+        case 2: FETCH_LOOP(f = (const float *)p; o[0] = f[0]; o[1] = f[1]; o[2] = 0.0f; o[3] = 1.0f;) return;
+        default: FETCH_LOOP(o[0] = ((const float *)p)[0]; o[1] = o[2] = 0.0f; o[3] = 1.0f;) return;
+        }
+    }
     case 4:
-        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)p[i] / 255.0f;)
+        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)p[i] / 255.0f; FETCH_REST(n);)
         return;
     case 1:
-        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)((const int16_t *)p)[i] / 32767.0f;)
+        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)((const int16_t *)p)[i] / 32767.0f; FETCH_REST(n);)
         return;
     case 5:
-        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)((const int16_t *)p)[i];)
+        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)((const int16_t *)p)[i]; FETCH_REST(n);)
         return;
     case 6:
         FETCH_LOOP(uint32_t v = *(const uint32_t *)p;
                    o[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
                    o[1] = (float)((int32_t)(v << 10) >> 21) / 1023.0f;
-                   o[2] = (float)((int32_t)v >> 22) / 511.0f;)
+                   o[2] = (float)((int32_t)v >> 22) / 511.0f;
+                   o[3] = 1.0f;)
         return;
     default:
         break;
     }
+#undef FETCH_REST
 #undef FETCH_LOOP
 slow:
+    for (j = 0; j < nv; j++) {
+        float *o = out + (size_t)j * ostride;
+        o[0] = o[1] = o[2] = 0.0f;
+        o[3] = 1.0f;
+    }
     for (j = 0; j < nv; j++)
         fetch_attr(a, idx ? idx[j] : lo + j, out + (size_t)j * ostride);
 }
@@ -3217,6 +3234,32 @@ static int vk_program_batch(void)
     for (i = 0; i < kk; i++)
         fetch_attr_run(&s_gpu.attr[ins[i]], ranged ? lo : 0, ranged ? NULL : s_gpu.idx,
                        nv, vin + (size_t)i * 4, (size_t)k * 4);
+    {
+        /* RECOMP_PB_FETCH_CHECK=1: every batch fetched again vertex by
+         * vertex (fetch_attr), compared bit for bit with the fast path. */
+        static int check = -1;
+        static unsigned long batches, bad;
+        if (check < 0)
+            check = getenv("RECOMP_PB_FETCH_CHECK") != NULL;
+        if (check) {
+            uint32_t jj;
+            float ref[4];
+            batches++;
+            for (i = 0; i < kk; i++)
+                for (jj = 0; jj < nv; jj++) {
+                    fetch_attr(&s_gpu.attr[ins[i]],
+                               ranged ? lo + jj : s_gpu.idx[jj], (ref[0] = ref[1] = ref[2] = 0.0f, ref[3] = 1.0f, ref));
+                    if (memcmp(ref, vin + (size_t)jj * k * 4 + (size_t)i * 4, sizeof ref) && bad++ < 20)
+                        fprintf(stderr, "[FETCHCHK] attr %u type %u size %u vertex %u: "
+                                "%g %g %g %g vs %g %g %g %g\n", ins[i], s_gpu.attr[ins[i]].type,
+                                s_gpu.attr[ins[i]].size, jj, ref[0], ref[1], ref[2], ref[3],
+                                vin[(size_t)jj * k * 4 + i * 4], vin[(size_t)jj * k * 4 + i * 4 + 1],
+                                vin[(size_t)jj * k * 4 + i * 4 + 2], vin[(size_t)jj * k * 4 + i * 4 + 3]);
+                }
+            if (batches % 100000 == 0)
+                fprintf(stderr, "[FETCHCHK] %lu batches, %lu mismatches\n", batches, bad);
+        }
+    }
     k = vk_tri_list(n);
     if (ranged)
         for (i = 0; i < k; i++)
@@ -4338,6 +4381,53 @@ static void end_batch(void)
 /* The stream address of the current batch's BEGIN_END (for the draw log). */
 extern uint32_t g_nv2a_cmd_va;
 uint32_t g_nv2a_draw_pb_va;
+
+/* A run of `count` words for one method header, from pb_walk: the bulk
+ * methods -- inline vertex data, index lists, vertex constant uploads --
+ * handled in one loop instead of one nv2a_pb_exec_method call per word,
+ * whose entry checks were a tenth of the executor on a phone. Returns how
+ * many words it consumed; 0 for anything else, which then goes word by word.
+ * Frame traces (s_ftrace) keep the word-by-word path, so they see it all. */
+uint32_t nv2a_pb_exec_bulk(uint32_t subch, uint32_t method, int noninc,
+                           const uint32_t *w, uint32_t count)
+{
+    uint32_t i;
+    if (subch != 0 || s_ftrace == 2 || !count)
+        return 0;
+    if (!noninc) {
+        if (method >= 0x0B80 && method + count * 4 <= 0x0C00) {  /* TRANSFORM_CONSTANT(i) */
+            for (i = 0; i < count; i++)
+                nv2a_vsh_constant_word(w[i]);
+            return count;
+        }
+        return 0;
+    }
+    switch (method) {
+    case NV097_INLINE_ARRAY:
+        if (s_gpu.prim) {
+            uint32_t n = count;
+            if (n > NV_MAX_INLINE - s_gpu.inline_count)
+                n = NV_MAX_INLINE - s_gpu.inline_count;
+            memcpy(s_gpu.inline_buf + s_gpu.inline_count, w, (size_t)n * 4);
+            s_gpu.inline_count += n;
+        }
+        return count;
+    case NV097_ARRAY_ELEMENT16:
+        if (s_gpu.prim)
+            for (i = 0; i < count && s_gpu.idx_count + 2 <= NV_MAX_INDICES; i++) {
+                s_gpu.idx[s_gpu.idx_count++] = w[i] & 0xFFFF;
+                s_gpu.idx[s_gpu.idx_count++] = w[i] >> 16;
+            }
+        return count;
+    case 0x1808:                                  /* ARRAY_ELEMENT32 */
+        if (s_gpu.prim)
+            for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
+                s_gpu.idx[s_gpu.idx_count++] = w[i];
+        return count;
+    default:
+        return 0;
+    }
+}
 
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {

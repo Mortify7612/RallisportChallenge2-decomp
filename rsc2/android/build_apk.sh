@@ -7,7 +7,8 @@
 #
 # Environment: ANDROID_SDK (default ~/Android/Sdk), JAVA_HOME (a JDK 17+,
 # default ~/Android/jdk21), NDK_VERSION, BUILD_TOOLS, PLATFORM to override
-# the newest installed ones.
+# the newest installed ones. RSC2_ANDROID_CFLAGS (default -gline-tables-only:
+# line numbers for simpleperf, stripped from the APK's copy).
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -32,6 +33,7 @@ done
 cmake -S "$root/rsc2" -B "$OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+    "-DCMAKE_C_FLAGS=${RSC2_ANDROID_CFLAGS:--gline-tables-only}" \
     -DXBOXRECOMP_GLSLC="$(command -v glslc)" \
     -DXBOXRECOMP_GLSLANG_INCLUDE="$TP/include" \
     -DXBOXRECOMP_GLSLANG_LIB="$TP/lib/libglslang.a" \

@@ -218,8 +218,24 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
             uint32_t subch  = (w >> 13) & 7u;
             uint32_t method =  w & 0x1FFCu;
             int noninc = (w & 0xE0000000u) == 0x40000000u;
+            uint32_t i0 = 0;
 
-            for (uint32_t i = 0; i < count && va < end_va; i++) {
+            /* Bulk methods in one call (nv2a_pb_exec_bulk); the survey,
+             * when on, still sees every word below. */
+            if (s_exec_enabled && !s_scan_enabled && count) {
+                extern uint32_t nv2a_pb_exec_bulk(uint32_t, uint32_t, int,
+                                                  const uint32_t *, uint32_t);
+                uint32_t n = count, done;
+                if (n > (end_va - va) / 4)
+                    n = (end_va - va) / 4;
+                g_nv2a_cmd_va = in_call ? s_call_site : va;
+                done = n ? nv2a_pb_exec_bulk(subch, method, noninc,
+                                             (const uint32_t *)(mem + va), n) : 0;
+                va += done * 4;
+                words += done;
+                i0 = done;
+            }
+            for (uint32_t i = i0; i < count && va < end_va; i++) {
                 uint32_t m = noninc ? method : method + i * 4;
                 if (s_scan_enabled)
                     note(subch, m);
