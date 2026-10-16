@@ -152,6 +152,44 @@ Rebuilding `third_party/mingw`:
   x86_64-w64-mingw32-dlltool -d third_party/vulkan-1.def -l third_party/mingw/lib/libvulkan-1.a
   ```
 
+## ARM64 test build (Linux on aarch64, run under qemu)
+
+This build is groundwork for an Android port, not a release. It lets the
+ARM-specific parts be built and tested on this PC. Those parts are the
+fault-trapped device registers (decoded as AArch64 instructions), the signal
+frame layout and the absence of a trap flag. The build uses clang and lld
+against an Arch Linux ARM sysroot and runs under `qemu-aarch64`, about 4×
+slower than native x86.
+
+```sh
+python3 -I rsc2/tools/arm64/make_sysroot.py third_party/sysroot-aarch64
+cmake -S rsc2 -B rsc2/build-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_TOOLCHAIN_FILE=$PWD/rsc2/cmake/aarch64-linux.cmake \
+      -DRSC2_SYSROOT=$PWD/third_party/sysroot-aarch64
+ninja -C rsc2/build-arm64
+ln -s ../../RalliSport2 rsc2/build-arm64/game
+rsc2/tools/arm64/run_qemu.sh RECOMP_FB_WINDOW=0 RECOMP_VULKAN=0 RECOMP_AUDIO=0 \
+      RSC2_INPUT_REPLAY=../../work/my_run2.xi RECOMP_FB_DUMP_AT=/tmp/arm:600,1200
+```
+
+`make_sysroot.py` needs `bsdtar` and network access; the sysroot is about
+900 MB. The toolchain file needs `clang`, `lld` and the host's `glslc`.
+
+What has been checked: headless, with the software renderer, the ARM build
+plays the intro movie and goes through the menus and car selection into a
+race. The USB pads, APU, AC'97 and GPU interrupt registers are all serviced
+by the AArch64 decoder. Up to the race the frames match the x86 build to
+within the noise between two x86 runs. Past that point not even two x86 runs
+agree, because the replay is not bit-exact.
+
+What qemu cannot check: x86 orders memory accesses strictly and ARM does
+not. Under qemu the ARM code runs on x86 hardware and inherits its ordering,
+so a race between the game's threads only shows on a real ARM CPU. The ARM
+build therefore defaults to `RECOMP_GUEST_LOCK=1`, which runs one guest
+thread at a time, as on the Xbox's single CPU. With the lock on, the x86
+build plays the same replay through to the race no slower. `RECOMP_GUEST_LOCK=0`
+turns it off.
+
 ## Useful switches (environment variables)
 
 Defaults are baked into `src/main.c`; `NAME=0` turns one off.

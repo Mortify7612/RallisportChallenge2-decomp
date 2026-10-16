@@ -345,7 +345,9 @@ static const struct { uint32_t offset; uint32_t idle_mask; } NV2A_IDLE[] = {
 
 static void *g_ac97_page = NULL;      /* host address of the trapped page */
 static void *g_ac97_veh  = NULL;
-static RECOMP_TLS int s_ac97_stepping = 0;
+#if !defined(__aarch64__)
+static RECOMP_TLS int s_ac97_stepping = 0;   /* x86: the write is being trap-stepped */
+#endif
 
 static void ac97_clear_reset_bits(void)
 {
@@ -1604,7 +1606,9 @@ static uint32_t g_watch_va;
 static void    *g_watch_page;
 static uint32_t g_watch_last;
 static void    *g_watch_veh;
+#if !defined(__aarch64__)
 static RECOMP_TLS int s_watch_stepping;
+#endif
 
 /* A plausible guest code address: inside the image's executable sections,
  * as recorded from the section headers at load. */

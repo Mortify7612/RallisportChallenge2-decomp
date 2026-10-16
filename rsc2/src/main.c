@@ -544,6 +544,13 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
             { "RECOMP_NV2A_IRQ",      "1" },  /* PMC/PTIMER/PCRTC model */
             { "RECOMP_VULKAN",        "1" },  /* GPU renderer */
             { "RECOMP_VK_SCALE",      "2" },  /* 2x internal resolution */
+#if defined(__aarch64__)
+            /* ARM may reorder memory accesses that x86 keeps in order, and
+             * the game's threads were written for the Xbox's single CPU:
+             * run one guest thread at a time. Costs nothing measurable on
+             * x86 (same race replay, no slower). */
+            { "RECOMP_GUEST_LOCK",    "1" },
+#endif
         };
         size_t k;
         /* Recording or replaying input (rsc2_overrides.c, XInputGetState)
