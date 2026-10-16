@@ -148,7 +148,7 @@ static const uint32_t s_frag_fast_spv[] =
 #define VK_MAX_ZETA    8
 #define VK_MAX_PIPES   4096          /* power of two: hashed */
 #define VK_MAX_PROGS   1024          /* power of two */
-#define VK_PROG_VERSION 9            /* translated-program cache files */
+#define VK_PROG_VERSION 10           /* translated-program cache files */
 #define VK_MAX_SAMPLERS 512
 #define VK_TEX_SLOTS   8192          /* power of two */
 #define VK_MAX_RETIRED 4096
@@ -5673,8 +5673,11 @@ static const char k_prog_tail[] =
      * squeezed towards the centre, so the 3D view is widened rather than
      * stretched and the HUD keeps its proportions -- except flat (w = 1)
      * vertices on the screen's edges, which keep full-screen passes
-     * (colour grading, fades) covering the whole screen. */
-    "    if (abs(w - 1.0) > 1e-5 || abs(ndc.x) < 0.999) ndc.x *= u.wide.x;\n"
+     * (colour grading, fades) covering the whole screen. "On the edge" is
+     * within a title pixel of it: D3D's half-pixel offset puts a full-screen
+     * quad at -0.5 .. 639.5, just outside on the left and just inside on the
+     * right, which a tighter test pinned on one side only. */
+    "    if (abs(w - 1.0) > 1e-5 || abs(ndc.x) < 1.0 - u.vp.x * 1.01) ndc.x *= u.wide.x;\n"
     "    gl_Position = vec4(ndc * w, u.vp.w == 2.0 ? WREV_C : R[12].z * u.vp.z * w, w);\n"
     "    v_zs = R[12].z * u.vp.z;\n"
     /* oD0/oD1 are clamped to [0,1] by the hardware before interpolation
