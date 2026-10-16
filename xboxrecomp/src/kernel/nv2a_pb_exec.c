@@ -618,15 +618,27 @@ static void fetch_attr_run(const VertexAttr *a, uint32_t lo, const uint32_t *idx
         default: FETCH_LOOP(o[0] = ((const float *)p)[0]; o[1] = o[2] = 0.0f; o[3] = 1.0f;) return;
         }
     }
+    /* The integer formats, unrolled by size the same way: RSC2's vertices
+ * are mostly 16-bit (type 5), and the per-component loop was the
+ * executor's hottest line on a phone. */
+#define FETCH_SIZED(T, SCALE) \
+        switch (n) { \
+        case 4: FETCH_LOOP(const T *q = (const T *)p; o[0] = (float)q[0] SCALE; o[1] = (float)q[1] SCALE; \
+                           o[2] = (float)q[2] SCALE; o[3] = (float)q[3] SCALE;) return; \
+        case 3: FETCH_LOOP(const T *q = (const T *)p; o[0] = (float)q[0] SCALE; o[1] = (float)q[1] SCALE; \
+                           o[2] = (float)q[2] SCALE; o[3] = 1.0f;) return; \
+        case 2: FETCH_LOOP(const T *q = (const T *)p; o[0] = (float)q[0] SCALE; o[1] = (float)q[1] SCALE; \
+                           o[2] = 0.0f; o[3] = 1.0f;) return; \
+        default: FETCH_LOOP(const T *q = (const T *)p; o[0] = (float)q[0] SCALE; o[1] = o[2] = 0.0f; \
+                            o[3] = 1.0f;) return; \
+        }
     case 4:
-        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)p[i] / 255.0f; FETCH_REST(n);)
-        return;
+        FETCH_SIZED(uint8_t, / 255.0f)
     case 1:
-        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)((const int16_t *)p)[i] / 32767.0f; FETCH_REST(n);)
-        return;
+        FETCH_SIZED(int16_t, / 32767.0f)
     case 5:
-        FETCH_LOOP(for (i = 0; i < n; i++) o[i] = (float)((const int16_t *)p)[i]; FETCH_REST(n);)
-        return;
+        FETCH_SIZED(int16_t, )
+#undef FETCH_SIZED
     case 6:
         FETCH_LOOP(uint32_t v = *(const uint32_t *)p;
                    o[0] = (float)((int32_t)(v << 21) >> 21) / 1023.0f;
@@ -4413,16 +4425,25 @@ uint32_t nv2a_pb_exec_bulk(uint32_t subch, uint32_t method, int noninc,
         }
         return count;
     case NV097_ARRAY_ELEMENT16:
-        if (s_gpu.prim)
-            for (i = 0; i < count && s_gpu.idx_count + 2 <= NV_MAX_INDICES; i++) {
-                s_gpu.idx[s_gpu.idx_count++] = w[i] & 0xFFFF;
-                s_gpu.idx[s_gpu.idx_count++] = w[i] >> 16;
+        if (s_gpu.prim) {
+            uint32_t n = (NV_MAX_INDICES - s_gpu.idx_count) / 2, *d = s_gpu.idx + s_gpu.idx_count;
+            if (n > count)
+                n = count;
+            for (i = 0; i < n; i++) {
+                d[2 * i] = w[i] & 0xFFFF;
+                d[2 * i + 1] = w[i] >> 16;
             }
+            s_gpu.idx_count += 2 * n;
+        }
         return count;
     case 0x1808:                                  /* ARRAY_ELEMENT32 */
-        if (s_gpu.prim)
-            for (i = 0; i < count && s_gpu.idx_count < NV_MAX_INDICES; i++)
-                s_gpu.idx[s_gpu.idx_count++] = w[i];
+        if (s_gpu.prim) {
+            uint32_t n = NV_MAX_INDICES - s_gpu.idx_count;
+            if (n > count)
+                n = count;
+            memcpy(s_gpu.idx + s_gpu.idx_count, w, (size_t)n * 4);
+            s_gpu.idx_count += n;
+        }
         return count;
     default:
         return 0;
