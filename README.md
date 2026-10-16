@@ -15,6 +15,8 @@ repository either.
 - Vulkan renderer at up to 6x internal resolution, with the game's own
   16:9 widescreen mode, and frame rates above 60 (the game keeps time by the
   clock).
+- Optional extras the original never had: MSAA, anisotropic filtering and
+  ambient occlusion.
 - Sound through SDL2: per-voice resampling, speaker mixdown, reverb.
 - Keyboard and SDL game controllers, with rumble.
 - A pre-game launcher for resolution, aspect ratio, GPU, display mode, frame

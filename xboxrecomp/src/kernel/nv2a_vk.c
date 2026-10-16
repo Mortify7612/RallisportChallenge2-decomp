@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 
 #if !defined(XBOXRECOMP_HAVE_VULKAN)
@@ -135,6 +136,15 @@ typedef struct {
      * colour: the same bytes in any layout (alias_resolve). */
     int clear_only;
     uint32_t clear_argb;
+    /* RECOMP_VK_MSAA: a multisampled twin the scene is drawn into, `msh`
+     * title rows tall; every pass resolves it into `img`, which stays what
+     * everything else reads. `ms_stale`: `img` was written directly (an
+     * upload, a clear) and the twin must be refreshed from it first. */
+    VkImage msimg;
+    VkDeviceMemory msmem;
+    VkImageView msview;
+    uint32_t msh;
+    int ms_stale;
 } Surf;
 
 /* A surface the title samples as a texture, copied on the GPU (rt_tex), or
@@ -155,9 +165,11 @@ typedef struct {
 
 typedef struct {
     uint32_t key, w, h;
+    uint32_t samples;           /* 1, or RECOMP_VK_MSAA for a twin's depth */
     VkImage img;
     VkDeviceMemory mem;
     VkImageView view;
+    VkImageView dview;          /* depth only, for sampling (AO); lazy */
     uint32_t last_use;
 } Zeta;
 
@@ -212,6 +224,26 @@ static struct {
     VkPhysicalDeviceLimits limits;
     VkFormat dsfmt;
     int depth_clamp;
+    float aniso;                    /* RECOMP_VK_ANISO, clamped; <= 1 off */
+    uint32_t msaa;                  /* RECOMP_VK_MSAA sample count, 1 off */
+    uint32_t cur_samples;           /* of the rendering instance */
+    uint8_t qsamples[VK_MAX_QUERIES], fqsamples[VK_MAX_QUERIES];
+    /* Fullscreen passes (post_*): one or two images in, push constants. */
+    VkDescriptorSetLayout post_dsl;
+    VkPipelineLayout post_pl;
+    VkShaderModule post_vs;
+    VkSampler post_samp;
+    VkPipeline up_pipe;             /* resolved image -> multisampled twin */
+    uint32_t st_ms_refresh, st_ao;
+    /* RECOMP_VK_AO: ambient occlusion on the presented scene (ao_*). */
+    int ao_on;
+    float ao_radius, ao_intensity, ao_bias, ao_far, ao_near, ao_tan;
+    VkImage ao_img;
+    VkDeviceMemory ao_mem;
+    VkImageView ao_view;
+    VkPipeline ao_pipe[2], ao_apply[2];   /* [1]: multisampled depth/target */
+    uint32_t flip_va[2];                  /* the last two presented surfaces */
+    uint32_t ao_frame, ao_zdraws, ao_done;
     VkCommandPool pool;
     VkCommandBuffer ucb, dcb;
     VkFence fence;
@@ -527,6 +559,9 @@ static void *ring_alloc(Ring *rg, VkDeviceSize n, VkDeviceSize align,
     return rg->map + o;
 }
 
+/* Samples for the next image_create; set around the multisampled ones. */
+static uint32_t s_img_samples = 1;
+
 static int image_create(uint32_t w, uint32_t h, uint32_t levels, uint32_t layers,
                         VkFormat fmt, VkImageUsageFlags usage, int cube,
                         VkImageAspectFlags aspect, VkImage *img,
@@ -544,7 +579,7 @@ static int image_create(uint32_t w, uint32_t h, uint32_t levels, uint32_t layers
     ci.extent.depth = 1;
     ci.mipLevels = levels;
     ci.arrayLayers = layers;
-    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.samples = (VkSampleCountFlagBits)s_img_samples;
     ci.tiling = VK_IMAGE_TILING_OPTIMAL;
     ci.usage = usage;
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -643,6 +678,7 @@ static void end_rendering(void)
     V.rendering = 0;
     V.cur_cs = NULL;
     V.cur_zs = NULL;
+    V.cur_samples = 1;
 }
 
 static uint64_t hash_bytes(const uint8_t *p, size_t n)
@@ -952,8 +988,8 @@ static void reports_resolve(void)
                 != VK_SUCCESS)
             memset(raw, 0, sizeof raw);
         res[0] = 0;
-        for (q = 0; q < V.nq; q++)
-            res[q + 1] = res[q] + raw[q];     /* prefix sums */
+        for (q = 0; q < V.nq; q++)            /* prefix sums, in pixels */
+            res[q + 1] = res[q] + raw[q] / (V.qsamples[q] > 1 ? V.qsamples[q] : 1);
     } else {
         res[0] = 0;
     }
@@ -1271,7 +1307,7 @@ static void vk_sync_inner(int readback)
                 && s_dlog)
             for (k = 0; k < V.nfq; k++)
                 fprintf(s_dlog, "Q F%u D%u %llu\n", V.fq_frame[k], V.fq_seq[k],
-                        (unsigned long long)raw[k]);
+                        (unsigned long long)(raw[k] / (V.fqsamples[k] > 1 ? V.fqsamples[k] : 1)));
         vkResetQueryPool(V.dev, V.fqpool, 0, V.nfq);
         V.nfq = 0;
     }
@@ -1429,6 +1465,162 @@ static int white_images(void)
     return V.state != -1;
 }
 
+static int glsl_to_spirv(const char *src, uint32_t hash, int frag, uint32_t **words, size_t *bytes);
+static void ao_init(void);
+
+static VkShaderModule glsl_module(const char *src, int frag)
+{
+    uint32_t *w = NULL;
+    size_t n = 0;
+    VkShaderModule m;
+    if (!glsl_to_spirv(src, 0xF0110000u + (uint32_t)frag, frag, &w, &n))
+        return VK_NULL_HANDLE;
+    m = shader(w, n);
+    free(w);
+    return m;
+}
+
+/* A fullscreen-triangle pipeline (fragment shader `fs`) drawing into one
+ * `fmt` attachment of `samples`, no depth. `blend`: 0 replace, 1 multiply
+ * the colour (alpha kept). */
+static VkPipeline post_pipeline(VkShaderModule fs, VkFormat fmt, uint32_t samples, int blend)
+{
+    VkPipelineShaderStageCreateInfo st[2];
+    VkPipelineVertexInputStateCreateInfo vi = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+    VkPipelineInputAssemblyStateCreateInfo ia = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
+    VkPipelineViewportStateCreateInfo vps = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
+    VkPipelineRasterizationStateCreateInfo rs = { VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO };
+    VkPipelineMultisampleStateCreateInfo ms = { VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO };
+    VkPipelineDepthStencilStateCreateInfo ds = { VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+    VkPipelineColorBlendAttachmentState ba;
+    VkPipelineColorBlendStateCreateInfo bs = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
+    static const VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+    VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
+    VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
+    VkGraphicsPipelineCreateInfo gp = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
+    VkPipeline p;
+    memset(st, 0, sizeof st);
+    st[0].sType = st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    st[0].module = V.post_vs;
+    st[0].pName = "main";
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    st[1].module = fs;
+    st[1].pName = "main";
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    vps.viewportCount = vps.scissorCount = 1;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.lineWidth = 1.0f;
+    ms.rasterizationSamples = (VkSampleCountFlagBits)samples;
+    ds.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    memset(&ba, 0, sizeof ba);
+    ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                      | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    if (blend == 1) {
+        ba.blendEnable = VK_TRUE;
+        ba.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
+        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        ba.colorBlendOp = VK_BLEND_OP_ADD;
+        ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                          | VK_COLOR_COMPONENT_B_BIT;
+    }
+    bs.attachmentCount = 1;
+    bs.pAttachments = &ba;
+    dy.dynamicStateCount = 2;
+    dy.pDynamicStates = dyn;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachmentFormats = &fmt;
+    gp.pNext = &ri;
+    gp.stageCount = 2;
+    gp.pStages = st;
+    gp.pVertexInputState = &vi;
+    gp.pInputAssemblyState = &ia;
+    gp.pViewportState = &vps;
+    gp.pRasterizationState = &rs;
+    gp.pMultisampleState = &ms;
+    gp.pDepthStencilState = &ds;
+    gp.pColorBlendState = &bs;
+    gp.pDynamicState = &dy;
+    gp.layout = V.post_pl;
+    if (vkCreateGraphicsPipelines(V.dev, V.pcache, 1, &gp, NULL, &p) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    return p;
+}
+
+/* Fullscreen passes: their layout and vertex shader, and the MSAA setting. */
+static void post_init(void)
+{
+    static const char *vs_src =
+        "#version 450\n"
+        "void main() {\n"
+        "    vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);\n"
+        "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+        "}\n";
+    static const char *up_src =
+        "#version 450\n"
+        "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+        "layout(location = 0) out vec4 o;\n"
+        "void main() { o = texelFetch(src, ivec2(gl_FragCoord.xy), 0); }\n";
+    VkDescriptorSetLayoutBinding b[2];
+    VkDescriptorSetLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    VkPushConstantRange pr;
+    VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    VkSamplerCreateInfo sci = { VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+    const char *e;
+
+    memset(b, 0, sizeof b);
+    b[0].binding = 0;
+    b[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    b[0].descriptorCount = 1;
+    b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    b[1] = b[0];
+    b[1].binding = 1;
+    lci.bindingCount = 2;
+    lci.pBindings = b;
+    pr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    pr.offset = 0;
+    pr.size = 64;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &V.post_dsl;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &pr;
+    sci.magFilter = sci.minFilter = VK_FILTER_NEAREST;
+    sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sci.maxLod = 0.25f;
+    if (vkCreateDescriptorSetLayout(V.dev, &lci, NULL, &V.post_dsl) != VK_SUCCESS
+            || vkCreatePipelineLayout(V.dev, &plci, NULL, &V.post_pl) != VK_SUCCESS
+            || vkCreateSampler(V.dev, &sci, NULL, &V.post_samp) != VK_SUCCESS
+            || !(V.post_vs = glsl_module(vs_src, 0))) {
+        fprintf(stderr, "  [VK] fullscreen passes unavailable\n");
+        V.post_pl = VK_NULL_HANDLE;
+        V.msaa = 1;
+        return;
+    }
+
+    /* RECOMP_VK_MSAA=<2|4|8>: multisampled scene targets, as many samples as
+     * the GPU allows for both colour and depth. */
+    e = getenv("RECOMP_VK_MSAA");
+    V.msaa = 1;
+    if (e && atoi(e) > 1) {
+        VkSampleCountFlags ok = V.limits.framebufferColorSampleCounts
+                              & V.limits.framebufferDepthSampleCounts
+                              & V.limits.framebufferStencilSampleCounts;
+        uint32_t want = (uint32_t)atoi(e), n;
+        for (n = 8; n > 1; n >>= 1)
+            if (n <= want && (ok & n))
+                break;
+        if (n > 1) {
+            VkShaderModule fs = glsl_module(up_src, 1);
+            V.up_pipe = fs ? post_pipeline(fs, VK_FORMAT_B8G8R8A8_UNORM, n, 0) : VK_NULL_HANDLE;
+            if (V.up_pipe) {
+                V.msaa = n;
+                fprintf(stderr, "  [VK] MSAA %ux on the scene targets\n", n);
+            }
+        }
+    }
+}
+
 static int vk_init(void)
 {
     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
@@ -1564,6 +1756,17 @@ static int vk_init(void)
         f2.features.largePoints = have.largePoints;
         f2.features.wideLines = have.wideLines;
         V.wide_lines = have.wideLines;
+        /* RECOMP_VK_ANISO=<2..16>: anisotropic filtering for the title's
+         * mipmapped textures, which sharpens road and terrain at grazing
+         * angles. The NV2A has it too, but the title never asks. */
+        {
+            const char *e = getenv("RECOMP_VK_ANISO");
+            float a = e ? (float)atof(e) : 0.0f;
+            if (a > 1.0f && have.samplerAnisotropy) {
+                f2.features.samplerAnisotropy = VK_TRUE;
+                V.aniso = a;
+            }
+        }
         dci.pNext = &f2;
         {
             static const char *swext[1] = { "VK_KHR_swapchain" };
@@ -1756,6 +1959,9 @@ static int vk_init(void)
     }
     if (!white_images())
         return 0;
+    post_init();
+    ao_init();
+    V.cur_samples = 1;
     fprintf(stderr, "  [VK] renderer up: depth format %d, depth clamp %d, scale %ux\n",
             (int)V.dsfmt, V.depth_clamp, V.scale);
     if (V.sx != V.scale)
@@ -1851,6 +2057,7 @@ static uint32_t depth_func_rev(uint32_t f)
 typedef struct {
     VkFormat cfmt;
     int has_depth, blend;
+    uint32_t samples;
     uint32_t cm, beq, sf, df, topo, ninputs;
     VkShaderModule vs, fs;
 } PipeDesc;
@@ -1920,7 +2127,7 @@ static VkPipeline pipe_build(const PipeDesc *d, int count)
     rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     /* Lines one title pixel wide at whatever scale the GPU renders. */
     rs.lineWidth = V.wide_lines ? (float)V.scale : 1.0f;
-    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    ms.rasterizationSamples = (VkSampleCountFlagBits)(d->samples ? d->samples : 1);
     ds.depthCompareOp = VK_COMPARE_OP_ALWAYS;
     ds.maxDepthBounds = 1.0f;
     memset(&ba, 0, sizeof ba);
@@ -1972,7 +2179,7 @@ static void pipe_key(const PipeDesc *d, uint32_t prog, int fast, uint64_t spec, 
          | (uint64_t)d->blend << 24 | (uint64_t)(d->blend ? d->beq : 0) << 32;
     k[1] = d->blend ? ((uint64_t)d->sf << 32 | d->df) : 0;
     k[2] = (uint64_t)prog << 8 | d->ninputs | (uint64_t)(d->topo & 3) << 40
-         | (uint64_t)fast << 44;
+         | (uint64_t)fast << 44 | (uint64_t)(d->samples & 0xF) << 48;
     k[3] = spec;
 }
 
@@ -2009,6 +2216,7 @@ static void pipe_desc(PipeDesc *d, VkFormat cfmt, int has_depth, const Nv2aVkSta
     d->topo = s->topology;
     d->vs = vs;
     d->ninputs = ninputs;
+    d->samples = V.cur_samples ? V.cur_samples : 1;
 }
 
 /* The draw's pipeline with the general fragment shader, built now if new. */
@@ -2101,6 +2309,13 @@ static VkSampler sampler(const Nv2aVkTex *t, uint32_t levels)
         }
         bias = (mode ? tex_lod_bias(t) : 0.0f) + extra;
         ci.mipLodBias = bias > lim ? lim : (bias < -lim ? -lim : bias);
+    }
+    /* Only where the title filters linearly within a mip level; its point-
+     * sampled textures stay point-sampled. */
+    if (V.aniso > 1.0f && mip && ci.minFilter == VK_FILTER_LINEAR) {
+        ci.anisotropyEnable = VK_TRUE;
+        ci.maxAnisotropy = V.aniso < V.limits.maxSamplerAnisotropy ? V.aniso
+                                                                   : V.limits.maxSamplerAnisotropy;
     }
     ci.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
     if (vkCreateSampler(V.dev, &ci, NULL, &V.samps[V.nsamps].s) != VK_SUCCESS)
@@ -2718,6 +2933,7 @@ static void surf_upload(Surf *s)
     }
     s->gen = ++V.gen;
     s->clear_only = 0;
+    s->ms_stale = 1;
     V.st_surf_up++;
 }
 
@@ -2775,6 +2991,8 @@ static Surf *surf_get(const Nv2aVkState *st)
             retire(s->img, s->mem, s->view);
             if (s->nimg)
                 retire(s->nimg, s->nmem, s->nview);
+            if (s->msimg)
+                retire(s->msimg, s->msmem, s->msview);
             free(s->swx);
             free(s->swy);
         } else {
@@ -2792,7 +3010,8 @@ static Surf *surf_get(const Nv2aVkState *st)
         if (!image_create(s->w * V.sx, s->h * V.scale, 1, 1, fmt,
                           VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
                           | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                          | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                          | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                          | VK_IMAGE_USAGE_SAMPLED_BIT,
                           0, VK_IMAGE_ASPECT_COLOR_BIT, &s->img, &s->mem, &s->view)) {
             s->va = 0;
             return NULL;
@@ -2843,23 +3062,32 @@ static Surf *surf_get(const Nv2aVkState *st)
     return s;
 }
 
-static Zeta *zeta_get(uint32_t key, uint32_t w)
+/* `samples` > 1: the depth of a multisampled twin, `h` rows (a separate
+ * buffer from the single-sampled one of the same key). */
+static Zeta *zeta_get(uint32_t key, uint32_t w, uint32_t samples, uint32_t h)
 {
     Zeta *z = NULL;
     int i;
     if (!key)
         return NULL;
-    if (w < 1024)
-        w = 1024;
+    if (samples <= 1) {
+        samples = 1;
+        h = VK_SURF_H;
+        if (w < 1024)
+            w = 1024;
+    }
     for (i = 0; i < V.nzeta; i++)
-        if (V.zeta[i].key == key && V.zeta[i].w >= w)
+        if (V.zeta[i].key == key && V.zeta[i].samples == samples
+                && V.zeta[i].w >= w && V.zeta[i].h >= h)
             return &V.zeta[i];
     for (i = 0; i < V.nzeta; i++)
-        if (V.zeta[i].key == key) {
+        if (V.zeta[i].key == key && V.zeta[i].samples == samples) {
             z = &V.zeta[i];           /* too narrow: replace */
             if (z == V.cur_zs)
                 end_rendering();
             retire(z->img, z->mem, z->view);
+            if (z->dview)
+                retire(VK_NULL_HANDLE, VK_NULL_HANDLE, z->dview);
             break;
         }
     if (!z) {
@@ -2872,6 +3100,8 @@ static Zeta *zeta_get(uint32_t key, uint32_t w)
             if (z == V.cur_zs)
                 end_rendering();
             retire(z->img, z->mem, z->view);
+            if (z->dview)
+                retire(VK_NULL_HANDLE, VK_NULL_HANDLE, z->dview);
         } else {
             z = &V.zeta[V.nzeta++];
         }
@@ -2879,11 +3109,15 @@ static Zeta *zeta_get(uint32_t key, uint32_t w)
     memset(z, 0, sizeof *z);
     z->key = key;
     z->w = w;
-    z->h = VK_SURF_H;
-    if (!image_create(z->w * V.sx, z->h * V.scale, 1, 1, V.dsfmt,
-                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0,
-                      VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
-                      &z->img, &z->mem, &z->view)) {
+    z->h = h;
+    z->samples = samples;
+    s_img_samples = samples;
+    i = image_create(z->w * V.sx, z->h * V.scale, 1, 1, V.dsfmt,
+                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
+                     VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                     &z->img, &z->mem, &z->view);
+    s_img_samples = 1;
+    if (!i) {
         z->key = 0;
         return NULL;
     }
@@ -2947,6 +3181,7 @@ static int alias_resolve(Surf *cs)
             cs->gen = ++V.gen;
             cs->clear_only = 1;
             cs->clear_argb = q->clear_argb;
+            cs->ms_stale = 1;
             q->dirty = 0;
             q->dirty_rows = 0;
             q->clear_only = 0;
@@ -2956,6 +3191,417 @@ static int alias_resolve(Surf *cs)
         need = 1;
     }
     return need;
+}
+
+/* ---- multisampling ----------------------------------------------------- */
+
+/* The scene targets: 640 wide, 32-bit, linear, drawn with depth. Smaller
+ * targets (reflections, shadow maps, effects) stay single-sampled; their
+ * edges are filtered away when they are sampled anyway. */
+static int ms_eligible(const Surf *cs, const Nv2aVkState *st)
+{
+    return V.msaa > 1 && V.up_pipe && !cs->swz && cs->bpp == 4 && cs->w == 640
+        && cs->fmt == VK_FORMAT_B8G8R8A8_UNORM && st->zeta_key && cs->rows <= 480;
+}
+
+static void ms_create(Surf *cs)
+{
+    int ok;
+    s_img_samples = V.msaa;
+    ok = image_create(cs->w * V.sx, 480 * V.scale, 1, 1, cs->fmt,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, VK_IMAGE_ASPECT_COLOR_BIT,
+                      &cs->msimg, &cs->msmem, &cs->msview);
+    s_img_samples = 1;
+    if (!ok) {
+        cs->msimg = VK_NULL_HANDLE;
+        return;
+    }
+    cs->msh = 480;
+    cs->ms_stale = 1;
+    segment_begin();
+    barrier_image(V.dcb, cs->msimg, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                  VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+}
+
+/* A descriptor set for a fullscreen pass: `a` and `b` (b may be NULL). */
+static VkDescriptorSet post_set(VkImageView a, VkImageView b)
+{
+    VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+    VkDescriptorImageInfo ii[2];
+    VkWriteDescriptorSet wr[2];
+    VkDescriptorSet set;
+    int k;
+    ai.descriptorPool = V.dpool;
+    ai.descriptorSetCount = 1;
+    ai.pSetLayouts = &V.post_dsl;
+    if (vkAllocateDescriptorSets(V.dev, &ai, &set) != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    V.sets_used++;
+    ii[0].sampler = ii[1].sampler = V.post_samp;
+    ii[0].imageView = a;
+    ii[1].imageView = b ? b : a;
+    ii[0].imageLayout = ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    memset(wr, 0, sizeof wr);
+    for (k = 0; k < 2; k++) {
+        wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wr[k].dstSet = set;
+        wr[k].dstBinding = (uint32_t)k;
+        wr[k].descriptorCount = 1;
+        wr[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        wr[k].pImageInfo = &ii[k];
+    }
+    vkUpdateDescriptorSets(V.dev, 2, wr, 0, NULL);
+    return set;
+}
+
+/* `cs->img` was written directly: copy it into the multisampled twin (every
+ * sample of a pixel gets the pixel) before the next pass draws there. */
+static void ms_refresh(Surf *cs)
+{
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    VkDescriptorSet set = post_set(cs->view, NULL);
+    VkViewport vp;
+    VkRect2D sc;
+    if (!set)
+        return;
+    mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+    sc.offset.x = sc.offset.y = 0;
+    sc.extent.width = cs->w * V.sx;
+    sc.extent.height = cs->msh * V.scale;
+    ri.renderArea = sc;
+    ri.layerCount = 1;
+    ca.imageView = cs->msview;
+    ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(V.dcb, &ri);
+    vp.x = vp.y = 0.0f;
+    vp.width = (float)sc.extent.width;
+    vp.height = (float)sc.extent.height;
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(V.dcb, 0, 1, &vp);
+    vkCmdSetScissor(V.dcb, 0, 1, &sc);
+    vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.up_pipe);
+    vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
+    vkCmdDraw(V.dcb, 3, 1, 0, 0);
+    vkCmdEndRendering(V.dcb);
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+    V.last_set = VK_NULL_HANDLE;    /* the draw path rebinds its own */
+    cs->ms_stale = 0;
+    V.st_ms_refresh++;
+}
+
+/* ---- ambient occlusion -------------------------------------------------- */
+
+/* RECOMP_VK_AO=1: screen-space ambient occlusion from the depth buffer alone
+ * (scalable ambient obscurance, McGuire et al. 2012), multiplied into the
+ * presented scene between its 3D draws and the HUD.
+ *
+ * The title keeps a w-buffer, stored reversed as WREV_C / w, so every depth
+ * sample is a linear eye distance; with the field of view that gives eye-
+ * space positions. The title's projection is not read: the vertical field of
+ * view is a setting (RECOMP_VK_AO_FOV, degrees), and the horizontal follows
+ * from the shown aspect. RECOMP_VK_AO_RADIUS (title units, ~metres),
+ * _INTENSITY, _BIAS, _FAR (where it fades out) and _NEAR (where it fades in,
+ * so the car keeps the title's own shading) tune it; RECOMP_VK_AO_SHOW=1
+ * shows the occlusion alone, 2 the depth in 4-unit bands, 3 how much each
+ * surface faces the camera. */
+
+static const char *k_ao_common =
+    "#version 450\n"
+    "#ifdef MS\n"
+    "layout(set = 0, binding = 0) uniform sampler2DMS dz;\n"
+    "#else\n"
+    "layout(set = 0, binding = 0) uniform sampler2D dz;\n"
+    "#endif\n"
+    "layout(set = 0, binding = 1) uniform sampler2D aot;\n"
+    "layout(push_constant) uniform PC { vec4 proj; vec4 prm; vec4 sz; } pc;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "float W(ivec2 p) {\n"
+    "    p = clamp(p, ivec2(0), ivec2(pc.sz.xy) - 1);\n"
+    "    float d = texelFetch(dz, p, 0).r;\n"
+    "    return d > 0.0 ? 1.0 / (pc.sz.z * d) : 1e9;\n"
+    "}\n"
+    "vec3 P(vec2 px, float w) {\n"
+    "    vec2 ndc = px / pc.sz.xy * 2.0 - 1.0;\n"
+    "    return vec3(ndc * pc.proj.xy * w, w);\n"
+    "}\n";
+
+/* proj.xy tan(half fov) x/y; prm radius, intensity, bias, far;
+ * sz render size in pixels, 1/WREV_C, blur step. */
+static const char *k_ao_main =
+    "void main() {\n"
+    "    vec2 fc = gl_FragCoord.xy;\n"
+    "    ivec2 ip = ivec2(fc);\n"
+    "    float w = W(ip);\n"
+    "    if (pc.proj.z > 1.5 && pc.proj.z < 2.5) { o = vec4(fract(w / 4.0)); return; }\n"
+    "    if (w > pc.prm.w) { o = vec4(1.0); return; }\n"
+    "    vec3 p = P(fc, w);\n"
+    "    float wl = W(ip - ivec2(1, 0)), wr = W(ip + ivec2(1, 0));\n"
+    "    float wu = W(ip - ivec2(0, 1)), wd = W(ip + ivec2(0, 1));\n"
+    "    vec3 dx = abs(wr - w) < abs(w - wl) ? P(fc + vec2(1, 0), wr) - p : p - P(fc - vec2(1, 0), wl);\n"
+    "    vec3 dy = abs(wd - w) < abs(w - wu) ? P(fc + vec2(0, 1), wd) - p : p - P(fc - vec2(0, 1), wu);\n"
+    "    vec3 n = normalize(cross(dy, dx));\n"
+    "    if (n.z > 0.0) n = -n;\n"
+    "    if (pc.proj.z > 2.5) { o = vec4(pc.proj.z > 3.5 ? abs(n.x) : -n.z); return; }\n"
+    "    float R = pc.prm.x;\n"
+    "    float rpx = min(R / (w * pc.proj.y) * 0.5 * pc.sz.y, 0.1 * pc.sz.y);\n"
+    "    if (rpx < 1.0) { o = vec4(1.0); return; }\n"
+    "    const int B[16] = int[](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);\n"
+    "    float phi = 6.2831853 * float(B[(ip.y & 3) * 4 + (ip.x & 3)]) / 16.0;\n"
+    "    float sum = 0.0;\n"
+    "    const int N = 16;\n"
+    "    for (int i = 0; i < N; i++) {\n"
+    "        float a = (float(i) + 0.5) / float(N);\n"
+    "        float ang = a * 6.2831853 * 7.0 + phi;\n"
+    "        vec2 q = fc + vec2(cos(ang), sin(ang)) * a * rpx;\n"
+    "        if (any(lessThan(q, vec2(0.0))) || any(greaterThanEqual(q, pc.sz.xy))) continue;\n"
+    "        vec3 v = P(q, W(ivec2(q))) - p;\n"
+    "        float vv = dot(v, v), vn = dot(v, n);\n"
+    "        float f = max(R * R - vv, 0.0);\n"
+    "        sum += f * f * f * max((vn - pc.prm.z) / (0.01 + vv), 0.0);\n"
+    "    }\n"
+    "    float R6 = R * R * R * R * R * R;\n"
+    "    float ao = max(0.0, 1.0 - sum * pc.prm.y / R6 * (5.0 / float(N)));\n"
+    "    ao = mix(ao, 1.0, smoothstep(pc.prm.w * 0.6, pc.prm.w, w));\n"
+    "    ao = mix(1.0, ao, smoothstep(pc.proj.w * 0.6, pc.proj.w, w));\n"
+    "    o = vec4(ao);\n"
+    "}\n";
+
+/* Depth-aware blur of the occlusion, as a factor the target is multiplied by. */
+static const char *k_ao_apply =
+    "void main() {\n"
+    "    ivec2 ip = ivec2(gl_FragCoord.xy);\n"
+    "    float w0 = W(ip);\n"
+    "    if (w0 > pc.prm.w) { o = vec4(1.0); return; }\n"
+    "    float s = 0.0, ws = 0.0;\n"
+    "    for (int y = -2; y < 2; y++)\n"
+    "        for (int x = -2; x < 2; x++) {\n"
+    "            ivec2 q = clamp(ip + ivec2(x, y), ivec2(0), ivec2(pc.sz.xy) - 1);\n"
+    "            float k = max(0.0, 1.0 - abs(W(q) - w0) / (0.05 * w0));\n"
+    "            s += texelFetch(aot, q, 0).r * k;\n"
+    "            ws += k;\n"
+    "        }\n"
+    "    float ao = ws > 0.0 ? s / ws : 1.0;\n"
+    "    o = vec4(vec3(ao), 1.0);\n"
+    "}\n";
+
+static VkPipeline ao_build(const char *body, int ms, VkFormat fmt, uint32_t samples)
+{
+    char src[8192];
+    VkShaderModule fs;
+    VkPipeline p;
+    /* #version must stay first: the define goes after it. */
+    snprintf(src, sizeof src, "#version 450\n%s%s%s", ms ? "#define MS 1\n" : "",
+             strchr(k_ao_common, '\n') + 1, body);
+    fs = glsl_module(src, 1);
+    if (!fs)
+        return VK_NULL_HANDLE;
+    /* RECOMP_VK_AO_SHOW=1: the occlusion term alone, in place of the scene. */
+    p = post_pipeline(fs, fmt, samples,
+                      fmt == VK_FORMAT_R8_UNORM || getenv("RECOMP_VK_AO_SHOW") ? 0 : 1);
+    vkDestroyShaderModule(V.dev, fs, NULL);
+    return p;
+}
+
+static void ao_init(void)
+{
+    const char *e = getenv("RECOMP_VK_AO");
+    float fov;
+    V.ao_on = e && *e && strcmp(e, "0") != 0 && V.post_pl;
+    if (!V.ao_on)
+        return;
+    e = getenv("RECOMP_VK_AO_RADIUS");
+    V.ao_radius = e ? (float)atof(e) : 1.0f;
+    e = getenv("RECOMP_VK_AO_INTENSITY");
+    V.ao_intensity = e ? (float)atof(e) : 0.7f;
+    e = getenv("RECOMP_VK_AO_NEAR");
+    V.ao_near = e ? (float)atof(e) : 8.0f;
+    e = getenv("RECOMP_VK_AO_BIAS");
+    V.ao_bias = e ? (float)atof(e) : 0.03f;
+    e = getenv("RECOMP_VK_AO_FAR");
+    V.ao_far = e ? (float)atof(e) : 150.0f;
+    e = getenv("RECOMP_VK_AO_FOV");
+    fov = e ? (float)atof(e) : 50.0f;
+    V.ao_tan = tanf(fov * 0.5f * 3.14159265f / 180.0f);
+    fprintf(stderr, "  [VK] ambient occlusion: radius %g, intensity %g, fov %g\n",
+            V.ao_radius, V.ao_intensity, fov);
+}
+
+/* The fullscreen pass `pipe` into one attachment. */
+static void ao_pass(VkImageView target, VkImageView resolve, uint32_t w, uint32_t h,
+                    VkPipeline pipe, VkDescriptorSet set, const float *pc)
+{
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    VkViewport vp;
+    VkRect2D sc;
+    sc.offset.x = sc.offset.y = 0;
+    sc.extent.width = w;
+    sc.extent.height = h;
+    ri.renderArea = sc;
+    ri.layerCount = 1;
+    ca.imageView = target;
+    ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    ca.loadOp = pipe == V.ao_pipe[0] || pipe == V.ao_pipe[1]
+              ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    if (resolve) {
+        ca.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+        ca.resolveImageView = resolve;
+        ca.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(V.dcb, &ri);
+    vp.x = vp.y = 0.0f;
+    vp.width = (float)w;
+    vp.height = (float)h;
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(V.dcb, 0, 1, &vp);
+    vkCmdSetScissor(V.dcb, 0, 1, &sc);
+    vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
+    vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
+    vkCmdDraw(V.dcb, 3, 1, 0, 0);
+    vkCmdEndRendering(V.dcb);
+}
+
+static void ao_barrier(void)
+{
+    VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+    mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                     | VK_ACCESS_SHADER_READ_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+                     | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+                     | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+                     | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                         | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                         | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
+                         | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                         | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+                         | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                         0, 1, &mb, 0, NULL, 0, NULL);
+}
+
+/* Before each draw: is this where the presented scene's 3D ends? The first
+ * draw without a depth test after the frame's depth-tested ones, into a
+ * surface that is shown. Runs the passes and ends the rendering instance
+ * (the caller begins it again); returns 1 when it did. */
+static int ao_maybe(const Nv2aVkState *st)
+{
+    Surf *cs = V.cur_cs;
+    Zeta *zs = V.cur_zs;
+    int ms;
+    uint32_t w, h, va;
+    float pc[12];
+    VkDescriptorSet set;
+
+    if (!cs || !zs || cs->swz || cs->bpp != 4 || cs->w != 640)
+        return 0;
+    va = cs->va & 0x0FFFFFFFu;
+    if (va != (V.flip_va[0] & 0x0FFFFFFFu) && va != (V.flip_va[1] & 0x0FFFFFFFu))
+        return 0;
+    if (V.ao_frame != V.frame) {
+        V.ao_frame = V.frame;
+        V.ao_zdraws = 0;
+    }
+    if (st->depth_test) {
+        if (depth_mode(st) == 2 && V.wrev)
+            V.ao_zdraws++;
+        return 0;
+    }
+    if (V.ao_zdraws < 32 || V.ao_done == V.frame + 1)
+        return 0;
+    V.ao_done = V.frame + 1;
+    ms = cs->msimg && zs->samples > 1;
+    if (!V.ao_pipe[ms])
+        V.ao_pipe[ms] = ao_build(k_ao_main, ms, VK_FORMAT_R8_UNORM, 1);
+    if (!V.ao_apply[ms])
+        V.ao_apply[ms] = ao_build(k_ao_apply, ms, cs->fmt, ms ? V.msaa : 1);
+    if (!V.ao_pipe[ms] || !V.ao_apply[ms]) {
+        fprintf(stderr, "  [VK] ambient occlusion shaders failed -- off\n");
+        V.ao_on = 0;
+        return 0;
+    }
+    if (!V.ao_img) {
+        if (!image_create(640 * V.sx, 480 * V.scale, 1, 1, VK_FORMAT_R8_UNORM,
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
+                          VK_IMAGE_ASPECT_COLOR_BIT, &V.ao_img, &V.ao_mem, &V.ao_view)) {
+            V.ao_on = 0;
+            return 0;
+        }
+        barrier_image(V.dcb, V.ao_img, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    }
+    if (!zs->dview) {
+        VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+        vi.image = zs->img;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = V.dsfmt;
+        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        vi.subresourceRange.levelCount = 1;
+        vi.subresourceRange.layerCount = 1;
+        if (vkCreateImageView(V.dev, &vi, NULL, &zs->dview) != VK_SUCCESS) {
+            zs->dview = VK_NULL_HANDLE;
+            return 0;
+        }
+    }
+    set = post_set(zs->dview, V.ao_view);
+    if (!set)
+        return 0;
+    end_rendering();
+    w = 640 * V.sx;
+    h = (cs->msimg ? cs->msh : (cs->rows < 480 ? cs->rows : 480)) * V.scale;
+    pc[0] = V.ao_tan * (fb_widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f);
+    pc[1] = V.ao_tan;
+    pc[2] = getenv("RECOMP_VK_AO_SHOW") ? (float)atof(getenv("RECOMP_VK_AO_SHOW")) : 0.0f;
+    pc[3] = V.ao_near;
+    pc[4] = V.ao_radius;
+    pc[5] = V.ao_intensity;
+    pc[6] = V.ao_bias;
+    pc[7] = V.ao_far;
+    pc[8] = (float)w;
+    pc[9] = (float)h;
+    pc[10] = 1.0f / WREV_C;
+    pc[11] = (float)((V.scale + 1) / 2);
+    ao_barrier();
+    ao_pass(V.ao_view, VK_NULL_HANDLE, w, h, V.ao_pipe[ms], set, pc);
+    ao_barrier();
+    if (ms)
+        ao_pass(cs->msview, cs->view, w, h, V.ao_apply[ms], set, pc);
+    else
+        ao_pass(cs->view, VK_NULL_HANDLE, w, h, V.ao_apply[ms], set, pc);
+    ao_barrier();
+    cs->dirty = 1;
+    cs->gen = ++V.gen;
+    cs->clear_only = 0;
+    if (cs->dirty_rows < h / V.scale)
+        cs->dirty_rows = h / V.scale;
+    V.last_set = VK_NULL_HANDLE;
+    V.st_ao++;
+    return 1;
 }
 
 /* Make (colour, zeta) the rendering instance being recorded. */
@@ -2987,7 +3633,10 @@ static int begin_target(const Nv2aVkState *st)
         vk_sync(1);
         cs = surf_get(st);
     }
-    zs = zeta_get(st->zeta_key, cs ? cs->w : 1024);
+    if (cs && !cs->msimg && ms_eligible(cs, st))
+        ms_create(cs);
+    zs = cs && cs->msimg ? zeta_get(st->zeta_key, cs->w, V.msaa, cs->msh)
+                         : zeta_get(st->zeta_key, cs ? cs->w : 1024, 1, 0);
     if (!cs && !zs)
         return 0;
     if (V.kick_draws > 0 && V.recording && V.seg_draws >= (uint32_t)V.kick_draws
@@ -2997,6 +3646,8 @@ static int begin_target(const Nv2aVkState *st)
     if (V.rendering && V.cur_cs == cs && V.cur_zs == zs)
         return 1;
     end_rendering();
+    if (cs && cs->msimg && cs->ms_stale)
+        ms_refresh(cs);
     {
         /* Draws in the previous instance precede this one's. */
         VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
@@ -3015,7 +3666,7 @@ static int begin_target(const Nv2aVkState *st)
                              0, 1, &mb, 0, NULL, 0, NULL);
     }
     w = cs ? cs->w : zs->w;
-    h = cs ? cs->h : zs->h;
+    h = cs ? (cs->msimg ? cs->msh : cs->h) : zs->h;
     if (zs && zs->w < w) w = zs->w;
     if (zs && zs->h < h) h = zs->h;
     ri.renderArea.extent.width = w * V.sx;
@@ -3026,6 +3677,13 @@ static int begin_target(const Nv2aVkState *st)
         ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        if (cs->msimg) {
+            /* Drawn multisampled, resolved into `img` as the pass ends. */
+            ca.imageView = cs->msview;
+            ca.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+            ca.resolveImageView = cs->view;
+            ca.resolveImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
         ri.colorAttachmentCount = 1;
         ri.pColorAttachments = &ca;
     }
@@ -3041,6 +3699,7 @@ static int begin_target(const Nv2aVkState *st)
     V.rendering = 1;
     V.cur_cs = cs;
     V.cur_zs = zs;
+    V.cur_samples = cs && cs->msimg ? V.msaa : 1;
     if (zs)
         zs->last_use = V.frame;
     return 1;
@@ -3051,10 +3710,11 @@ static VkRect2D clip_rect(const Nv2aVkState *st)
 {
     VkRect2D r;
     uint32_t w = V.cur_cs ? V.cur_cs->w : V.cur_zs->w;
-    uint32_t h = V.cur_cs ? V.cur_cs->h : V.cur_zs->h;
+    uint32_t h = V.cur_cs ? (V.cur_cs->msimg ? V.cur_cs->msh : V.cur_cs->h) : V.cur_zs->h;
     uint32_t x0 = st->clip_x, y0 = st->clip_y;
     uint32_t x1 = st->clip_x + st->clip_w, y1 = st->clip_y + st->clip_h;
     if (V.cur_zs && V.cur_zs->w < w) w = V.cur_zs->w;
+    if (V.cur_zs && V.cur_zs->h < h) h = V.cur_zs->h;
     if (x1 > w) x1 = w;
     if (y1 > h) y1 = h;
     if (x0 > x1) x0 = x1;
@@ -3584,6 +4244,8 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
 
     if (!begin_target(st))
         return;
+    if (V.ao_on && ao_maybe(st) && !begin_target(st))
+        return;
     pipe = pipeline(V.cur_cs ? V.cur_cs->fmt : VK_FORMAT_UNDEFINED, V.cur_zs != NULL, st,
                     vs, prog, ninputs);
     if (!pipe)
@@ -3817,12 +4479,14 @@ static void draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     if (V.zpass && V.nq < VK_MAX_QUERIES) {
         uint32_t q = V.nq++;
         V.st_qdraws++;
+        V.qsamples[q] = (uint8_t)V.cur_samples;
         vkCmdBeginQuery(V.dcb, V.qpool, q, V.precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
         vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
         vkCmdEndQuery(V.dcb, V.qpool, q);
     } else if (s_flight > 0 && s_dlog && V.fqpool && V.nfq < VK_MAX_QUERIES) {
         /* Flight recorder: how many samples this draw actually wrote. */
         uint32_t q = V.nfq++;
+        V.fqsamples[q] = (uint8_t)V.cur_samples;
         V.fq_frame[q] = nv2a_pb_presented_frames();
         V.fq_seq[q] = s_dlog_seq - 1;
         vkCmdBeginQuery(V.dcb, V.fqpool, q, V.precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
@@ -4464,6 +5128,8 @@ void nv2a_vk_present(uint32_t va, uint32_t pitch)
 
     if (V.state <= 0)
         return;
+    V.flip_va[0] = V.flip_va[1];
+    V.flip_va[1] = va;
     hires_dump(va, pitch);
     if (!V.has_swapchain_ext)
         return;
@@ -4668,6 +5334,9 @@ void nv2a_vk_flush(void)
             fprintf(stderr, "  [VK]   visibility: %u reports, %u counted draws\n",
                     V.st_reports, V.st_qdraws);
             V.st_reports = V.st_qdraws = 0;
+            if (V.msaa > 1 || V.st_ao)
+                fprintf(stderr, "  [VK]   msaa refreshes %u, ao passes %u\n", V.st_ms_refresh, V.st_ao);
+            V.st_ms_refresh = V.st_ao = 0;
             V.st_compiles = V.st_pipes_new = 0;
             V.st_compile_ms = V.st_pipe_ms = 0;
             V.st_draws = V.st_tris = V.st_syncs = V.st_tex_up = 0;

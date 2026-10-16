@@ -48,6 +48,17 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
 - `RECOMP_VK_DEVICE=N`: pick a Vulkan device by index (listed at start).
 - `RECOMP_VK_VSYNC=1`: FIFO presentation instead of mailbox.
 - `RECOMP_FLIP_HZ=N`: flip pacing (default 60; 0 = unpaced).
+- `RECOMP_VK_MSAA=2|4|8`: multisample anti-aliasing. Applies to the 640-wide
+  scene targets; each pass resolves into the image everything else reads.
+- `RECOMP_VK_ANISO=N`: anisotropic filtering, up to 16. Used where the game
+  already filters linearly with mipmaps.
+- `RECOMP_VK_AO=1`: screen-space ambient occlusion. It's worked out from the
+  game's w-buffer and applied to the shown scene before the HUD.
+  - Tuning: `RECOMP_VK_AO_RADIUS` (default 1), `_INTENSITY` (0.7), `_FOV`
+    (50, vertical), `_NEAR` (8: fades in past the car), `_FAR` (150).
+  - `RECOMP_VK_AO_SHOW=1` shows the occlusion term on its own.
+- The launcher sets these three from its Graphics section. Its default is
+  16x anisotropic, with MSAA and AO off.
 - Compiled shaders are cached in `~/.cache/xboxrecomp/vk`
   (`RECOMP_VK_CACHE=dir`, `=0` off).
 

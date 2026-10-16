@@ -36,8 +36,8 @@ int nv2a_vk_device_names(char (*names)[256], int max);
 #define MAXV 12
 
 enum {
-    O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS,
-    O_SOUND, O_REVERB, O_KEYBOARD, O_RUMBLE, O_SHOW,
+    O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS, O_SHOW,
+    O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_KEYBOARD, O_RUMBLE,
     O_COUNT
 };
 
@@ -135,6 +135,35 @@ static void opts_init(int list_gpus)
     opt_add(o, "144", "144");
     opt_add(o, "Unlimited", "0");
 
+    o = opt_def(O_SHOW, "show_launcher", NULL, "LAUNCHER", 0, "Show at startup",
+                "When off, the game starts straight away. Start it with --launcher "
+                "to get this screen back.");
+    opt_add(o, "Yes", "1");
+    opt_add(o, "No", "0");
+
+    o = opt_def(O_MSAA, "msaa", "RECOMP_VK_MSAA", "GRAPHICS", 1, "Anti-aliasing",
+                "Multisample anti-aliasing smooths the jagged edges of the 3D scene. "
+                "4\xC3\x97 is a good balance; each step costs GPU time.");
+    opt_add(o, "Off", "0");
+    opt_add(o, "2\xC3\x97 MSAA", "2");
+    opt_add(o, "4\xC3\x97 MSAA", "4");
+    opt_add(o, "8\xC3\x97 MSAA", "8");
+
+    o = opt_def(O_ANISO, "anisotropic", "RECOMP_VK_ANISO", NULL, 1, "Texture filtering",
+                "Anisotropic filtering keeps the road and ground sharp into the "
+                "distance instead of blurring. Costs very little.");
+    opt_add(o, "Standard", "0");
+    opt_add(o, "4\xC3\x97 anisotropic", "4");
+    opt_add(o, "8\xC3\x97 anisotropic", "8");
+    opt_add(o, "16\xC3\x97 anisotropic", "16");
+    o->def = 3;
+
+    o = opt_def(O_AO, "ambient_occlusion", "RECOMP_VK_AO", NULL, 1, "Ambient occlusion",
+                "Shades the corners and contact points of the scenery for more depth. "
+                "Not in the original game; costs some GPU time.");
+    opt_add(o, "Off", "0");
+    opt_add(o, "On", "1");
+
     o = opt_def(O_SOUND, "sound", "RECOMP_AUDIO", "AUDIO", 1, "Sound",
                 "Turns all game audio on or off.");
     opt_add(o, "On", "1");
@@ -159,12 +188,6 @@ static void opts_init(int list_gpus)
                 "Controller rumble from the game.");
     opt_add(o, "On", "1");
     opt_add(o, "Off", "0");
-
-    o = opt_def(O_SHOW, "show_launcher", NULL, "LAUNCHER", 1, "Show at startup",
-                "When off, the game starts straight away. Start it with --launcher "
-                "to get this screen back.");
-    opt_add(o, "Yes", "1");
-    opt_add(o, "No", "0");
 }
 
 static int opt_find(const Opt *o, const char *val)
@@ -276,6 +299,11 @@ static void env_put(const char *k, const char *v)
 #endif
 }
 
+static int vk_only(int i)
+{
+    return i == O_GPU || i == O_SCALE || i == O_MSAA || i == O_ANISO || i == O_AO;
+}
+
 /* Only variables nobody set by hand. The Vulkan-only settings are left out
  * for the software renderer. */
 static void settings_apply(void)
@@ -286,7 +314,7 @@ static void settings_apply(void)
         const char *v = o->val[o->cur];
         if (!o->env || o->soon || o->env_set || !*v)
             continue;
-        if (soft && (i == O_GPU || i == O_SCALE))
+        if (soft && vk_only(i))
             continue;
         env_put(o->env, v);
     }
@@ -297,7 +325,7 @@ static int row_disabled(int i)
     int soft = strcmp(s_opt[O_RENDERER].val[s_opt[O_RENDERER].cur], "0") == 0;
     if (s_opt[i].soon || s_opt[i].env_set)
         return 1;
-    if (soft && (i == O_GPU || i == O_SCALE))
+    if (soft && vk_only(i))
         return 1;
     return i == O_GPU && s_opt[i].n < 2;
 }
@@ -327,7 +355,7 @@ static int launcher_window(void) { return 1; }
 
 /* Layout in logical units; the renderer's pixels per unit is s_px. */
 #define WIN_W 1000
-#define WIN_H 620
+#define WIN_H 720
 #define ROW_H 42
 #define SEC_H 34
 #define COL_W 444
@@ -708,24 +736,24 @@ static void draw(void)
             snprintf(t, sizeof t, "%s  (Only used by the Vulkan renderer.)", o->help);
         else
             snprintf(t, sizeof t, "%s", o->help);
-        text_wrap(&s_body, 58, 452, WIN_W - 116, 22, t, C_MUTED);
+        text_wrap(&s_body, 58, 552, WIN_W - 116, 22, t, C_MUTED);
     } else {
         char t[1100];
         snprintf(t, sizeof t, "Settings are saved to %s", s_path);
-        text_wrap(&s_body, 58, 452, WIN_W - 116, 22, t, C_DIM);
+        text_wrap(&s_body, 58, 552, WIN_W - 116, 22, t, C_DIM);
     }
 
-    fill(48, 534, WIN_W - 96, 1, C_LINE);
+    fill(48, 634, WIN_W - 96, 1, C_LINE);
     {
         float hx = 48;
-        keycap(&hx, 506, "Enter", "start");
-        keycap(&hx, 506, "Esc", "quit");
-        keycap(&hx, 506, "Arrows", "choose and change");
-        keycap(&hx, 506, "A / Start", "on a controller");
+        keycap(&hx, 606, "Enter", "start");
+        keycap(&hx, 606, "Esc", "quit");
+        keycap(&hx, 606, "Arrows", "choose and change");
+        keycap(&hx, 606, "A / Start", "on a controller");
     }
-    draw_button(B_DEFAULTS, 48, 556, 130, "Defaults", 0);
-    draw_button(B_QUIT, WIN_W - 48 - 190 - 12 - 110, 556, 110, "Quit", 0);
-    draw_button(B_START, WIN_W - 48 - 190, 556, 190, "Start game", 1);
+    draw_button(B_DEFAULTS, 48, 656, 130, "Defaults", 0);
+    draw_button(B_QUIT, WIN_W - 48 - 190 - 12 - 110, 656, 110, "Quit", 0);
+    draw_button(B_START, WIN_W - 48 - 190, 656, 190, "Start game", 1);
 }
 
 static void change(int i, int d)
