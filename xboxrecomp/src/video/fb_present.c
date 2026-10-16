@@ -246,6 +246,13 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             nv2a_vk_overlay_toggle();
             return 0;
         }
+        /* Alt+Enter, as in most Windows games: fullscreen, and not an Enter
+         * for the title (bit 29: Alt held; it arrives as WM_SYSKEYDOWN). */
+        if (w == VK_RETURN && (l & 0x20000000)) {
+            if (!(l & 0x40000000))
+                fb_set_fullscreen(h, !s_fullscreen);
+            return 0;
+        }
         if (w == VK_F11 && !(l & 0x40000000)) {   /* not auto-repeat */
             fb_set_fullscreen(h, !s_fullscreen);
             return 0;
@@ -805,6 +812,16 @@ static void fb_events(SDL_Window *win, int *resized)
                 /* The FPS counter (RECOMP_FPS_OVERLAY). */
                 extern void nv2a_vk_overlay_toggle(void);
                 nv2a_vk_overlay_toggle();
+            }
+            /* F11 or Alt+Enter: fullscreen. Alt+Enter is not also an Enter
+             * for the title, where Enter is START. */
+            if (ev.type == SDL_KEYDOWN && (ev.key.keysym.mod & KMOD_ALT)
+                    && (ev.key.keysym.sym == SDLK_RETURN || ev.key.keysym.sym == SDLK_KP_ENTER)) {
+                if (!ev.key.repeat) {
+                    Uint32 fs = SDL_GetWindowFlags(win) & SDL_WINDOW_FULLSCREEN_DESKTOP;
+                    SDL_SetWindowFullscreen(win, fs ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
+                }
+                vk = 0;
             }
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F11
                     && !ev.key.repeat) {

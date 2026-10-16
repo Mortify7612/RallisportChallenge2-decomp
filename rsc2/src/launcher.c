@@ -151,7 +151,8 @@ static void opts_init(int list_gpus)
     opt_add(o, "16:9  widescreen", "1");
 
     o = opt_def(O_DISPLAY, "display", "RECOMP_FULLSCREEN", NULL, 0, "Display mode",
-                "Fullscreen uses your desktop resolution. F11 switches while playing.");
+                "Fullscreen uses your desktop resolution. F11 or Alt+Enter switches "
+                "while playing.");
     opt_add(o, "Windowed", "0");
     opt_add(o, "Fullscreen", "1");
 

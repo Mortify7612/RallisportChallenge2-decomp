@@ -15,7 +15,7 @@ PRIME offload (`prime-run`, with an inherited `VK_ICD_FILENAMES` dropped);
 `RSC2_GPU=igpu rsc2/run.sh` uses the integrated GPU. Running `build/rsc2`
 directly works too and uses whatever Vulkan device the environment exposes.
 
-Opens a window (F11 = fullscreen; closing it quits) with sound through SDL2.
+Opens a window (F11 or Alt+Enter = fullscreen; closing it quits) with sound through SDL2.
 The keyboard is pad 0, alongside any real controller, and is laid out for
 driving with the game's default controller preset (PRESET 1):
 
@@ -121,7 +121,7 @@ On Windows, as on Linux:
 - 16:9 opens a 1280x720 window. The window size scales with the display's
   DPI setting.
 - The display mode setting (`RECOMP_FULLSCREEN=1`) gives borderless
-  fullscreen on the monitor. F11 toggles it.
+  fullscreen on the monitor. F11 or Alt+Enter toggles it.
 
 Known Windows issues:
 - A profile saved by the Linux build is listed but "Unable to load".
