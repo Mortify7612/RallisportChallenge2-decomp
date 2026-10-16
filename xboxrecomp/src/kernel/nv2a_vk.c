@@ -1711,9 +1711,49 @@ static void settle_inflight(uint32_t va, uint32_t bytes, const Surf *except)
     for (i = 0; i < V.nsurf; i++) {
         const Surf *s = &V.surf[i];
         if (s != except && s->dirty == 2 && va < s->va + surf_bytes(s) && va + bytes > s->va) {
+            static int trace = -1;
+            if (trace < 0)
+                trace = getenv("RECOMP_VK_SETTLE_TRACE") != NULL;
+            if (trace)
+                fprintf(stderr, "[VKSETTLE] F%u %08X+%u over in-flight %08X %ux%u pitch %u swz %d%s\n",
+                        nv2a_pb_presented_frames(), va, bytes, s->va, s->w, s->h, s->pitch,
+                        s->swz, except ? " (target)" : " (texture)");
             pend_retire_all();
             return;
         }
+    }
+}
+
+/* A clear about to overwrite all of [va, va+bytes): copy-backs still in
+ * flight for other surfaces lying wholly inside it are of no use any more.
+ * Cancel them -- their entries in the flipped frame are voided, so they can
+ * never land late -- instead of waiting for that frame (settle_inflight).
+ * RSC2 clears its shadow map's memory through a linear surface every
+ * frame; on a phone, whose GPU runs most of a frame behind, that wait
+ * serialised CPU and GPU. RECOMP_VK_DROP_INFLIGHT=0 waits as before. */
+static void drop_inflight(uint32_t va, uint32_t bytes, const Surf *except)
+{
+    static int on = -1;
+    int i, k, j;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_DROP_INFLIGHT");
+        on = !(e && strcmp(e, "0") == 0);
+    }
+    if (!on)
+        return;
+    for (i = 0; i < V.nsurf; i++) {
+        Surf *q = &V.surf[i];
+        if (q == except || q->dirty != 2 || q->va < va || q->va + surf_bytes(q) > va + bytes)
+            continue;
+        for (k = 0; k < VK_SLOTS; k++)
+            if (V.pend[k].active)
+                for (j = 0; j < V.pend[k].nrb; j++)
+                    if (V.pend[k].rb[j].s == q)
+                        V.pend[k].rb[j].img = VK_NULL_HANDLE;
+        q->dirty = 0;
+        q->dirty_rows = 0;
+        q->clear_only = 0;
+        q->hash_valid = 0;
     }
 }
 
@@ -4114,6 +4154,12 @@ void nv2a_vk_clear(const Nv2aVkState *st, uint32_t flags, uint32_t argb, uint32_
         fprintf(s_dlog, "F%u C%u clear %X colour %08X zs %08X surf %08X zeta %08X clip %u,%u,%u,%u w%u\n",
                 nv2a_pb_presented_frames(), s_dlog_seq++, flags, argb, zs, st->color_va,
                 st->zeta_key, st->clip_x, st->clip_y, st->clip_w, st->clip_h, st->wbuffer);
+    /* Every channel over the whole surface: nothing under it survives. */
+    if ((flags & 0xF0) == 0xF0 && st->clip_x == 0 && st->clip_y == 0) {
+        Surf *cs = surf_get(st);
+        if (cs && st->clip_w >= cs->w && st->clip_h >= (cs->swz ? cs->h : cs->rows))
+            drop_inflight(cs->va, cs->swz ? cs->w * cs->h * cs->bpp : cs->rows * cs->pitch, cs);
+    }
     if (!begin_target(st))
         return;
     zmax = st->zeta_fmt == 1 ? 65535.0f : 16777215.0f;
