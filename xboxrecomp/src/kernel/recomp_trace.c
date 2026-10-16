@@ -432,6 +432,8 @@ static FILE *s_tt;
 static int s_tt_on = -1;
 static uint32_t s_tt_out, s_tt_cnt, s_tt_a3, s_tt_a4, s_tt_obj;
 
+extern uint32_t nv2a_pb_presented_frames(void);
+
 static void tt_hdr(uint32_t kind, uint32_t n, uint32_t extra)
 {
     extern uint32_t nv2a_pb_presented_frames(void);
@@ -523,9 +525,185 @@ static void tree_trace(uint32_t va)
     }
 }
 
+/* What sub_00112530 (one object of the opaque mesh list) and sub_001101E0
+ * (the faded/billboard batch) put into the pushbuffer: the put pointer
+ * [0x372F70] at entry and exit, and the methods in between.
+ * kind 10, per sub_00112530 call (extra = the mesh), two entries:
+ *   { u32 inst, f32 dist (inst+0x10), u32 bytes, u8 lod, u8 draws,
+ *     u8 jumps+calls, u8 flags (bit 0 put wrapped, bits 4-6 LOD path) }
+ *   { u32 put at entry, u32 put at exit, u32 mesh, 0 }
+ * kind 11, per sub_001101E0 call: n batch items { inst, fade byte as lod },
+ *   extra = draws << 24 | bytes.
+ * Needs trace hooks on 0x00112530 and 0x001101E0 as well. */
+static uint32_t s_tt_put0, s_tt_inst, s_tt_mesh, s_tt_lod, s_tt_path;
+static uint32_t s_tt_bput0, s_tt_bren, s_tt_bn;
+static float s_tt_dist;
+
+static void tt_pb_scan(const uint8_t *m, uint32_t a, uint32_t b, uint32_t *draws, uint32_t *jumps)
+{
+    *draws = *jumps = 0;
+    while (a + 4 <= b) {
+        uint32_t h = *(const uint32_t *)(m + a), n, meth, k;
+        if ((h & 0xE0000003u) == 0x20000000u || (h & 3u) == 1u || (h & 3u) == 2u || h == 0x00020000u) {
+            (*jumps)++;
+            a += 4;
+            continue;
+        }
+        n = (h >> 18) & 0x7FFu;
+        meth = h & 0x1FFCu;
+        for (k = 0; k < n && a + 8 + 4 * k <= b; k++) {
+            uint32_t mm = (h & 0x40000000u) ? meth : meth + 4 * k;
+            if (mm == 0x17FCu && *(const uint32_t *)(m + a + 4 + 4 * k) != 0)
+                (*draws)++;
+        }
+        a += 4 + 4 * n;
+    }
+}
+
+/* kind 12: the put range of other drawing functions, one entry per call:
+ * { u32 function, u32 put at entry, u32 put at exit, u32 depth }. */
+static const uint32_t s_tt_rfn[] = { 0x001101E0u, 0x00273890u, 0x00275010u, 0x00114C80u, 0x00273710u };
+static uint32_t s_tt_rput[8][4];
+static int s_tt_rdep[8];
+
+static void tree_trace_range(const uint8_t *m, uint32_t va, int is_exit)
+{
+    unsigned i;
+    for (i = 0; i < sizeof s_tt_rfn / sizeof s_tt_rfn[0]; i++) {
+        if (s_tt_rfn[i] != va)
+            continue;
+        if (!is_exit) {
+            if (s_tt_rdep[i] < 4)
+                s_tt_rput[i][s_tt_rdep[i]] = *(const uint32_t *)(m + 0x372F70u);
+            s_tt_rdep[i]++;
+        } else if (s_tt_rdep[i] > 0) {
+            uint32_t r[4];
+            s_tt_rdep[i]--;
+            r[0] = va;
+            r[1] = s_tt_rdep[i] < 4 ? s_tt_rput[i][s_tt_rdep[i]] : 0;
+            r[2] = *(const uint32_t *)(m + 0x372F70u);
+            r[3] = (uint32_t)s_tt_rdep[i];
+            tt_hdr(12, 1, va);
+            fwrite(r, 4, 4, s_tt);
+        }
+    }
+}
+
+static void tree_trace_draw(uint32_t va, int is_exit)
+{
+    const uint8_t *m;
+    const uint32_t *sp;
+    if (s_tt_on <= 0)
+        return;
+    m = (const uint8_t *)xbox_GetMemoryOffset();
+    sp = (const uint32_t *)(m + g_esp);
+    tree_trace_range(m, va, is_exit);
+    if (va == 0x00114C80u && !is_exit) {
+        /* kind 13: sub_00114C80's list (ren, count, list, flags), extra =
+         * the return address; entries as kind 1. */
+        uint32_t n = sp[2], i;
+        if (n > 4096)
+            n = 0;
+        tt_hdr(13, n, sp[0]);
+        for (i = 0; i < n; i++)
+            tt_entry(m, sp[3] + 24 * i, sp[4] & 0xFF);
+    }
+    if (va == 0x00112530u && !is_exit) {
+        uint32_t ren = sp[1], rec = sp[2], inst = *(const uint32_t *)(m + rec);
+        uint32_t mesh = *(const uint32_t *)(m + inst + 4), fl = *(const uint32_t *)(m + mesh + 4);
+        float d, t1, t2;
+        memcpy(&d, m + inst + 0x10, 4);
+        memcpy(&t1, m + mesh + 0x2B4, 4);
+        memcpy(&t2, m + mesh + 0x2BC, 4);
+        if (fl & 0x1000u) {
+            s_tt_lod = m[ren + 0x80C8]; s_tt_path = 1;
+        } else if (m[mesh + 0x96]) {
+            s_tt_lod = m[inst + 0x1D]; s_tt_path = 2;
+        } else if (m[ren + 0x80D4]) {
+            s_tt_lod = *(const uint32_t *)(m + mesh + 0x81) - 1; s_tt_path = 3;
+        } else if (t1 > d && m[mesh + 0x2B8]) {
+            s_tt_lod = 1; s_tt_path = 4;
+        } else if (t2 > d && m[mesh + 0x2C0]) {
+            s_tt_lod = 2; s_tt_path = 5;
+        } else {
+            s_tt_lod = 0; s_tt_path = 6;
+        }
+        s_tt_inst = inst;
+        s_tt_mesh = mesh;
+        s_tt_dist = d;
+        s_tt_put0 = *(const uint32_t *)(m + 0x372F70u);
+    } else if (va == 0x00112530u) {
+        struct { uint32_t inst; float dist; uint32_t bytes; uint8_t lod, draws, jumps, flags; } e;
+        uint32_t put = *(const uint32_t *)(m + 0x372F70u), dr = 0, jp = 0;
+        e.inst = s_tt_inst;
+        e.dist = s_tt_dist;
+        e.flags = (uint8_t)(s_tt_path << 4);
+        if (put >= s_tt_put0) {
+            tt_pb_scan(m, s_tt_put0, put, &dr, &jp);
+            e.bytes = put - s_tt_put0;
+        } else {
+            e.bytes = 0;
+            e.flags |= 1;
+        }
+        e.lod = (uint8_t)s_tt_lod;
+        e.draws = (uint8_t)(dr > 255 ? 255 : dr);
+        e.jumps = (uint8_t)(jp > 255 ? 255 : jp);
+        {
+            uint32_t r2[4] = { s_tt_put0, put, s_tt_mesh, 0 };
+            tt_hdr(10, 2, s_tt_mesh);
+            fwrite(&e, sizeof e, 1, s_tt);
+            fwrite(r2, 4, 4, s_tt);
+        }
+    } else if (va == 0x001101E0u && !is_exit) {
+        uint32_t n = *(const uint32_t *)(m + sp[1] + 0x1F10);
+        s_tt_bput0 = *(const uint32_t *)(m + 0x372F70u);
+        s_tt_bren = sp[1];      /* the renderer: batch count at +0x1F10 */
+        s_tt_bn = n > 1024 ? 0 : n;
+    } else if (va == 0x001101E0u) {
+        uint32_t put = *(const uint32_t *)(m + 0x372F70u), dr = 0, jp = 0, n = s_tt_bn, i;
+        uint32_t ren = s_tt_bren;
+        if (put >= s_tt_bput0)
+            tt_pb_scan(m, s_tt_bput0, put, &dr, &jp);
+        tt_hdr(11, n, (dr > 255 ? 255 : dr) << 24 | ((put >= s_tt_bput0 ? put - s_tt_bput0 : 0xFFFFFFu) & 0xFFFFFFu));
+        {
+            /* RECOMP_TREE_PBDUMP=<items>: list the stream of batches that
+             * big -- method headers, with the first data word. */
+            static long big = -2;
+            if (big == -2) {
+                const char *e = getenv("RECOMP_TREE_PBDUMP");
+                big = e ? atol(e) : -1;
+            }
+            if (big >= 0 && n >= (uint32_t)big && put >= s_tt_bput0) {
+                uint32_t a = s_tt_bput0;
+                fprintf(stderr, "[PBDUMP] F%u batch %u items put %08X-%08X\n", nv2a_pb_presented_frames(), n, s_tt_bput0, put);
+                while (a + 4 <= put) {
+                    uint32_t h = *(const uint32_t *)(m + a), c = (h >> 18) & 0x7FFu;
+                    if ((h & 0xE0000003u) == 0x20000000u || (h & 3u) == 1u || (h & 3u) == 2u) {
+                        fprintf(stderr, "[PBDUMP]   %08X jump/call %08X\n", a, h);
+                        a += 4;
+                        continue;
+                    }
+                    if ((h & 0x1FFCu) != 0x1818u || c > 0)
+                        fprintf(stderr, "[PBDUMP]   %08X m %04X n %u%s d0 %08X\n", a, h & 0x1FFCu, c,
+                                (h & 0x40000000u) ? " ni" : "", c ? *(const uint32_t *)(m + a + 4) : 0);
+                    a += 4 + 4 * c;
+                }
+            }
+        }
+        for (i = 0; i < n; i++) {
+            struct { uint32_t inst; float dist, w; uint8_t lod, type; uint16_t pad; } e;
+            memset(&e, 0, sizeof e);
+            e.inst = *(const uint32_t *)(m + ren + 0x1F14 + 8 * i);
+            e.lod = m[ren + 0x1F18 + 8 * i];
+            fwrite(&e, sizeof e, 1, s_tt);
+        }
+    }
+}
+
 void recomp_trace_enter(const char *name, uint32_t va)
 {
     tree_trace(va);
+    tree_trace_draw(va, 0);
     /* RECOMP_DUMP_BUCKETS: RalliSport Challenge 2's render buckets at the
      * entry of sub_00273890 (eax = renderer): bucket i at eax+24*i+24 holds
      * [begin, end) of 12-byte items, each pointing at a 24-byte record. */
@@ -670,6 +848,7 @@ void recomp_trace_exit(const char *name, uint32_t va)
             }
         }
     }
+    tree_trace_draw(va, 1);
     snapb_exit(va);
     if (s_snapb_n > 0) return;
     snap_exit(va);

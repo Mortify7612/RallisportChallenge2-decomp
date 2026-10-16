@@ -4245,6 +4245,10 @@ static void flip_pace(void)
     next += period;
 }
 
+/* The stream address of the current batch's BEGIN_END (for the draw log). */
+extern uint32_t g_nv2a_cmd_va;
+uint32_t g_nv2a_draw_pb_va;
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -4488,6 +4492,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 
     case NV097_SET_BEGIN_END:
         if (param) {
+            g_nv2a_draw_pb_va = g_nv2a_cmd_va;
             s_gpu.prim = param;
             s_gpu.idx_count = 0;
             s_gpu.inline_count = 0;

@@ -167,6 +167,12 @@ void nv2a_pb_scan_report(void)
  * only when asked -- it was a quarter of the executor's time in a race. */
 static int s_scan_enabled = -1;
 
+/* Where the method being executed sits in the stream: its data word, or the
+ * CALL that reached it. The draw log prints it, so a draw can be matched to
+ * the guest code that wrote it (the title's put pointer). */
+uint32_t g_nv2a_cmd_va;
+static uint32_t s_call_site;
+
 static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                         uint32_t *jumps, uint32_t *unknown, uint32_t *jump_to)
 {
@@ -202,6 +208,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
             if (!in_call) {
                 uint32_t sub = XBOX_CONTIG_BASE | ((w & 0xFFFFFFFCu) & 0x0FFFFFFFu);
                 s_tot_calls++;
+                s_call_site = va - 4;
                 words += pb_walk(sub, sub + 0x400000u, 1, jumps, unknown, NULL);
             }
             continue;
@@ -219,6 +226,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                 /* Same walk, two consumers: the survey counts, the executor
                  * acts. Keeping them on one decode means they can never
                  * disagree about what the stream said. */
+                g_nv2a_cmd_va = in_call ? s_call_site : va;
                 if (s_exec_enabled)
                     nv2a_pb_exec_method(subch, m,
                                         *(const uint32_t *)(mem + va));

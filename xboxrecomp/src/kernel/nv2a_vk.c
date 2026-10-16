@@ -831,6 +831,8 @@ static int dlog_active(void)
     return 0;
 }
 
+extern uint32_t g_nv2a_draw_pb_va;
+
 static void dlog_draw(const Nv2aVkState *st, uint32_t prog, const void *v,
                       size_t vbytes, const uint32_t *idx, uint32_t nidx)
 {
@@ -838,7 +840,7 @@ static void dlog_draw(const Nv2aVkState *st, uint32_t prog, const void *v,
     fprintf(s_dlog, "F%u D%u prog %08X surf %08X/%u swz %u zeta %08X clip %u,%u,%u,%u"
             " v %016llX/%zu i %016llX/%u c %016llX rc %016llX"
             " blend %u %X %X %X cm %08X depth %u %X %u w%u st %u %X %X cull %u %X %X at %u %X %X"
-            " sp %05X va %08X zoff %g %g",
+            " sp %05X va %08X zoff %g %g pb %08X",
             nv2a_pb_presented_frames(), s_dlog_seq++, prog, st->color_va, st->bpp,
             st->swz_w, st->zeta_key, st->clip_x, st->clip_y, st->clip_w, st->clip_h,
             (unsigned long long)hash_bytes((const uint8_t *)v, vbytes), vbytes,
@@ -850,7 +852,7 @@ static void dlog_draw(const Nv2aVkState *st, uint32_t prog, const void *v,
             st->st_test, st->st_func, st->st_ref, st->cull_enable, st->cull_face,
             st->front_face, st->alpha_test, st->alpha_func, st->alpha_ref,
             st->rc ? st->rc->stage_program : 0, st->vtx_va,
-            st->poff_factor, st->poff_units);
+            st->poff_factor, st->poff_units, g_nv2a_draw_pb_va);
     for (i = 0; i < 4; i++) {
         const Nv2aVkTex *t = &st->tex[i];
         uint32_t bytes;

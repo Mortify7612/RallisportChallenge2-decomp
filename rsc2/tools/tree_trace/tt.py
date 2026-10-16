@@ -7,6 +7,13 @@ def read(path):
         ents = []
         if i + 16 * n > len(d): break
         for k in range(n):
+            if kind == 12:      # function, put0, put1, depth
+                ents.append(struct.unpack_from('<4I', d, i)); i += 16
+                continue
+            if kind == 10:      # inst, dist, bytes, lod, draws, jumps, flags; put0, put1, mesh, 0
+                ents.append(struct.unpack_from('<IfIBBBB', d, i) if k == 0 else
+                            struct.unpack_from('<4I', d, i)); i += 16
+                continue
             inst, dist, w, lod, typ, pad = struct.unpack_from('<IffBBH', d, i); i += 16
             ents.append((inst, dist, w, lod, typ, pad))
         out.append((frame, kind, extra, ents))
