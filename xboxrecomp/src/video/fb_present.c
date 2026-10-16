@@ -241,6 +241,11 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        if (w == VK_F3 && !(l & 0x40000000)) {    /* the FPS counter */
+            extern void nv2a_vk_overlay_toggle(void);
+            nv2a_vk_overlay_toggle();
+            return 0;
+        }
         if (w == VK_F11 && !(l & 0x40000000)) {   /* not auto-repeat */
             fb_set_fullscreen(h, !s_fullscreen);
             return 0;
@@ -820,6 +825,12 @@ static void fb_events(SDL_Window *win, int *resized)
                 extern void xbox_FlightDumpRequest(void);
                 g_recomp_user_mark++;
                 xbox_FlightDumpRequest();
+            }
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F3
+                    && !ev.key.repeat) {
+                /* The FPS counter (RECOMP_FPS_OVERLAY). */
+                extern void nv2a_vk_overlay_toggle(void);
+                nv2a_vk_overlay_toggle();
             }
             if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F11
                     && !ev.key.repeat) {

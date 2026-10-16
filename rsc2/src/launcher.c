@@ -36,7 +36,7 @@ int nv2a_vk_device_names(char (*names)[256], int max);
 #define MAXV 12
 
 enum {
-    O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS, O_SHOW,
+    O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS, O_FPSCOUNT, O_SHOW,
     O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_KEYBOARD, O_RUMBLE,
     O_COUNT
 };
@@ -134,6 +134,12 @@ static void opts_init(int list_gpus)
     opt_add(o, "120", "120");
     opt_add(o, "144", "144");
     opt_add(o, "Unlimited", "0");
+
+    o = opt_def(O_FPSCOUNT, "fps_counter", "RECOMP_FPS_OVERLAY", NULL, 0, "FPS counter",
+                "Frames per second and frame times in the corner, with a graph of "
+                "recent frames. F3 switches it while playing.");
+    opt_add(o, "Off", "0");
+    opt_add(o, "On", "1");
 
     o = opt_def(O_SHOW, "show_launcher", NULL, "LAUNCHER", 0, "Show at startup",
                 "When off, the game starts straight away. Start it with --launcher "
@@ -302,7 +308,8 @@ static void env_put(const char *k, const char *v)
 
 static int vk_only(int i)
 {
-    return i == O_GPU || i == O_SCALE || i == O_MSAA || i == O_ANISO || i == O_AO;
+    return i == O_GPU || i == O_SCALE || i == O_MSAA || i == O_ANISO || i == O_AO
+        || i == O_FPSCOUNT;
 }
 
 /* Only variables nobody set by hand. The Vulkan-only settings are left out
@@ -356,7 +363,7 @@ static int launcher_window(void) { return 1; }
 
 /* Layout in logical units; the renderer's pixels per unit is s_px. */
 #define WIN_W 1000
-#define WIN_H 720
+#define WIN_H 760
 #define ROW_H 42
 #define SEC_H 34
 #define COL_W 444
@@ -737,24 +744,24 @@ static void draw(void)
             snprintf(t, sizeof t, "%s  (Only used by the Vulkan renderer.)", o->help);
         else
             snprintf(t, sizeof t, "%s", o->help);
-        text_wrap(&s_body, 58, 552, WIN_W - 116, 22, t, C_MUTED);
+        text_wrap(&s_body, 58, 592, WIN_W - 116, 22, t, C_MUTED);
     } else {
         char t[1100];
         snprintf(t, sizeof t, "Settings are saved to %s", s_path);
-        text_wrap(&s_body, 58, 552, WIN_W - 116, 22, t, C_DIM);
+        text_wrap(&s_body, 58, 592, WIN_W - 116, 22, t, C_DIM);
     }
 
-    fill(48, 634, WIN_W - 96, 1, C_LINE);
+    fill(48, 674, WIN_W - 96, 1, C_LINE);
     {
         float hx = 48;
-        keycap(&hx, 606, "Enter", "start");
-        keycap(&hx, 606, "Esc", "quit");
-        keycap(&hx, 606, "Arrows", "choose and change");
-        keycap(&hx, 606, "A / Start", "on a controller");
+        keycap(&hx, 646, "Enter", "start");
+        keycap(&hx, 646, "Esc", "quit");
+        keycap(&hx, 646, "Arrows", "choose and change");
+        keycap(&hx, 646, "A / Start", "on a controller");
     }
-    draw_button(B_DEFAULTS, 48, 656, 130, "Defaults", 0);
-    draw_button(B_QUIT, WIN_W - 48 - 190 - 12 - 110, 656, 110, "Quit", 0);
-    draw_button(B_START, WIN_W - 48 - 190, 656, 190, "Start game", 1);
+    draw_button(B_DEFAULTS, 48, 696, 130, "Defaults", 0);
+    draw_button(B_QUIT, WIN_W - 48 - 190 - 12 - 110, 696, 110, "Quit", 0);
+    draw_button(B_START, WIN_W - 48 - 190, 696, 190, "Start game", 1);
 }
 
 static void change(int i, int d)

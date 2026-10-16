@@ -43,6 +43,7 @@ void nv2a_vk_present(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
 void nv2a_vk_zpass(int enable) { (void)enable; }
 void nv2a_vk_set_gamma(const uint8_t *r, const uint8_t *g, const uint8_t *b) { (void)r; (void)g; (void)b; }
 int nv2a_gamma_ramp(uint8_t out[3][256]) { (void)out; return 0; }
+void nv2a_vk_overlay_toggle(void) { }
 void xbox_FlightDumpRequest(void) { }
 void nv2a_vk_report_clear(void) { }
 void nv2a_vk_report_get(uint32_t va, uint64_t stamp) { (void)va; (void)stamp; }
@@ -248,6 +249,10 @@ static struct {
     uint32_t gm_w, gm_h;
     VkPipeline gm_pipe;
     int dump_gamma;             /* the pending dump is pre-gamma: apply it */
+    /* The FPS counter (overlay_*). */
+    VkImage ov_img;
+    VkDeviceMemory ov_mem;
+    VkImageView ov_view;
     /* RECOMP_VK_AO: ambient occlusion on the presented scene (ao_*). */
     int ao_on;
     float ao_radius, ao_intensity, ao_bias, ao_far, ao_near, ao_tan;
@@ -5448,6 +5453,198 @@ static void hires_dump(uint32_t va, uint32_t pitch)
     V.dump_gamma = V.gm_on;
 }
 
+/* ---- FPS counter --------------------------------------------------------- */
+
+/* RECOMP_FPS_OVERLAY=1 (or F3 in the window): frames per second and frame
+ * times in a corner of the window -- the average, the fastest and slowest
+ * frame of the last second, and a graph of the last 160 frames against the
+ * frame-rate limit. Frame time is the time between presents. Drawn on the
+ * CPU with a built-in 5x7 font and blitted into the window image after the
+ * title's frame, so neither the title, MSAA nor the gamma ramp touch it. */
+
+#define OV_W 168
+#define OV_H 64
+#define OV_N 256
+
+static volatile int s_ov_on = -1;
+static double s_ov_dt[OV_N];            /* ms, ring */
+static uint32_t s_ov_i, s_ov_count;
+static double s_ov_last, s_ov_shown_at;
+static char s_ov_text[3][32];
+static uint8_t s_ov_px[OV_W * OV_H * 4];
+
+void nv2a_vk_overlay_toggle(void)
+{
+    s_ov_on = s_ov_on > 0 ? 0 : 1;
+}
+
+/* ' ', '.', 0-9, then F P S m s a v g i n x: 5x7, one byte per row. */
+static const char k_ov_chars[] = " .0123456789FPSmsavginx";
+static const uint8_t k_ov_font[][7] = {
+    {0,0,0,0,0,0,0}, {0,0,0,0,0,0x0C,0x0C},
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E},
+    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E},
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E},
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, {0x1F,0x01,0x02,0x04,0x08,0x08,0x08},
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C},
+    {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}, {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10},
+    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, {0,0,0x1A,0x15,0x15,0x11,0x11},
+    {0,0,0x0E,0x10,0x0E,0x01,0x1E}, {0,0,0x0E,0x01,0x0F,0x11,0x0F},
+    {0,0,0x11,0x11,0x11,0x0A,0x04}, {0,0,0x0F,0x11,0x0F,0x01,0x0E},
+    {0x04,0,0x0C,0x04,0x04,0x04,0x0E}, {0,0,0x16,0x19,0x11,0x11,0x11},
+    {0,0,0x11,0x0A,0x04,0x0A,0x11},
+};
+
+static void ov_fill(int x, int y, int w, int h, uint32_t rgb)
+{
+    int i, j;
+    for (j = y; j < y + h; j++)
+        for (i = x; i < x + w; i++) {
+            uint8_t *p;
+            if (i < 0 || j < 0 || i >= OV_W || j >= OV_H)
+                continue;
+            p = s_ov_px + ((size_t)j * OV_W + i) * 4;
+            p[0] = (uint8_t)(rgb >> 16);
+            p[1] = (uint8_t)(rgb >> 8);
+            p[2] = (uint8_t)rgb;
+            p[3] = 255;
+        }
+}
+
+static void ov_text(int x, int y, const char *t, uint32_t rgb)
+{
+    for (; *t; t++, x += 6) {
+        const char *c = strchr(k_ov_chars, *t);
+        int r, b;
+        if (!c)
+            continue;
+        for (r = 0; r < 7; r++)
+            for (b = 0; b < 5; b++)
+                if (k_ov_font[c - k_ov_chars][r] & (0x10 >> b))
+                    ov_fill(x + b, y + r, 1, 1, rgb);
+    }
+}
+
+/* Called once per present: time this frame, and draw the counter. */
+static void overlay_frame(uint32_t ox, uint32_t oy)
+{
+    double now = now_ms(), target;
+    VkDeviceSize off;
+    uint8_t *stage;
+    uint32_t k, n, i;
+    int hz;
+
+    if (s_ov_on < 0) {
+        const char *e = getenv("RECOMP_FPS_OVERLAY");
+        s_ov_on = e && *e && strcmp(e, "0") != 0;
+    }
+    if (s_ov_last > 0.0) {
+        s_ov_dt[s_ov_i] = now - s_ov_last;
+        s_ov_i = (s_ov_i + 1) % OV_N;
+        if (s_ov_count < OV_N)
+            s_ov_count++;
+    }
+    s_ov_last = now;
+    if (s_ov_on <= 0 || !s_ov_count)
+        return;
+    {
+        const char *e = getenv("RECOMP_FLIP_HZ");
+        hz = e ? atoi(e) : 60;
+        target = 1000.0 / (hz > 0 ? hz : 60);
+    }
+    /* The numbers: the last second's frames, refreshed four times a second
+     * so they can be read. */
+    if (now - s_ov_shown_at >= 250.0) {
+        double sum = 0.0, lo = 1e9, hi = 0.0;
+        n = 0;
+        for (i = 0; i < s_ov_count && sum < 1000.0; i++) {
+            double d = s_ov_dt[(s_ov_i + OV_N - 1 - i) % OV_N];
+            sum += d;
+            if (d < lo) lo = d;
+            if (d > hi) hi = d;
+            n++;
+        }
+        snprintf(s_ov_text[0], sizeof s_ov_text[0], "%.1f FPS", n && sum > 0.0 ? n * 1000.0 / sum : 0.0);
+        snprintf(s_ov_text[1], sizeof s_ov_text[1], "%.2f ms avg", n ? sum / n : 0.0);
+        snprintf(s_ov_text[2], sizeof s_ov_text[2], "min %.1f max %.1f", lo < 1e9 ? lo : 0.0, hi);
+        s_ov_shown_at = now;
+    }
+    ov_fill(0, 0, OV_W, OV_H, 0x101418);
+    ov_text(4, 3, s_ov_text[0], 0xFFFFFF);
+    ov_text(4, 12, s_ov_text[1], 0xC8D0D8);
+    ov_text(4, 21, s_ov_text[2], 0xC8D0D8);
+    /* The graph: one column per frame, newest on the right, scaled so twice
+     * the frame-rate limit fills it; the line is the limit. */
+    {
+        const int gx = 4, gy = 31, gw = OV_W - 8, gh = OV_H - 34;
+        ov_fill(gx, gy, gw, gh, 0x1C2228);
+        for (i = 0; i < (uint32_t)gw && i < s_ov_count; i++) {
+            double d = s_ov_dt[(s_ov_i + OV_N - 1 - i) % OV_N];
+            int h = (int)(d / (2.0 * target) * gh + 0.5);
+            uint32_t col = d <= target * 1.1 ? 0x58D068 : d <= target * 2.0 ? 0xE8C040 : 0xE85848;
+            if (h > gh) h = gh;
+            if (h < 1) h = 1;
+            ov_fill(gx + gw - 1 - (int)i, gy + gh - h, 1, h, col);
+        }
+        ov_fill(gx, gy + gh / 2, gw, 1, 0x8090A0);
+    }
+
+    /* Into the window, scaled up for its size, at the frame's corner. */
+    if (!V.ov_img) {
+        if (!image_create(OV_W, OV_H, 1, 1, VK_FORMAT_R8G8B8A8_UNORM,
+                          VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0,
+                          VK_IMAGE_ASPECT_COLOR_BIT, &V.ov_img, &V.ov_mem, &V.ov_view)) {
+            V.ov_img = VK_NULL_HANDLE;
+            return;
+        }
+        barrier_image(V.dcb, V.ov_img, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
+    stage = (uint8_t *)ring_alloc(&V.stage, sizeof s_ov_px, 16, &off);
+    if (!stage)
+        return;
+    memcpy(stage, s_ov_px, sizeof s_ov_px);
+    {
+        VkBufferImageCopy c;
+        VkImageBlit b;
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        memset(&c, 0, sizeof c);
+        c.bufferOffset = off;
+        c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        c.imageSubresource.layerCount = 1;
+        c.imageExtent.width = OV_W;
+        c.imageExtent.height = OV_H;
+        c.imageExtent.depth = 1;
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb, 0, NULL, 0, NULL);
+        vkCmdCopyBufferToImage(V.dcb, V.stage.buf, V.ov_img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 1, &mb, 0, NULL, 0, NULL);
+        k = V.sc_ext.height / 540;
+        if (k < 1) k = 1;
+        memset(&b, 0, sizeof b);
+        b.srcSubresource.aspectMask = b.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.srcSubresource.layerCount = b.dstSubresource.layerCount = 1;
+        b.srcOffsets[1].x = OV_W;
+        b.srcOffsets[1].y = OV_H;
+        b.srcOffsets[1].z = 1;
+        b.dstOffsets[0].x = (int32_t)(ox + 8 * k);
+        b.dstOffsets[0].y = (int32_t)(oy + 8 * k);
+        b.dstOffsets[1].x = (int32_t)(ox + 8 * k + OV_W * k);
+        b.dstOffsets[1].y = (int32_t)(oy + 8 * k + OV_H * k);
+        b.dstOffsets[1].z = 1;
+        if ((uint32_t)b.dstOffsets[1].x <= V.sc_ext.width && (uint32_t)b.dstOffsets[1].y <= V.sc_ext.height)
+            vkCmdBlitImage(V.dcb, V.ov_img, VK_IMAGE_LAYOUT_GENERAL, V.sc_img[V.sc_idx],
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_NEAREST);
+    }
+}
+
 /* Blit the surface the title just finished into the window. */
 void nv2a_vk_present(uint32_t va, uint32_t pitch)
 {
@@ -5567,6 +5764,16 @@ void nv2a_vk_present(uint32_t va, uint32_t pitch)
         VkImage src = gamma_apply(s, sw * V.sx, sh * V.scale);
         vkCmdBlitImage(V.dcb, src, VK_IMAGE_LAYOUT_GENERAL, V.sc_img[V.sc_idx],
                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &b, VK_FILTER_LINEAR);
+    }
+    {
+        /* The counter goes on top of the frame (the blit above must land
+         * first: same image, both transfer writes). */
+        VkMemoryBarrier mb = { VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        mb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        mb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+        overlay_frame(ox, oy);
     }
     if (getenv("RECOMP_VK_PRESENT_DUMP")) {
         barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,

@@ -48,6 +48,10 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
 - `RECOMP_VK_DEVICE=N`: pick a Vulkan device by index (listed at start).
 - `RECOMP_VK_VSYNC=1`: FIFO presentation instead of mailbox.
 - `RECOMP_FLIP_HZ=N`: flip pacing (default 60; 0 = unpaced).
+- `RECOMP_FPS_OVERLAY=1`, or F3 in the window: an FPS counter in the
+  corner. It shows the average, fastest and slowest frame time of the last
+  second, and a graph of the last 160 frames against the frame-rate limit
+  (the line). It's also in the launcher, and needs the Vulkan renderer.
 - `RECOMP_GAMMA=0`: ignore the game's gamma ramp. The console's video DAC
   maps every pixel through the ramp the game sets; RalliSport Challenge 2's
   race ramp lifts and warms the shadows and midtones. It's applied when
