@@ -444,6 +444,8 @@ static struct {
     char htex[8][64];           /* this frame's texture uploads (hitch log) */
     int nhtex;
     uint32_t st_rt_copies;      /* surfaces copied on the GPU to sample */
+    uint32_t st_passes;         /* render passes begun (tilers pay per pass) */
+    uint32_t st_pass_clears;    /* vkCmdClearAttachments inside a pass */
     uint32_t st_alias_clears;   /* aliased clears carried over on the GPU */
     uint8_t *present_dump_px;
     const char *present_dump_path;
@@ -3624,6 +3626,7 @@ static void ms_refresh(Surf *cs)
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
     vkCmdBeginRendering(V.dcb, &ri);
+    V.st_passes++;
     vp.x = vp.y = 0.0f;
     vp.width = (float)sc.extent.width;
     vp.height = (float)sc.extent.height;
@@ -3807,6 +3810,7 @@ static void ao_pass(VkImageView target, VkImageView resolve, uint32_t w, uint32_
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &ca;
     vkCmdBeginRendering(V.dcb, &ri);
+    V.st_passes++;
     vp.x = vp.y = 0.0f;
     vp.width = (float)w;
     vp.height = (float)h;
@@ -4036,6 +4040,7 @@ static int begin_target(const Nv2aVkState *st)
         ri.pStencilAttachment = &da;
     }
     vkCmdBeginRendering(V.dcb, &ri);
+    V.st_passes++;
     V.rendering = 1;
     V.cur_cs = cs;
     V.cur_zs = zs;
@@ -4131,6 +4136,7 @@ void nv2a_vk_clear(const Nv2aVkState *st, uint32_t flags, uint32_t argb, uint32_
     cr.layerCount = 1;
     if (!cr.rect.extent.width || !cr.rect.extent.height)
         return;
+    V.st_pass_clears++;
     vkCmdClearAttachments(V.dcb, n, at, 1, &cr);
     if (flags & 0xF0) {
         mark_drawn(st);
@@ -4229,6 +4235,23 @@ static uint32_t s_spec_ready, s_spec_failed;
 static int glsl_to_spirv(const char *src, uint32_t hash, int frag, uint32_t **words, size_t *bytes);
 
 /* The specialised source: constants, the common block, nv2a.frag's body. */
+/* Combiner arithmetic at 16 bits (nv2a.frag NV2A_MP): on by default on
+ * Android, where mobile GPUs run it at about twice the rate; RECOMP_VK_FP16
+ * says 0 or 1 anywhere. */
+static int spec_fp16(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_FP16");
+#if defined(__ANDROID__)
+        on = !(e && strcmp(e, "0") == 0);
+#else
+        on = e && strcmp(e, "1") == 0;
+#endif
+    }
+    return on;
+}
+
 static char *spec_source(const SpecVals *v)
 {
     size_t n = sizeof k_nv2a_frag_src + sizeof k_nv2a_common_glsl_src + 4096;
@@ -4238,8 +4261,10 @@ static char *spec_source(const SpecVals *v)
     if (!src)
         return NULL;
     q = src;
-    q += sprintf(q, "#version 450\n#define NV2A_SPEC 1\n%s",
-                 v->fast ? "#define NV2A_FAST_DEPTH 1\n" : "");
+    q += sprintf(q, "#version 450\n#define NV2A_SPEC 1\n%s%s%s",
+                 v->fast ? "#define NV2A_FAST_DEPTH 1\n" : "",
+                 getenv("RECOMP_VK_FLAT") ? "#define NV2A_FLAT 1\n" : "",
+                 spec_fp16() ? "#define NV2A_MP mediump\n" : "");
     q += sprintf(q, "const uvec4 SP_MISC = uvec4(%uu, %uu, 0u, %uu);\n", v->misc_x, v->misc_y, v->misc_w);
     q += sprintf(q, "const uvec4 SP_MISC2 = uvec4(%uu, %uu, %uu, %uu);\n",
                  v->misc2[0], v->misc2[1], v->misc2[2], v->misc2[3]);
@@ -4354,7 +4379,9 @@ static int spec_enabled(void)
         if (s_spec_on) {
             s_frag_src_hash = hash_bytes((const uint8_t *)k_nv2a_frag_src, sizeof k_nv2a_frag_src)
                             ^ hash_bytes((const uint8_t *)k_nv2a_common_glsl_src,
-                                         sizeof k_nv2a_common_glsl_src) * 31;
+                                         sizeof k_nv2a_common_glsl_src) * 31
+                            ^ (getenv("RECOMP_VK_FLAT") ? 0x9E3779B97F4A7C15ull : 0)
+                            ^ (spec_fp16() ? 0xC2B2AE3D27D4EB4Full : 0);
             {
                 /* glslang's process state before the worker compiles. */
                 uint32_t *w = NULL;
@@ -6181,11 +6208,14 @@ void nv2a_vk_flush(void)
         if (V.frame % 120 == 0) {
             fprintf(stderr, "  [VK] frame %u (last 120): draws %u tris %u syncs %u tex uploads %u"
                     " hashed %u MB surf uploads %u textures %u pipelines %d gpu-wait %.1f ms/frame"
-                    " rt copies %u alias clears %u kicks %u gpu %.2f ms/frame spec %u/%u\n",
+                    " rt copies %u alias clears %u kicks %u gpu %.2f ms/frame spec %u/%u"
+                    " passes %u clears %u\n",
                     V.frame, V.st_draws, V.st_tris, V.st_syncs, V.st_tex_up,
                     V.st_tex_hash_mb >> 10, V.st_surf_up, V.ntex, V.npipes, V.st_wait_ms / 120.0,
                     V.st_rt_copies, V.st_alias_clears, V.st_kicks, V.gpu_ms / 120.0,
-                    V.st_spec_draws, V.st_spec_draws + V.st_uber_draws);
+                    V.st_spec_draws, V.st_spec_draws + V.st_uber_draws,
+                    V.st_passes, V.st_pass_clears);
+            V.st_passes = V.st_pass_clears = 0;
             V.st_wait_ms = 0;
             V.st_rt_copies = 0;
             V.st_alias_clears = 0;

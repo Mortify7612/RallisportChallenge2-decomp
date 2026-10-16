@@ -45,11 +45,19 @@ layout(location = 0) out vec4 o_color;
 #define K_VPW    u.vp.w
 #endif
 
-vec4 R[16];
+/* NV2A_MP: the precision of the combiner arithmetic -- mediump (16-bit,
+ * about twice the rate on mobile GPUs) where nv2a_vk.c asks for it; the
+ * combiners themselves are about 9 bits a channel. Texture coordinates,
+ * depth and the texture-shader dot products stay full precision. */
+#ifndef NV2A_MP
+#define NV2A_MP
+#endif
 
-float map_in(float x, uint b)
+NV2A_MP vec4 R[16];
+
+NV2A_MP float map_in(NV2A_MP float x, uint b)
 {
-    float p = max(x, 0.0);
+    NV2A_MP float p = max(x, 0.0);
     switch ((b >> 5) & 7u) {
     case 0u: return p;
     case 1u: return 1.0 - clamp(x, 0.0, 1.0);
@@ -62,7 +70,7 @@ float map_in(float x, uint b)
     }
 }
 
-float map_out(float x, uint m)
+NV2A_MP float map_out(NV2A_MP float x, uint m)
 {
     switch (m) {
     case 0x08u: return x - 0.5;
@@ -74,29 +82,29 @@ float map_out(float x, uint m)
     }
 }
 
-vec3 map_out3(vec3 v, uint m)
+NV2A_MP vec3 map_out3(NV2A_MP vec3 v, uint m)
 {
     return clamp(vec3(map_out(v.x, m), map_out(v.y, m), map_out(v.z, m)), -1.0, 1.0);
 }
 
-vec3 read_rgb(uint b)
+NV2A_MP vec3 read_rgb(uint b)
 {
     b &= 0xFFu;
-    vec4 r = R[b & 15u];
-    vec3 v = (b & 0x10u) != 0u ? r.aaa : r.rgb;
+    NV2A_MP vec4 r = R[b & 15u];
+    NV2A_MP vec3 v = (b & 0x10u) != 0u ? r.aaa : r.rgb;
     return vec3(map_in(v.x, b), map_in(v.y, b), map_in(v.z, b));
 }
 
-float read_alpha(uint b)
+NV2A_MP float read_alpha(uint b)
 {
     b &= 0xFFu;
-    vec4 r = R[b & 15u];
+    NV2A_MP vec4 r = R[b & 15u];
     return map_in((b & 0x10u) != 0u ? r.a : r.b, b);
 }
 
 /* What each texture stage produced, and the dot products the texture-shader
  * modes leave behind for the stages after them. */
-vec4 T[4];
+NV2A_MP vec4 T[4];
 float D[4];
 vec4 TC[4];
 
@@ -216,6 +224,11 @@ bool alpha_pass(float a)
 
 void main()
 {
+#ifdef NV2A_FLAT
+    /* RECOMP_VK_FLAT: a flat colour, to measure what the combiners cost. */
+    o_color = vec4(0.5, 0.5, 0.5, 1.0);
+    return;
+#endif
     /* The stored depth in title units (z or w LSBs), with the polygon offset:
      * factor * max screen-z slope + units, in z-buffer LSBs. Titles size it
      * that way under the w-buffer too (RSC2's car shadow: bias = k / dist^2),
@@ -270,23 +283,23 @@ void main()
             R[2] = u.f1[(flags & 0x100u) != 0u ? s : 0u];
             bool mux = (flags & 1u) != 0u ? R[12].a >= 0.5
                                           : (int(R[12].a * 255.0) & 1) != 0;
-            vec3 A = read_rgb(icw >> 24), B = read_rgb(icw >> 16);
-            vec3 C = read_rgb(icw >> 8),  D = read_rgb(icw);
-            float aA = read_alpha(aicw >> 24), aB = read_alpha(aicw >> 16);
-            float aC = read_alpha(aicw >> 8),  aD = read_alpha(aicw);
+            NV2A_MP vec3 A = read_rgb(icw >> 24), B = read_rgb(icw >> 16);
+            NV2A_MP vec3 C = read_rgb(icw >> 8),  D = read_rgb(icw);
+            NV2A_MP float aA = read_alpha(aicw >> 24), aB = read_alpha(aicw >> 16);
+            NV2A_MP float aC = read_alpha(aicw >> 8),  aD = read_alpha(aicw);
 
-            vec3 pab = (fl & 2u) != 0u ? vec3(dot(A, B)) : A * B;
-            vec3 pcd = (fl & 1u) != 0u ? vec3(dot(C, D)) : C * D;
-            vec3 sum = (fl & 4u) != 0u ? (mux ? pcd : pab) : pab + pcd;
-            vec3 ab = map_out3(pab, fl & 0x38u);
-            vec3 cd = map_out3(pcd, fl & 0x38u);
-            vec3 ms = map_out3(sum, fl & 0x38u);
+            NV2A_MP vec3 pab = (fl & 2u) != 0u ? vec3(dot(A, B)) : A * B;
+            NV2A_MP vec3 pcd = (fl & 1u) != 0u ? vec3(dot(C, D)) : C * D;
+            NV2A_MP vec3 sum = (fl & 4u) != 0u ? (mux ? pcd : pab) : pab + pcd;
+            NV2A_MP vec3 ab = map_out3(pab, fl & 0x38u);
+            NV2A_MP vec3 cd = map_out3(pcd, fl & 0x38u);
+            NV2A_MP vec3 ms = map_out3(sum, fl & 0x38u);
 
-            float apab = aA * aB, apcd = aC * aD;
-            float asum = (afl & 4u) != 0u ? (mux ? apcd : apab) : apab + apcd;
-            float aab = clamp(map_out(apab, afl & 0x38u), -1.0, 1.0);
-            float acd = clamp(map_out(apcd, afl & 0x38u), -1.0, 1.0);
-            float ams = clamp(map_out(asum, afl & 0x38u), -1.0, 1.0);
+            NV2A_MP float apab = aA * aB, apcd = aC * aD;
+            NV2A_MP float asum = (afl & 4u) != 0u ? (mux ? apcd : apab) : apab + apcd;
+            NV2A_MP float aab = clamp(map_out(apab, afl & 0x38u), -1.0, 1.0);
+            NV2A_MP float acd = clamp(map_out(apcd, afl & 0x38u), -1.0, 1.0);
+            NV2A_MP float ams = clamp(map_out(asum, afl & 0x38u), -1.0, 1.0);
 
             uint d;
             d = (ocw >> 4) & 15u;
@@ -309,13 +322,13 @@ void main()
             uint ff = f1 & 0xFFu;
             R[1] = u.fc0;
             R[2] = u.fc1;
-            vec3 a = (ff & 0x40u) != 0u ? 1.0 - R[5].rgb : R[5].rgb;
-            vec3 b = (ff & 0x20u) != 0u ? 1.0 - R[12].rgb : R[12].rgb;
+            NV2A_MP vec3 a = (ff & 0x40u) != 0u ? 1.0 - R[5].rgb : R[5].rgb;
+            NV2A_MP vec3 b = (ff & 0x20u) != 0u ? 1.0 - R[12].rgb : R[12].rgb;
             R[14] = vec4((ff & 0x80u) != 0u ? clamp(a + b, 0.0, 1.0) : a + b, 0.0);
-            vec3 E = read_rgb(f1 >> 24), F = read_rgb(f1 >> 16);
+            NV2A_MP vec3 E = read_rgb(f1 >> 24), F = read_rgb(f1 >> 16);
             R[15] = vec4(E * F, 0.0);
-            vec3 A = read_rgb(f0 >> 24), B = read_rgb(f0 >> 16);
-            vec3 C = read_rgb(f0 >> 8),  D = read_rgb(f0);
+            NV2A_MP vec3 A = read_rgb(f0 >> 24), B = read_rgb(f0 >> 16);
+            NV2A_MP vec3 C = read_rgb(f0 >> 8),  D = read_rgb(f0);
             outc = vec4(D + C * (1.0 - A) + B * A, read_alpha(f1 >> 8));
         } else {
             outc = R[12];
