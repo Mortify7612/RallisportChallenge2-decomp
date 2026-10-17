@@ -25,3 +25,7 @@ __pycache__/
 run*.err
 run*.out
 gdb*.txt
+
+# Claude Code local state (the project skill in .claude/skills is tracked)
+.claude/*
+!.claude/skills/
