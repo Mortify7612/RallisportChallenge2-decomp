@@ -83,15 +83,20 @@ The cross build is documented in `rsc2/RUNNING.md`, "Windows". It needs
 `vulkan-1.dll` import library. That folder is gitignored, and the rebuild
 steps are in RUNNING.md.
 
-**Building on Windows itself is untested.** The likely route:
+**Building on Windows itself works** with MSYS2's MINGW64 shell (GCC 16,
+Windows 11); steps in `rsc2/RUNNING.md`, "Windows (native build with
+MSYS2)". Running that build on real Windows is still untested. Notes:
 
-- MSYS2's MINGW64 shell, with `mingw-w64-x86_64-{gcc,cmake,ninja,python,SDL2,glslang,vulkan-headers,vulkan-loader}`.
-- Configure without the toolchain file (it's for cross builds), pointing
-  the `-DVulkan_*`, `-DXBOXRECOMP_GLSLANG_*` and `-DSDL2_DIR` options at the
-  MSYS2 prefix.
-- `rsc2/regen.sh` needs bash, a Python venv at `.venv` with capstone, and
-  the XBE at `xboxrecomp/game_files/default.xbe`. It hardcodes
-  `.venv/bin/python`.
+- No toolchain file and no `-D` paths: CMake finds MSYS2's glslang, SDL2
+  and Vulkan on its own.
+- Pass `-D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000007` in
+  `CMAKE_C_FLAGS`, or `kernel_file.c` fails on `FileDispositionInfoEx`.
+- `rsc2/regen.sh` needs `xboxrecomp/game_files/default_analysis.json`
+  (from `tools.xbe_parser --json`) next to the XBE. A venv made with
+  `--system-site-packages` over MSYS2's python-capstone/pefile/numpy has
+  the `.venv/bin/python` it hardcodes.
+- The result links glslang, SPIRV-Tools and the GCC runtime as DLLs from
+  `/mingw64/bin`.
 
 The generated `rsc2/src/recomp/` is the same on every host, so copying it
 from the Linux machine avoids the Python setup. The game's CMake already

@@ -176,6 +176,47 @@ Rebuilding `third_party/mingw`:
   x86_64-w64-mingw32-dlltool -d third_party/vulkan-1.def -l third_party/mingw/lib/libvulkan-1.a
   ```
 
+## Windows (native build with MSYS2)
+
+This builds on Windows 11 with MSYS2's MINGW64 environment and needs no
+`third_party/mingw`: MSYS2 provides SDL2, glslang and the Vulkan loader.
+Running the result on real Windows is still untested (issue #4).
+
+In the "MSYS2 MINGW64" shell (run `pacman -Syu` first if the install is
+old; pacman refuses new packages against an outdated `gcc-libs`):
+
+```sh
+pacman -S --needed mingw-w64-x86_64-{gcc,cmake,ninja,python,SDL2,glslang,vulkan-headers,vulkan-loader,shaderc,spirv-tools,python-capstone,python-pefile,python-numpy,python-pytest}
+python -m venv --system-site-packages .venv
+```
+
+Put the game in `RalliSport2/` and its `default.xbe` in
+`xboxrecomp/game_files/`, as on Linux. `regen.sh` also needs the XBE's
+analysis JSON, which it doesn't write itself:
+
+```sh
+(cd xboxrecomp && ../.venv/bin/python -m tools.xbe_parser game_files/default.xbe \
+    --json game_files/default_analysis.json)
+rsc2/regen.sh
+```
+
+MSYS2's headers only declare `FileDispositionInfoEx` (used by
+`kernel_file.c`) for Windows 10 1607 and later, so set the target version:
+
+```sh
+cmake -S rsc2 -B rsc2/build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      "-DCMAKE_C_FLAGS=-D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000007"
+ninja -C rsc2/build
+cmd //c "mklink /J rsc2\\build\\game RalliSport2"
+```
+
+This links glslang, SPIRV-Tools and the GCC runtime as DLLs. To run
+outside the MSYS2 shell, copy them next to the program:
+
+```sh
+ldd rsc2/build/rsc2.exe | awk '/\/mingw64\//{print $3}' | sort -u | xargs -I{} cp {} rsc2/build/
+```
+
 ## ARM64 test build (Linux on aarch64, run under qemu)
 
 This build is groundwork for an Android port, not a release. It lets the
