@@ -9,6 +9,10 @@ the Windows build is cross-compiled and so far tested under Wine.
 C code is generated locally from your `default.xbe` and is not part of this
 repository either.
 
+## Demo
+
+[![RalliSport Challenge 2 running natively on PC (video)](https://img.youtube.com/vi/hVSkDmrpqtg/maxresdefault.jpg)](https://youtu.be/hVSkDmrpqtg)
+
 ## Prebuilt binaries
 
 [Releases](https://github.com/Mortify7612/RallisportChallenge2-decomp/releases)
