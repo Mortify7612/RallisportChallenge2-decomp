@@ -40,6 +40,32 @@ Everything goes in `~/Android`:
 
 The host's `glslc` compiles the renderer's built-in shaders, as on Linux.
 
+6. **Turnip, volk and libadrenotools** (for Adreno devices whose own driver
+   is older than Vulkan 1.3, e.g. an Adreno 650 tablet on Android 13 with
+   1.1.128). Sources go in `third_party/src`:
+   ```sh
+   git clone --depth 1 https://github.com/zeux/volk.git third_party/src/volk
+   git clone --recursive https://github.com/bylaws/libadrenotools.git third_party/src/libadrenotools
+   # Mesa 26.2.5 from archive.mesa3d.org, unpacked to third_party/src/mesa-26.2.5
+   ```
+   Turnip is built with Meson against the NDK, KGSL backend only. The cross
+   file `third_party/android-aarch64-mesa.cross` names the NDK's
+   `aarch64-linux-android29-clang`/`clang++`, `llvm-ar`, `llvm-strip` and lld,
+   with `system = 'android'`, `cpu_family = 'aarch64'`:
+   ```sh
+   meson setup third_party/build-android-turnip third_party/src/mesa-26.2.5 \
+       --cross-file third_party/android-aarch64-mesa.cross -Dbuildtype=release \
+       -Dplatforms=android -Dplatform-sdk-version=29 -Dandroid-stub=true \
+       -Dgallium-drivers= -Dvulkan-drivers=freedreno -Dfreedreno-kmds=kgsl \
+       -Dandroid-libbacktrace=disabled -Dllvm=disabled -Dopengl=false \
+       -Degl=disabled -Dgles1=disabled -Dgles2=disabled -Dglx=disabled \
+       -Dgbm=disabled -Dvalgrind=disabled -Dlibunwind=disabled -Dzstd=disabled \
+       -Dcpp_args=-Wno-c++11-narrowing
+   ninja -C third_party/build-android-turnip
+   ```
+   (`-Wno-c++11-narrowing`: the NDK's clang makes those errors.) Without
+   volk the APK links the system libvulkan and needs a Vulkan 1.3 driver.
+
 ## Build and install
 
 ```sh
@@ -110,6 +136,18 @@ unstripped `rsc2/build-android/libmain.so` for it.
 - **No launcher window yet.** The game starts full screen with the default
   settings.
 - **One guest thread at a time** (`RECOMP_GUEST_LOCK=1`, the ARM default).
+- **Vulkan driver:** calls go through volk, loaded from the system's
+  libvulkan or, when that driver is older than 1.3, from libadrenotools'
+  private copy whose driver is the APK's Turnip (`libvulkan_freedreno.so`).
+  `RSC2_VK_DRIVER=system` or `=turnip` in `rsc2.env` forces one. The
+  surface for SDL's window is made by the renderer, not by SDL.
+
+## Second device: Lenovo tablet (Snapdragon 870 / Adreno 650, Android 13)
+
+- The stock driver is Vulkan 1.1.128; with Turnip (Mesa 26.2.5) the
+  renderer gets Vulkan 1.3. Intro, menus and races run, 2560x1600 output.
+- Menus 60 fps; races about 33-39 fps at the default 2x (attract races
+  47-60). Not yet profiled.
 
 Not done yet: race performance on mobile GPUs, touch controls (use a
 Bluetooth or USB controller), the launcher, and importing the game folder

@@ -2166,6 +2166,10 @@ static DWORD veh_code(int sig, int si_code)
     return EXCEPTION_ACCESS_VIOLATION;
 }
 
+/* What each signal did before veh_install: on Android, debuggerd's handler,
+ * which writes the tombstone and logs the backtrace. */
+static struct sigaction s_veh_prev[32];
+
 static void veh_signal(int sig, siginfo_t *si, void *ucv)
 {
     ucontext_t *uc = (ucontext_t *)ucv;
@@ -2195,8 +2199,13 @@ static void veh_signal(int sig, siginfo_t *si, void *ucv)
         }
     }
 
-    /* Nobody took it: re-fault under the default action. */
-    signal(sig, SIG_DFL);
+    /* Nobody took it: re-fault under what was there before -- the default
+     * action on a desktop, debuggerd's crash report on Android (SIG_DFL
+     * there killed the process with no backtrace at all). */
+    if (sig > 0 && sig < 32)
+        sigaction(sig, &s_veh_prev[sig], NULL);
+    else
+        signal(sig, SIG_DFL);
     errno = saved_errno;
 }
 
@@ -2224,7 +2233,7 @@ static void veh_install(void)
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
     for (k = 0; k < sizeof(sigs) / sizeof(sigs[0]); k++)
-        sigaction(sigs[k], &sa, NULL);
+        sigaction(sigs[k], &sa, sigs[k] < 32 ? &s_veh_prev[sigs[k]] : NULL);
     s_veh_installed = 1;
 }
 

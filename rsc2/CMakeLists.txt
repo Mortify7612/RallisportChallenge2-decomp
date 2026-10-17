@@ -50,6 +50,33 @@ endif()
 # and provides the 'xboxrecomp' umbrella target to link against.
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
+# Android: the renderer calls Vulkan through volk, loaded at run time from
+# the system's libvulkan or from libadrenotools' private copy of it whose
+# driver is Turnip (nv2a_vk.c, vk_android_loader). See android/README.md.
+if(ANDROID AND TARGET xbox_kernel)
+    set(RSC2_VOLK_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/src/volk" CACHE PATH
+        "volk source tree for the Android build")
+    set(RSC2_ADRENOTOOLS_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/src/libadrenotools"
+        CACHE PATH "libadrenotools source tree for the Android build")
+    if(EXISTS "${RSC2_VOLK_SRC}/volk.c")
+        target_sources(xbox_kernel PRIVATE "${RSC2_VOLK_SRC}/volk.c")
+        target_include_directories(xbox_kernel PRIVATE "${RSC2_VOLK_SRC}")
+        # The platform define must reach volk.c too, or vkCreateAndroidSurfaceKHR
+        # is never defined there and binds to libvulkan's function instead.
+        target_compile_definitions(xbox_kernel PRIVATE XBOXRECOMP_VOLK=1 VK_NO_PROTOTYPES=1
+                                   VK_USE_PLATFORM_ANDROID_KHR=1)
+        target_link_libraries(xbox_kernel PRIVATE dl)
+        if(EXISTS "${RSC2_ADRENOTOOLS_SRC}/CMakeLists.txt")
+            add_subdirectory(${RSC2_ADRENOTOOLS_SRC} ${CMAKE_BINARY_DIR}/adrenotools)
+            target_link_libraries(xbox_kernel PRIVATE adrenotools)
+            target_compile_definitions(xbox_kernel PRIVATE XBOXRECOMP_HAVE_ADRENOTOOLS=1)
+        endif()
+    else()
+        message(WARNING "No volk in ${RSC2_VOLK_SRC}: the Android renderer links the "
+                        "system libvulkan and cannot use Turnip")
+    endif()
+endif()
+
 # ── Recompiled game executable ──────────────────────────────────
 
 # Collect generated recompiled code.

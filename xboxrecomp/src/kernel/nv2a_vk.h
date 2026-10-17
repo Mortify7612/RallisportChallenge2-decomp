@@ -125,6 +125,8 @@ int   nv2a_vk_device_names(char (*names)[256], int max);
 void  nv2a_vk_set_surface(uint64_t surface);
 void  nv2a_vk_set_window_size(int w, int h);
 int   nv2a_vk_attach_hwnd(void *hinstance, void *hwnd);   /* Win32 window */
+/* Android: a surface for SDL's ANativeWindow, from the renderer's loader. */
+int   nv2a_vk_create_android_surface(void *anw, uint64_t *surface);
 /* A Wayland window's wl_display and wl_surface (SDL's): HDR frames can then
  * be handed over in the compositor's own colour space (wl_color.h). */
 void  nv2a_vk_set_wayland(void *wl_display, void *wl_surface);

@@ -589,6 +589,7 @@ extern void *nv2a_vk_instance_handle(void);
 extern void  nv2a_vk_set_surface(uint64_t surface);
 extern void  nv2a_vk_set_window_size(int w, int h);
 extern void  nv2a_vk_set_wayland(void *wl_display, void *wl_surface);
+extern int   nv2a_vk_create_android_surface(void *anw, uint64_t *surface);
 
 static volatile int  s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
@@ -942,7 +943,23 @@ static void *fb_thread(void *unused)
                                    fb_wide() ? 1280 : (int)s_fb_width * 2, fb_wide() ? 720 : (int)s_fb_height * 2,
                                    SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
                                    | SDL_WINDOW_VULKAN | fb_start_flags());
+#if defined(__ANDROID__)
+            /* The renderer's own loader makes it (it may be Turnip's). */
+            int made = 0;
+            if (win) {
+                SDL_SysWMinfo wm;
+                uint64_t s64 = 0;
+                SDL_VERSION(&wm.version);
+                if (SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_ANDROID
+                        && nv2a_vk_create_android_surface(wm.info.android.window, &s64)) {
+                    surf = (VkSurfaceKHR)(uintptr_t)s64;
+                    made = 1;
+                }
+            }
+            if (made) {
+#else
             if (win && SDL_Vulkan_CreateSurface(win, (VkInstance)vkinst, &surf)) {
+#endif
                 int dw, dh;
                 SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
                 nv2a_vk_set_window_size(dw, dh);

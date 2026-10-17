@@ -52,6 +52,7 @@ void nv2a_vk_report_get(uint32_t va, uint64_t stamp) { (void)va; (void)stamp; }
 void *nv2a_vk_instance_handle(void) { return NULL; }
 int nv2a_vk_device_names(char (*names)[256], int max) { (void)names; (void)max; return 0; }
 int nv2a_vk_attach_hwnd(void *hinstance, void *hwnd) { (void)hinstance; (void)hwnd; return 0; }
+int nv2a_vk_create_android_surface(void *anw, uint64_t *surface) { (void)anw; (void)surface; return 0; }
 void nv2a_vk_set_surface(uint64_t surface) { (void)surface; }
 void nv2a_vk_set_wayland(void *d, void *s) { (void)d; (void)s; }
 void nv2a_vk_set_window_size(int w, int h) { (void)w; (void)h; }
@@ -67,7 +68,22 @@ int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
 #define VK_USE_PLATFORM_WIN32_KHR 1
 #include <windows.h>
 #endif
+#if defined(XBOXRECOMP_VOLK)
+/* Android: every Vulkan call goes through volk's function pointers, loaded
+ * from whichever libvulkan vk_android_loader opened -- the system's, or a
+ * private copy whose driver is Turnip (see there). */
+#ifndef VK_USE_PLATFORM_ANDROID_KHR
+#define VK_USE_PLATFORM_ANDROID_KHR 1
+#endif
+#include "volk.h"
+#include <dlfcn.h>
+#include <sys/stat.h>
+#if defined(XBOXRECOMP_HAVE_ADRENOTOOLS)
+#include <adrenotools/driver.h>
+#endif
+#else
 #include <vulkan/vulkan.h>
+#endif
 
 /* Android's libvulkan.so exports only the core functions of the API level
  * the app targets (1.1 at API 29), so the 1.2/1.3 ones the renderer uses are
@@ -355,6 +371,8 @@ static struct {
     VkImage ov_img;
     VkDeviceMemory ov_mem;
     VkImageView ov_view;
+    int turnip;                 /* Android: Turnip loaded through adrenotools */
+    char drv_path[600];
     /* RECOMP_VK_AO: ambient occlusion on the presented scene (ao_*). */
     int ao_on;
     float ao_radius, ao_intensity, ao_bias, ao_far, ao_near, ao_tan;
@@ -2190,6 +2208,113 @@ static void post_init(void)
     }
 }
 
+#if defined(XBOXRECOMP_VOLK)
+/* The newest Vulkan version a device of `gipa`'s loader offers, 0 for none. */
+static uint32_t vk_loader_best_api(PFN_vkGetInstanceProcAddr gipa)
+{
+    PFN_vkCreateInstance ci = (PFN_vkCreateInstance)gipa(NULL, "vkCreateInstance");
+    VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    VkInstanceCreateInfo ici = { VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    VkInstance inst;
+    VkPhysicalDevice pds[8];
+    uint32_t n = 8, i, best = 0;
+    app.apiVersion = VK_API_VERSION_1_1;
+    ici.pApplicationInfo = &app;
+    if (!ci || ci(&ici, NULL, &inst) != VK_SUCCESS)
+        return 0;
+    {
+        PFN_vkEnumeratePhysicalDevices ep =
+            (PFN_vkEnumeratePhysicalDevices)gipa(inst, "vkEnumeratePhysicalDevices");
+        PFN_vkGetPhysicalDeviceProperties gp =
+            (PFN_vkGetPhysicalDeviceProperties)gipa(inst, "vkGetPhysicalDeviceProperties");
+        PFN_vkDestroyInstance di = (PFN_vkDestroyInstance)gipa(inst, "vkDestroyInstance");
+        if (ep && gp && ep(inst, &n, pds) >= 0)
+            for (i = 0; i < n; i++) {
+                VkPhysicalDeviceProperties p;
+                gp(pds[i], &p);
+                if (p.apiVersion > best)
+                    best = p.apiVersion;
+            }
+        if (di)
+            di(inst, NULL);
+    }
+    return best;
+}
+
+/* Which Vulkan driver to use on Android, once, before the first call.
+ *
+ * The renderer needs Vulkan 1.3. Many Adreno devices ship an older driver
+ * (an Adreno 650 tablet on Android 13: 1.1.128) for a GPU that Turnip --
+ * Mesa's open Adreno driver, built into the APK as libvulkan_freedreno.so --
+ * drives at 1.3. libadrenotools loads a private copy of the system's
+ * libvulkan.so whose driver lookup is redirected to Turnip, as Android
+ * emulators do; no root needed. RSC2_VK_DRIVER=system or =turnip forces
+ * one; by default Turnip is used when the system driver is older than 1.3
+ * and Turnip is there. */
+static int vk_android_loader(void)
+{
+    static int done = -1;
+    const char *want = getenv("RSC2_VK_DRIVER");
+    void *sys, *h = NULL;
+    PFN_vkGetInstanceProcAddr gipa;
+    uint32_t sys_api;
+    if (done >= 0)
+        return done;
+    done = 0;
+    sys = dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+    gipa = sys ? (PFN_vkGetInstanceProcAddr)dlsym(sys, "vkGetInstanceProcAddr") : NULL;
+    sys_api = gipa ? vk_loader_best_api(gipa) : 0;
+    fprintf(stderr, "  [VK] system driver: Vulkan %u.%u.%u\n", VK_VERSION_MAJOR(sys_api),
+            VK_VERSION_MINOR(sys_api), VK_VERSION_PATCH(sys_api));
+#if defined(XBOXRECOMP_HAVE_ADRENOTOOLS)
+    if (!(want && strcmp(want, "system") == 0)
+            && ((want && strcmp(want, "turnip") == 0) || sys_api < VK_API_VERSION_1_3)) {
+        /* The APK's own library folder: the hooks and Turnip are there. */
+        Dl_info di;
+        char dir[512];
+        struct stat sb;
+        if (dladdr((void *)vk_android_loader, &di) && di.dli_fname
+                && strlen(di.dli_fname) < sizeof dir) {
+            char *slash;
+            snprintf(dir, sizeof dir, "%s", di.dli_fname);
+            slash = strrchr(dir, '/');
+            if (slash)
+                slash[1] = 0;
+            snprintf(V.drv_path, sizeof V.drv_path, "%slibvulkan_freedreno.so", dir);
+            if (stat(V.drv_path, &sb) == 0)
+                h = adrenotools_open_libvulkan(RTLD_NOW, ADRENOTOOLS_DRIVER_CUSTOM, NULL, dir,
+                                               dir, "libvulkan_freedreno.so", NULL, NULL);
+            else
+                fprintf(stderr, "  [VK] no Turnip in the APK (%s)\n", V.drv_path);
+        }
+        if (h) {
+            PFN_vkGetInstanceProcAddr tg =
+                (PFN_vkGetInstanceProcAddr)dlsym(h, "vkGetInstanceProcAddr");
+            uint32_t api = tg ? vk_loader_best_api(tg) : 0;
+            if (tg && api >= VK_API_VERSION_1_3) {
+                fprintf(stderr, "  [VK] using Turnip (Vulkan %u.%u.%u) through adrenotools\n",
+                        VK_VERSION_MAJOR(api), VK_VERSION_MINOR(api), VK_VERSION_PATCH(api));
+                gipa = tg;
+                V.turnip = 1;
+            } else {
+                fprintf(stderr, "  [VK] Turnip did not load (Vulkan %u.%u) -- system driver\n",
+                        VK_VERSION_MAJOR(api), VK_VERSION_MINOR(api));
+            }
+        }
+    }
+#else
+    (void)want; (void)h;
+#endif
+    if (!gipa) {
+        fprintf(stderr, "  [VK] no libvulkan.so\n");
+        return 0;
+    }
+    volkInitializeCustom(gipa);
+    done = 1;
+    return 1;
+}
+#endif
+
 static int vk_init(void)
 {
     VkApplicationInfo app = { VK_STRUCTURE_TYPE_APPLICATION_INFO };
@@ -2200,6 +2325,10 @@ static int vk_init(void)
     const char *pick = getenv("RECOMP_VK_DEVICE");
     const char *layers[1] = { "VK_LAYER_KHRONOS_validation" };
 
+#if defined(XBOXRECOMP_VOLK)
+    if (!vk_android_loader())
+        return 0;
+#endif
     app.pApplicationName = "xboxrecomp";
     app.apiVersion = VK_API_VERSION_1_3;
     ici.pApplicationInfo = &app;
@@ -2234,6 +2363,9 @@ static int vk_init(void)
     r = vkCreateInstance(&ici, NULL, &V.inst);
     if (r != VK_SUCCESS)
         return vk_fail("vkCreateInstance", r);
+#if defined(XBOXRECOMP_VOLK)
+    volkLoadInstance(V.inst);
+#endif
     r = vkEnumeratePhysicalDevices(V.inst, &npd, pds);
     if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || !npd)
         return vk_fail("vkEnumeratePhysicalDevices", r);
@@ -2381,6 +2513,10 @@ static int vk_init(void)
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
         r = vkCreateDevice(V.pd, &dci, NULL, &V.dev);
+#if defined(XBOXRECOMP_VOLK)
+        if (r == VK_SUCCESS)
+            volkLoadDevice(V.dev);
+#endif
         if (r != VK_SUCCESS)
             return vk_fail("vkCreateDevice", r);
 #if defined(__ANDROID__)
@@ -6652,6 +6788,11 @@ int nv2a_vk_device_names(char (*names)[256], int max)
     uint32_t npd = 16, i;
     int n = 0, pass;
 
+#if defined(XBOXRECOMP_VOLK)
+    (void)app; (void)ici; (void)inst; (void)pds; (void)npd; (void)i; (void)pass;
+    (void)names; (void)max; (void)n;
+    return 0;       /* no launcher on Android; volk holds the game's instance */
+#endif
     app.pApplicationName = "xboxrecomp";
     app.apiVersion = VK_API_VERSION_1_3;
     ici.pApplicationInfo = &app;
@@ -6682,6 +6823,27 @@ void nv2a_vk_set_surface(uint64_t surface)
 void nv2a_vk_set_wayland(void *wl_display, void *wl_surface)
 {
     V.wl_ok = wlc_attach(wl_display, wl_surface);
+}
+
+/* Android: SDL's native window as a Vulkan surface, made with the loader the
+ * renderer uses (SDL's own copy of libvulkan cannot serve a Turnip
+ * instance). */
+int nv2a_vk_create_android_surface(void *anw, uint64_t *surface)
+{
+#if defined(XBOXRECOMP_VOLK)
+    VkAndroidSurfaceCreateInfoKHR ci = { VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR };
+    VkSurfaceKHR surf;
+    if (V.state <= 0 || !vkCreateAndroidSurfaceKHR)
+        return 0;
+    ci.window = (struct ANativeWindow *)anw;
+    if (vkCreateAndroidSurfaceKHR(V.inst, &ci, NULL, &surf) != VK_SUCCESS)
+        return 0;
+    *surface = (uint64_t)(uintptr_t)surf;
+    return 1;
+#else
+    (void)anw; (void)surface;
+    return 0;
+#endif
 }
 
 /* The Win32 window (fb_present.c's GDI window) as a Vulkan surface. */

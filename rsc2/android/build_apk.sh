@@ -47,6 +47,19 @@ mkdir -p "$STAGE/lib/arm64-v8a" "$STAGE/classes" "$STAGE/dex"
 STRIP=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip
 "$STRIP" --strip-unneeded -o "$STAGE/lib/arm64-v8a/libmain.so" "$OUT/libmain.so"
 "$STRIP" --strip-unneeded -o "$STAGE/lib/arm64-v8a/libSDL2.so" "$OUT/SDL2/libSDL2.so"
+# libadrenotools' hooks: loaded from the app's native library folder.
+for h in "$OUT"/adrenotools/src/hook/lib*.so; do
+    [ -e "$h" ] && "$STRIP" --strip-unneeded -o "$STAGE/lib/arm64-v8a/$(basename "$h")" "$h"
+done
+# Turnip, Mesa's Vulkan driver for Adreno (build_turnip.sh), for devices
+# whose own driver is older than Vulkan 1.3. RSC2_TURNIP=<file> picks another
+# build; without one the APK uses the system driver only.
+TURNIP=${RSC2_TURNIP:-$root/third_party/build-android-turnip/src/freedreno/vulkan/libvulkan_freedreno.so}
+if [ -e "$TURNIP" ]; then
+    "$STRIP" --strip-unneeded -o "$STAGE/lib/arm64-v8a/libvulkan_freedreno.so" "$TURNIP"
+else
+    echo "build_apk.sh: no Turnip ($TURNIP) -- system Vulkan driver only"
+fi
 
 # ── java ────────────────────────────────────────────────────────
 "$JAVA_HOME/bin/javac" -nowarn -source 11 -target 11 -encoding UTF-8 \
