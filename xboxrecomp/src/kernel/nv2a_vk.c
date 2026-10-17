@@ -2398,7 +2398,17 @@ static int vk_init(void)
         VkQueryPoolCreateInfo qci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
         const char *e = getenv("RECOMP_VK_KICK");
         int sl, k;
+        /* RECOMP_VK_KICK=n: submit the frame in pieces of n draws (2n in
+         * one long run), so the GPU starts early. Since whole frames are
+         * pipelined (two in flight) that buys nothing on desktop GPUs and
+         * the submits cost more: off, the race ran 128 -> 145 fps on an
+         * RTX 5070 Ti at 3x (114 -> 134 with 4x MSAA) and no slower on a
+         * Ryzen iGPU. Android keeps 16, where it was tuned on Adreno. */
+#if defined(__ANDROID__)
         V.kick_draws = e ? atoi(e) : 16;
+#else
+        V.kick_draws = e ? atoi(e) : 0;
+#endif
         e = getenv("RECOMP_VK_PIPELINE");
         V.pipelined = e ? atoi(e) != 0 : 1;
         pci.queueFamilyIndex = V.qf;
