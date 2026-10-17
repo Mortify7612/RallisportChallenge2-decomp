@@ -519,6 +519,7 @@ static struct {
     int dump_float;             /* RGBA half floats, written raw (hdr_dump) */
     /* last descriptor set, reused while the textures stay the same */
     VkDescriptorSet last_set;
+    VkPipeline bound_pipe;      /* the draw path's last bind in V.dcb, or none */
     VkImageView last_views[8];
     VkSampler last_samps[8];
     /* stats */
@@ -872,6 +873,7 @@ static void segment_begin(void)
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(V.ucb, &bi);
     vkBeginCommandBuffer(V.dcb, &bi);
+    V.bound_pipe = VK_NULL_HANDLE;
     V.recording = 1;
     V.seg_draws = 0;
     if (V.tspool && V.nts + 2 <= 2 * (VK_KICKS + 2))
@@ -4245,6 +4247,7 @@ static void ms_refresh(Surf *cs)
     vkCmdSetViewport(V.dcb, 0, 1, &vp);
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.up_pipe);
+    V.bound_pipe = VK_NULL_HANDLE;
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     vkCmdEndRendering(V.dcb);
@@ -4508,6 +4511,7 @@ static void ao_pass(VkImageView target, VkImageView resolve, uint32_t w, uint32_
     vkCmdSetViewport(V.dcb, 0, 1, &vp);
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    V.bound_pipe = VK_NULL_HANDLE;
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pcsize, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
@@ -5696,6 +5700,7 @@ static void aux_flush(void)
     for (i = 0; i < n; i++) {
         const AuxDraw *a = &s_aux[i];
         vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, a->pipe);
+        V.bound_pipe = VK_NULL_HANDLE;
         vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
                                 &a->set, 2, a->doff);
         vkCmdBindVertexBuffers(V.dcb, 0, 1, &V.vtx.buf, &a->voff);
@@ -6050,7 +6055,13 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         }
         if (sp) V.st_spec_draws++; else V.st_uber_draws++;
     }
-    vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    /* Consecutive draws often share a pipeline, and a bind is not free:
+     * Turnip copies the pipeline's state on each one (a quarter of its time
+     * in the executor on an Adreno 650). Every other bind clears this. */
+    if (pipe != V.bound_pipe) {
+        vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+        V.bound_pipe = pipe;
+    }
     doff[0] = (uint32_t)uoff;
     doff[1] = (uint32_t)coff;
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
@@ -6135,6 +6146,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
             vkCmdResetQueryPool(V.dcb, dq, 0, 6);
             begin_target(st);
             vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+            V.bound_pipe = VK_NULL_HANDLE;
             {
                 uint32_t doff[2] = { (uint32_t)uoff, (uint32_t)coff };
                 vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1, &set, 2, doff);
@@ -6161,6 +6173,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                                &vis, vs, prog, ninputs, 0);
                 if (vp2) {
                     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, vp2);
+                    V.bound_pipe = VK_NULL_HANDLE;
                     vkCmdSetStencilTestEnable(V.dcb, VK_FALSE);
                     vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
                     mark_drawn(st);
@@ -7153,6 +7166,7 @@ static void hdr_pass(VkImageView target, VkImageLayout layout, VkPipeline pipe, 
     sc.extent.height = dh;
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+    V.bound_pipe = VK_NULL_HANDLE;
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     pc[0] = (float)ox;
     pc[1] = (float)oy;
