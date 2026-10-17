@@ -70,8 +70,18 @@ full lock); that part is the game's.
 | `RECOMP_WHEEL_DAMPER` | 10 | Damper, percent. |
 | `RECOMP_WHEEL_RUMBLE` | 50 | The game's pad rumble as a vibration, percent. `RECOMP_RUMBLE=0` also stops it. |
 | `RECOMP_WHEEL_FFB` | 100 | Overall force feedback gain, percent. |
-| `RECOMP_WHEEL_LOG=1` | | Prints axes and buttons as they move, to find the numbers above. |
+| `RECOMP_WHEEL_TUG=0` | | No short tug left and right when the wheel opens (the force feedback check). |
+| `RECOMP_WHEEL_LOG=0` | | No log file (below). `RECOMP_WHEEL_LOGFILE=path` puts it elsewhere. |
 | `RECOMP_WHEEL=0` | | Off. |
+
+Every run writes `rsc2_wheel_log.txt` next to the program (or in the
+settings folder if that is read-only; the run before is kept as
+`rsc2_wheel_log.prev.txt`), for testers to send back: the system and SDL
+version, every joystick SDL sees and why it was or was not taken, the force
+feedback the wheel offers and whether each effect started, the axes as they
+move (at most twenty lines a second) with the steering, throttle and brake
+sent to the game, each button with the pad input it is bound to, the
+game's rumble, and every 20 s each axis's range and the buttons seen.
 
 `RECOMP_WHEEL_VIRTUAL=<file>` adds a scripted wheel for testing without
 one: lines of `ms steer throttle brake buttons-hex hat`, from when input
