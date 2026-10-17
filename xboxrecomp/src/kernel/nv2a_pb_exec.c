@@ -4788,6 +4788,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     s_gpu.drawn_offset, s_gpu.color_offset, 10);
         /* The GPU path: finish the frame and put every surface it drew
          * back in guest RAM, where the window and the dumps read it. */
+        {
+            extern void xbox_FrameTimeMark(int tag);
+            xbox_FrameTimeMark('F');
+        }
         if (nv2a_vk_active()) {
             uint32_t done = s_gpu.drawn_offset ? s_gpu.drawn_offset : s_gpu.color_offset;
             uint32_t pitch = s_gpu.drawn_offset ? s_gpu.drawn_pitch : s_gpu.pitch;
@@ -4796,6 +4800,12 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             nv2a_vk_flush();
         }
         flip_pace();
+        if (nv2a_vk_active())
+            nv2a_vk_present_queued();
+        {
+            extern void xbox_FrameTimeMark(int tag);
+            xbox_FrameTimeMark('S');
+        }
         {
             extern void xbox_GuestClockFlip(void);
             xbox_GuestClockFlip();

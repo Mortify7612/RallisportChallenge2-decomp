@@ -105,6 +105,9 @@ void nv2a_vk_report_get(uint32_t va, uint64_t stamp);
  * surface with nv2a_vk_set_surface. */
 void nv2a_vk_present(uint32_t va, uint32_t pitch);
 
+/* After nv2a_vk_flush and the flip pacing: hand the frame to the screen. */
+void nv2a_vk_present_queued(void);
+
 /* The shape the 3D view is shown at: 16:9 for a widescreen title, or the
  * screen's own when it is wider. A title that culls by its own field of
  * view widens that to match (RSC2: rsc2_overrides.c). */

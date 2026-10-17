@@ -234,6 +234,13 @@ Defaults are baked into `src/main.c`; `NAME=0` turns one off.
   `RECOMP_VK_SURF_TRACE`, `RECOMP_VK_PRESENT_DUMP=file.bmp`
   (+`RECOMP_VK_PRESENT_DUMP_AT=frames`), `RECOMP_VK_CPU_VSH` (vertex
   programs on the CPU), `RECOMP_VK_PROG_DUMP`, `RECOMP_REPORT_TRACE`.
+- Frame pacing: `RECOMP_FRAME_TIMES=file` logs, per frame, when the game
+  starts it (`G`), the flip (`F`), the present (`P`/`Q`), the pacer
+  (`S`), the wait for the GPU (`W`/`w`) and, where the driver has
+  VK_KHR_present_wait, when it reached the screen (`D`). With
+  `RECOMP_VK_STATS` it also logs each frame's GPU time (`g`).
+  `RECOMP_VK_PRESENT_EARLY=1` presents at the flip instead of after the
+  pacer (the old timing); `RECOMP_VK_SC_IMAGES=n` sets the swapchain size.
 - Diagnostics: `RSC2_PROFILE=file` (+`RSC2_PROFILE_WALL=1`,
   `RSC2_PROFILE_DELAY=s`), `RECOMP_PIXEL_PROBE=x,y`, `RECOMP_BATCH_LOG`,
   `RECOMP_PROG_STATS`, `RECOMP_PROG_DUMP=hash`, `RECOMP_APU_STATS`,

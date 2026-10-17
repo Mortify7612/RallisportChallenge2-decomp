@@ -456,6 +456,50 @@ static int gc_enabled(void)
     return gc_mode;
 }
 
+/* RECOMP_FRAME_TIMES=<file>: one line per event, "<tag> <ns>" on the real
+ * clock -- G the game starts a frame (its pad poll), F the executor reaches
+ * a flip, P/Q around vkQueuePresentKHR, S the flip pacer done. For judging
+ * frame pacing. */
+static FILE *ft_file(void)
+{
+    static FILE *f;
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FRAME_TIMES");
+        on = e && *e && (f = fopen(e, "w")) != NULL;
+    }
+    return on ? f : NULL;
+}
+
+static volatile long ft_lock;
+
+void xbox_FrameTimeMark(int tag)
+{
+    FILE *f = ft_file();
+    uint64_t t;
+    if (!f)
+        return;
+    t = gc_real_ns();
+    while (__atomic_exchange_n(&ft_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    fprintf(f, "%c %llu\n", tag, (unsigned long long)t);
+    if (tag == 'S')
+        fflush(f);
+    __atomic_store_n(&ft_lock, 0, __ATOMIC_RELEASE);
+}
+
+/* ... and a value: "<tag> =<v>" (g: a frame's GPU ms, s: its GPU span). */
+void xbox_FrameTimeVal(int tag, double v)
+{
+    FILE *f = ft_file();
+    if (!f)
+        return;
+    while (__atomic_exchange_n(&ft_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    fprintf(f, "%c =%.3f\n", tag, v);
+    __atomic_store_n(&ft_lock, 0, __ATOMIC_RELEASE);
+}
+
 /* Guest nanoseconds since the clock started. */
 uint64_t xbox_GuestClockNs(void)
 {
@@ -515,6 +559,7 @@ void xbox_GuestClockFlip(void)
 
 void xbox_GuestClockGameFrame(void)
 {
+    xbox_FrameTimeMark('G');
     if (!gc_enabled())
         return;
     if (!gc_game_driven) {

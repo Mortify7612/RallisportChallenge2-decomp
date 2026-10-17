@@ -40,6 +40,7 @@ void nv2a_vk_clear(const Nv2aVkState *s, uint32_t f, uint32_t c, uint32_t z)
 { (void)s; (void)f; (void)c; (void)z; }
 void nv2a_vk_flush(void) { }
 void nv2a_vk_present(uint32_t va, uint32_t pitch) { (void)va; (void)pitch; }
+void nv2a_vk_present_queued(void) { }
 float nv2a_vk_view_aspect(void) { return 16.0f / 9.0f; }
 void nv2a_vk_zpass(int enable) { (void)enable; }
 void nv2a_vk_set_gamma(const uint8_t *r, const uint8_t *g, const uint8_t *b) { (void)r; (void)g; (void)b; }
@@ -433,6 +434,11 @@ static struct {
     uint32_t sc_n, sc_idx;
     VkSemaphore sem_acq, sem_done;
     int present_pending, sc_dead;
+    int present_queued;             /* submitted, vkQueuePresentKHR still to come */
+    VkSemaphore pq_sem;
+    uint32_t pq_idx;
+    int has_pwait;                  /* RECOMP_FRAME_TIMES: when frames reach the screen */
+    uint64_t present_id;
     /* RECOMP_HDR: an HDR swapchain and the pass that fills it (hdr_*). */
     int hdr_want;               /* asked for; hdr_mode: what the window got */
     int hdr_mode;               /* 0 SDR, 1 HDR10 (PQ), 2 scRGB (linear) */
@@ -518,6 +524,9 @@ static double now_ms(void)
 #include <sys/stat.h>
 #define mkdir_one(p) mkdir((p), 0755)
 #endif
+
+void xbox_FrameTimeMark(int tag);    /* kernel_hal.c, RECOMP_FRAME_TIMES */
+void xbox_FrameTimeVal(int tag, double v);
 
 static const char *cache_dir(void)
 {
@@ -1355,6 +1364,8 @@ static uint32_t aw_check(const char *what, const Surf *s)
 
 /* Submit the segment and wait for it. With `readback`, every dirty surface
  * is copied back into guest RAM first. */
+static void present_issue(void);
+
 /* Hand the segment recorded so far to the GPU and go on recording, without
  * waiting: the GPU draws the start of the frame while the CPU works on the
  * rest. Rings, descriptor sets and retired images are only recycled at the
@@ -1501,8 +1512,11 @@ static int segment_submit(int readback, RbEnt *list, int *nrb)
     si.commandBufferCount = 2;
     si.pCommandBuffers = cbs;
     {
-        static const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT
-                                                     | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        /* Only what writes the swapchain image waits for it: the blit (SDR)
+         * or the HDR pass -- not the copy-backs and uploads of the frame. */
+        static VkPipelineStageFlags wait_stage;
+        wait_stage = V.hdr_mode ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+                                : VK_PIPELINE_STAGE_TRANSFER_BIT;
         if (V.present_pending) {
             si.waitSemaphoreCount = 1;
             si.pWaitSemaphores = &V.sem_acq;
@@ -1513,29 +1527,17 @@ static int segment_submit(int readback, RbEnt *list, int *nrb)
     }
     r = vkQueueSubmit(V.q, 1, &si, V.fence);
     if (r == VK_SUCCESS && V.present_pending) {
-        VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-        VkResult pr;
-        pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &V.sem_done;
-        pi.swapchainCount = 1;
-        pi.pSwapchains = &V.swapchain;
-        pi.pImageIndices = &V.sc_idx;
-        pr = vkQueuePresentKHR(V.q, &pi);
-        if (pr == VK_ERROR_OUT_OF_DATE_KHR)
-            V.sc_dead = 1;
-        else if (pr == VK_SUBOPTIMAL_KHR) {
-            /* Rebuild only for a new size. Android says suboptimal on every
-             * present when the panel is rotated and the frames are not
-             * (identity preTransform, the compositor turns them): rebuilding
-             * for that cost a GPU sync and a driver round trip every frame. */
-            VkSurfaceCapabilitiesKHR caps;
-            if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, V.surface, &caps) != VK_SUCCESS
-                    || (caps.currentExtent.width != 0xFFFFFFFFu
-                        && (caps.currentExtent.width != V.sc_ext.width
-                            || caps.currentExtent.height != V.sc_ext.height)))
-                V.sc_dead = 1;
-        }
+        /* Shown by nv2a_vk_present_queued(), after the flip pacing: the GPU
+         * starts on the frame now, the screen gets it on the pacing grid. */
+        static int early = -1;      /* RECOMP_VK_PRESENT_EARLY=1: the old way, to compare */
+        if (early < 0)
+            early = getenv("RECOMP_VK_PRESENT_EARLY") && atoi(getenv("RECOMP_VK_PRESENT_EARLY"));
+        V.pq_sem = V.sem_done;
+        V.pq_idx = V.sc_idx;
+        V.present_queued = 1;
         V.present_pending = 0;
+        if (early)
+            present_issue();
     }
     if (r != VK_SUCCESS) {
         vk_fail("vkQueueSubmit", r);
@@ -1552,7 +1554,9 @@ static void slot_wait(Slot *sl, int kick, uint32_t nts)
     VkResult r;
     {
         double t0 = now_ms();
+        xbox_FrameTimeMark('W');
         r = vkWaitForFences(V.dev, 1, &sl->fence, VK_TRUE, UINT64_MAX);
+        xbox_FrameTimeMark('w');
         V.st_wait_ms += now_ms() - t0;
     }
     if (r != VK_SUCCESS) {
@@ -1572,9 +1576,16 @@ static void slot_wait(Slot *sl, int kick, uint32_t nts)
         uint32_t k;
         if (vkGetQueryPoolResults(V.dev, sl->tspool, 0, nts, sizeof ts, ts, 8,
                                   VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
+        {
+            double fm = 0.0;
             for (k = 0; k + 1 < nts; k += 2)
                 if (ts[k + 1] > ts[k])
-                    V.gpu_ms += (double)(ts[k + 1] - ts[k]) * V.limits.timestampPeriod * 1e-6;
+                    fm += (double)(ts[k + 1] - ts[k]) * V.limits.timestampPeriod * 1e-6;
+            V.gpu_ms += fm;
+            xbox_FrameTimeVal('g', fm);
+            if (nts >= 2 && ts[nts - 1] > ts[0])
+                xbox_FrameTimeVal('s', (double)(ts[nts - 1] - ts[0]) * V.limits.timestampPeriod * 1e-6);
+        }
         vkResetQueryPool(V.dev, sl->tspool, 0, nts);
     }
     if (!V.cb_reset)
@@ -2287,6 +2298,8 @@ static int vk_init(void)
         VkPhysicalDeviceVulkan13Features f13 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
         VkPhysicalDeviceVulkan12Features f12 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
         VkPhysicalDeviceFeatures2 f2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+        VkPhysicalDevicePresentIdFeaturesKHR fpid = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR };
+        VkPhysicalDevicePresentWaitFeaturesKHR fpw = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR };
         VkPhysicalDeviceFeatures have;
         VkDeviceCreateInfo dci = { VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
         vkGetPhysicalDeviceFeatures(V.pd, &have);
@@ -2317,7 +2330,9 @@ static int vk_init(void)
         }
         dci.pNext = &f2;
         {
-            static const char *swext[2] = { "VK_KHR_swapchain", "VK_EXT_hdr_metadata" };
+            static const char *swext[4];
+            int has_pid = 0, has_pw = 0, nx = 0;
+            const char *ft = getenv("RECOMP_FRAME_TIMES");
             VkExtensionProperties ep[512];
             uint32_t ne = 512, k;
             vkEnumerateDeviceExtensionProperties(V.pd, NULL, &ne, ep);
@@ -2326,9 +2341,25 @@ static int vk_init(void)
                     V.has_swapchain_ext = 1;
                 if (!strcmp(ep[k].extensionName, "VK_EXT_hdr_metadata"))
                     V.has_hdr_meta = 1;
+                if (!strcmp(ep[k].extensionName, "VK_KHR_present_id"))
+                    has_pid = 1;
+                if (!strcmp(ep[k].extensionName, "VK_KHR_present_wait"))
+                    has_pw = 1;
             }
             if (V.has_swapchain_ext) {
-                dci.enabledExtensionCount = V.has_hdr_meta ? 2 : 1;
+                swext[nx++] = "VK_KHR_swapchain";
+                if (V.has_hdr_meta)
+                    swext[nx++] = "VK_EXT_hdr_metadata";
+                if (ft && *ft && has_pid && has_pw) {
+                    swext[nx++] = "VK_KHR_present_id";
+                    swext[nx++] = "VK_KHR_present_wait";
+                    fpid.presentId = VK_TRUE;
+                    fpw.presentWait = VK_TRUE;
+                    fpid.pNext = &fpw;
+                    f12.pNext = &fpid;
+                    V.has_pwait = 1;
+                }
+                dci.enabledExtensionCount = (uint32_t)nx;
                 dci.ppEnabledExtensionNames = swext;
             } else {
                 V.has_hdr_meta = 0;
@@ -6868,9 +6899,98 @@ static void sc_views_destroy(void)
         }
 }
 
+/* RECOMP_FRAME_TIMES with VK_KHR_present_wait: a 'D' mark when each
+ * frame reaches the screen (a frame the compositor dropped completes with
+ * the next one, so two marks together). Diagnostic only: it does not
+ * follow a swapchain rebuild. */
+static void *pwait_thread(void *arg)
+{
+    PFN_vkWaitForPresentKHR wfp = (PFN_vkWaitForPresentKHR)(uintptr_t)arg;
+    uint64_t id = 1;
+    (void)arg;
+    for (;;) {
+        VkResult r;
+        if (__atomic_load_n(&V.present_id, __ATOMIC_ACQUIRE) < id || !V.swapchain) {
+            struct timespec ts = { 0, 500000 };
+            nanosleep(&ts, NULL);
+            continue;
+        }
+        r = wfp(V.dev, V.swapchain, id, 100000000ull);
+        if (r == VK_TIMEOUT)
+            continue;
+        if (r == VK_SUCCESS)
+            xbox_FrameTimeMark('D');
+        id++;
+    }
+    return NULL;
+}
+
+/* The frame submitted at the flip, to the screen. */
+static void present_issue(void)
+{
+    VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
+    VkPresentIdKHR pid = { VK_STRUCTURE_TYPE_PRESENT_ID_KHR };
+    uint64_t id;
+    VkResult pr;
+    V.present_queued = 0;
+    pi.waitSemaphoreCount = 1;
+    pi.pWaitSemaphores = &V.pq_sem;
+    pi.swapchainCount = 1;
+    pi.pSwapchains = &V.swapchain;
+    pi.pImageIndices = &V.pq_idx;
+    if (V.has_pwait) {
+        static int started;
+        id = V.present_id + 1;
+        pid.swapchainCount = 1;
+        pid.pPresentIds = &id;
+        pi.pNext = &pid;
+        if (!started) {
+            PFN_vkWaitForPresentKHR wfp =
+                (PFN_vkWaitForPresentKHR)vkGetDeviceProcAddr(V.dev, "vkWaitForPresentKHR");
+            pthread_t th;
+            started = 1;
+            if (!wfp || pthread_create(&th, NULL, pwait_thread, (void *)(uintptr_t)wfp) != 0)
+                V.has_pwait = 0;
+            else
+                pthread_detach(th);
+        }
+    }
+    xbox_FrameTimeMark('P');
+    pr = vkQueuePresentKHR(V.q, &pi);
+    xbox_FrameTimeMark('Q');
+    if (V.has_pwait)
+        __atomic_store_n(&V.present_id, id, __ATOMIC_RELEASE);
+    if (pr == VK_ERROR_OUT_OF_DATE_KHR)
+        V.sc_dead = 1;
+    else if (pr == VK_SUBOPTIMAL_KHR) {
+        /* Rebuild only for a new size. Android says suboptimal on every
+         * present when the panel is rotated and the frames are not
+         * (identity preTransform, the compositor turns them): rebuilding
+         * for that cost a GPU sync and a driver round trip every frame. */
+        VkSurfaceCapabilitiesKHR caps;
+        if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(V.pd, V.surface, &caps) != VK_SUCCESS
+                || (caps.currentExtent.width != 0xFFFFFFFFu
+                    && (caps.currentExtent.width != V.sc_ext.width
+                        || caps.currentExtent.height != V.sc_ext.height)))
+            V.sc_dead = 1;
+    }
+}
+
+/* After the flip pacing: show the frame the flip submitted. Evenly paced
+ * presents are what make the motion smooth -- presenting at the submit
+ * put each frame on screen a little early or late by however long the
+ * executor took to reach the flip. */
+void nv2a_vk_present_queued(void)
+{
+    if (V.state > 0 && V.present_queued)
+        present_issue();
+}
+
 static void swapchain_destroy(void)
 {
     if (V.swapchain) {
+        if (V.present_queued)
+            present_issue();
         vkDeviceWaitIdle(V.dev);
         sc_views_destroy();
         vkDestroySwapchainKHR(V.dev, V.swapchain, NULL);
@@ -6953,6 +7073,13 @@ static int swapchain_create(void)
         return 0;                              /* minimised */
     ci.surface = V.surface;
     ci.minImageCount = caps.minImageCount + 1;
+    {
+        const char *e = getenv("RECOMP_VK_SC_IMAGES");   /* (testing) */
+        if (e && atoi(e) > 0)
+            ci.minImageCount = (uint32_t)atoi(e);
+        if (ci.minImageCount < caps.minImageCount)
+            ci.minImageCount = caps.minImageCount;
+    }
     if (caps.maxImageCount && ci.minImageCount > caps.maxImageCount)
         ci.minImageCount = caps.maxImageCount;
     ci.imageFormat = V.sc_fmt;
@@ -6995,8 +7122,8 @@ static int swapchain_create(void)
         V.hdr_want = 0;
         return swapchain_create();
     }
-    fprintf(stderr, "  [VK] presenting %ux%u, format %d, mode %d%s\n", V.sc_ext.width,
-            V.sc_ext.height, (int)V.sc_fmt, (int)mode,
+    fprintf(stderr, "  [VK] presenting %ux%u, format %d, mode %d, %u images (min %u)%s\n", V.sc_ext.width,
+            V.sc_ext.height, (int)V.sc_fmt, (int)mode, V.sc_n, caps.minImageCount,
             V.hdr_mode == 1 ? ", HDR10" : V.hdr_mode == 2 ? ", HDR scRGB" : "");
     return 1;
 }
@@ -7332,6 +7459,8 @@ static void present_frame(uint32_t va, uint32_t pitch)
     uint32_t dw, dh, ox, oy, sw, sh;
     int i;
 
+    if (V.present_queued)          /* a flip without pacing in between */
+        present_issue();
     if (V.state <= 0)
         return;
     V.flip_va[0] = V.flip_va[1];
@@ -7371,6 +7500,10 @@ static void present_frame(uint32_t va, uint32_t pitch)
         }
     if (!s)
         return;
+    /* The frame so far to the GPU first: the submit that waits for the
+     * swapchain image then holds only the passes into it, and the scene's
+     * last draws never wait on the compositor handing an image back. */
+    vk_kick();
     r = vkAcquireNextImageKHR(V.dev, V.swapchain, 100000000ull, V.sem_acq,
                               VK_NULL_HANDLE, &V.sc_idx);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
