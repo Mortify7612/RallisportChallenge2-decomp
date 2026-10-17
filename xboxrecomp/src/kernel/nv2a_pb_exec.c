@@ -4837,14 +4837,20 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     memcpy(m + pk_va[k], &pk_v[k], 4);
             }
             /* RECOMP_PEEKF=<va>:<count>:<every>: count floats at va every
-             * that many presented frames. */
-            static long pv = -2, pn, pe;
+             * that many presented frames. <va> may be *<ptr>+<off> (hex):
+             * off past the pointer stored at ptr, for an object whose heap
+             * address changes from run to run. */
+            static long pv = -2, pn, pe, pptr = -1;
             if (pv == -2) {
                 const char *e = getenv("RECOMP_PEEKF");
                 pv = -1;
                 if (e) {
                     char *c;
-                    pv = (long)strtoul(e, &c, 16);
+                    if (*e == '*') {
+                        pptr = (long)strtoul(e + 1, &c, 16);
+                        pv = *c == '+' ? (long)strtoul(c + 1, &c, 16) : 0;
+                    } else
+                        pv = (long)strtoul(e, &c, 16);
                     pn = *c == ':' ? strtol(c + 1, &c, 0) : 8;
                     pe = *c == ':' ? strtol(c + 1, &c, 0) : 60;
                     if (pe <= 0) pe = 60;
@@ -4852,13 +4858,21 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
             if (pv >= 0 && s_presented % (uint32_t)pe == 0) {
                 const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset();
+                uint32_t va = (uint32_t)pv;
                 long k;
-                fprintf(stderr, "[PEEKF] F%u %08lX:", s_presented, pv);
-                for (k = 0; k < pn; k++) {
+                if (pptr >= 0) {
+                    uint32_t base;
+                    memcpy(&base, m + pptr, 4);
+                    va += base;
+                }
+                if (va < 0x1000u || va + (uint32_t)pn * 4 > (64u << 20))
+                    va = 0;
+                fprintf(stderr, "[PEEKF] F%u %08X:", s_presented, va);
+                for (k = 0; va && k < pn; k++) {
                     float f;
                     uint32_t u;
-                    memcpy(&f, m + pv + k * 4, 4);
-                    memcpy(&u, m + pv + k * 4, 4);
+                    memcpy(&f, m + va + k * 4, 4);
+                    memcpy(&u, m + va + k * 4, 4);
                     fprintf(stderr, " %g/%u", f, u);
                 }
                 fputc('\n', stderr);

@@ -321,6 +321,8 @@ Defaults are baked into `src/main.c`; `NAME=0` turns one off.
   `RECOMP_PROG_STATS`, `RECOMP_PROG_DUMP=hash`, `RECOMP_APU_STATS`,
   `RECOMP_ACK_STATS`, `RECOMP_WATCH=va`, `RSC2_FIBER_TRACE`.
 - Guest memory: `RECOMP_PEEKF=va:count:every` prints floats every so many
-  frames, `RECOMP_POKEF=va=value,...` writes floats at every flip, and
+  frames (`va` may be `*ptr+off`: off past the pointer stored at ptr, for
+  heap objects that move between runs), `RECOMP_POKEF=va=value,...` writes
+  floats at every flip, and
   `RECOMP_MEMDUMP=file:frame` saves the 64 MB of guest RAM at that frame
   (file offset = guest address) for searching offline.
