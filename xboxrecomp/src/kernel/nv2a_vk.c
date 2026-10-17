@@ -358,12 +358,13 @@ static struct {
     /* RECOMP_VK_AO: ambient occlusion on the presented scene (ao_*). */
     int ao_on;
     float ao_radius, ao_intensity, ao_bias, ao_far, ao_near, ao_tan;
-    VkImage ao_img;
-    VkDeviceMemory ao_mem;
-    VkImageView ao_view;
-    VkPipeline ao_pipe[2], ao_apply[2];   /* [1]: multisampled depth/target */
+    VkImage ao_img[4];          /* AO, blurred and masked AO, snapshot, distances */
+    VkDeviceMemory ao_mem[4];
+    VkImageView ao_view[4];
+    uint32_t ao_lw, ao_lh;                /* the AO's own (reduced) size */
+    VkPipeline ao_lin[2], ao_pipe[2], ao_blur[2], ao_snap[2], ao_apply[2]; /* [1]: MSAA */
     uint32_t flip_va[2];                  /* the last two presented surfaces */
-    uint32_t ao_frame, ao_zdraws, ao_done;
+    uint32_t ao_frame, ao_zdraws, ao_done, ao_snapped;
     VkCommandPool pool;
     VkCommandBuffer ucb, dcb;
     VkFence fence;
@@ -2124,7 +2125,7 @@ static void post_init(void)
         "layout(set = 0, binding = 0) uniform sampler2D src;\n"
         "layout(location = 0) out vec4 o;\n"
         "void main() { o = texelFetch(src, ivec2(gl_FragCoord.xy), 0); }\n";
-    VkDescriptorSetLayoutBinding b[2];
+    VkDescriptorSetLayoutBinding b[5];
     VkDescriptorSetLayoutCreateInfo lci = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
     VkPushConstantRange pr;
     VkPipelineLayoutCreateInfo plci = { VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
@@ -2138,7 +2139,13 @@ static void post_init(void)
     b[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     b[1] = b[0];
     b[1].binding = 1;
-    lci.bindingCount = 2;
+    b[2] = b[0];
+    b[2].binding = 2;
+    b[3] = b[0];
+    b[3].binding = 3;
+    b[4] = b[0];
+    b[4].binding = 4;
+    lci.bindingCount = 5;
     lci.pBindings = b;
     pr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     pr.offset = 0;
@@ -2391,7 +2398,17 @@ static int vk_init(void)
         VkQueryPoolCreateInfo qci = { VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
         const char *e = getenv("RECOMP_VK_KICK");
         int sl, k;
+        /* RECOMP_VK_KICK=n: submit the frame in pieces of n draws (2n in
+         * one long run), so the GPU starts early. Since whole frames are
+         * pipelined (two in flight) that buys nothing on desktop GPUs and
+         * the submits cost more: off, the race ran 128 -> 145 fps on an
+         * RTX 5070 Ti at 3x (114 -> 134 with 4x MSAA) and no slower on a
+         * Ryzen iGPU. Android keeps 16, where it was tuned on Adreno. */
+#if defined(__ANDROID__)
         V.kick_draws = e ? atoi(e) : 16;
+#else
+        V.kick_draws = e ? atoi(e) : 0;
+#endif
         e = getenv("RECOMP_VK_PIPELINE");
         V.pipelined = e ? atoi(e) != 0 : 1;
         pci.queueFamilyIndex = V.qf;
@@ -3976,13 +3993,13 @@ static void ms_create(Surf *cs)
                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
 }
 
-/* A descriptor set for a fullscreen pass: `a` and `b` (b may be NULL),
- * sampled through `samp`. */
-static VkDescriptorSet post_set_s(VkImageView a, VkImageView b, VkSampler samp)
+/* A descriptor set for a fullscreen pass: bindings 0-4 from `v` (NULL
+ * entries repeat the first), sampled through `samp`. */
+static VkDescriptorSet post_set_v(const VkImageView v[5], VkSampler samp)
 {
     VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
-    VkDescriptorImageInfo ii[2];
-    VkWriteDescriptorSet wr[2];
+    VkDescriptorImageInfo ii[5];
+    VkWriteDescriptorSet wr[5];
     VkDescriptorSet set;
     int k;
     ai.descriptorPool = V.dpool;
@@ -3991,12 +4008,11 @@ static VkDescriptorSet post_set_s(VkImageView a, VkImageView b, VkSampler samp)
     if (vkAllocateDescriptorSets(V.dev, &ai, &set) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     V.sets_used++;
-    ii[0].sampler = ii[1].sampler = samp;
-    ii[0].imageView = a;
-    ii[1].imageView = b ? b : a;
-    ii[0].imageLayout = ii[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
     memset(wr, 0, sizeof wr);
-    for (k = 0; k < 2; k++) {
+    for (k = 0; k < 5; k++) {
+        ii[k].sampler = samp;
+        ii[k].imageView = v[k] ? v[k] : v[0];
+        ii[k].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
         wr[k].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         wr[k].dstSet = set;
         wr[k].dstBinding = (uint32_t)k;
@@ -4004,8 +4020,15 @@ static VkDescriptorSet post_set_s(VkImageView a, VkImageView b, VkSampler samp)
         wr[k].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         wr[k].pImageInfo = &ii[k];
     }
-    vkUpdateDescriptorSets(V.dev, 2, wr, 0, NULL);
+    vkUpdateDescriptorSets(V.dev, 5, wr, 0, NULL);
     return set;
+}
+
+/* The same for two images, `a` and `b` (b may be NULL). */
+static VkDescriptorSet post_set_s(VkImageView a, VkImageView b, VkSampler samp)
+{
+    VkImageView v[5] = { a, b, NULL, NULL, NULL };
+    return post_set_v(v, samp);
 }
 
 static VkDescriptorSet post_set(VkImageView a, VkImageView b)
@@ -4075,9 +4098,29 @@ static void ms_refresh(Surf *cs)
  * view is a setting (RECOMP_VK_AO_FOV, degrees), and the horizontal follows
  * from the shown aspect. RECOMP_VK_AO_RADIUS (title units, ~metres),
  * _INTENSITY, _BIAS, _FAR (where it fades out) and _NEAR (where it fades in,
- * so the car keeps the title's own shading) tune it; RECOMP_VK_AO_SHOW=1
- * shows the occlusion alone, 2 the depth in 4-unit bands, 3 how much each
- * surface faces the camera. */
+ * so the car keeps the title's own shading) tune it.
+ *
+ * All of it but the last pass runs at a reduced size, RECOMP_VK_AO_RES
+ * render-scale steps (default half the render scale, at least 1): reads
+ * scattered over a 4x frame were what made it slow. At the HUD's first draw:
+ *   1. the distances at that size, from one depth read per pixel;
+ *   2. the occlusion, 16 samples of those, the spiral rotated per 4x4 block;
+ *   3. a 4x4 depth-aware blur, which averages that rotation out, and the
+ *      translucency mask (below), into one factor per pixel;
+ *   4. the factor upscaled bilinearly with depth weights, multiplied into
+ *      the scene.
+ *
+ * Translucent draws write no depth: tree billboards, fading meshes, smoke,
+ * glass. Their pixels keep the depth of what is behind them, so the
+ * occlusion of the wall behind a tree was multiplied over the tree. At the
+ * frame's first blended draw without depth writes, after the bulk of the
+ * scene, distance and colour are snapshotted; where the colour has changed
+ * since but the distance has not, something translucent was drawn over the
+ * pixel, and it is left alone. Opaque draws later on change the distance and
+ * are shaded as before. RECOMP_VK_AO_SNAP=0 turns the snapshot off.
+ *
+ * RECOMP_VK_AO_SHOW=1 shows the factor alone, 2 the depth in 4-unit bands,
+ * 3 how much each surface faces the camera. */
 
 static const char *k_ao_common =
     "#version 450\n"
@@ -4087,8 +4130,14 @@ static const char *k_ao_common =
     "layout(set = 0, binding = 0) uniform sampler2D dz;\n"
     "#endif\n"
     "layout(set = 0, binding = 1) uniform sampler2D aot;\n"
-    "layout(push_constant) uniform PC { vec4 proj; vec4 prm; vec4 sz; } pc;\n"
+    "layout(set = 0, binding = 3) uniform sampler2D lin;\n"
+    "layout(push_constant) uniform PC { vec4 proj; vec4 prm; vec4 sz; vec4 lo; } pc;\n"
+    "#ifdef UOUT\n"
+    "layout(location = 0) out uvec4 o;\n"
+    "#else\n"
     "layout(location = 0) out vec4 o;\n"
+    "#endif\n"
+    /* distance at a full-size pixel, from the depth buffer */
     "float W(ivec2 p) {\n"
     "    p = clamp(p, ivec2(0), ivec2(pc.sz.xy) - 1);\n"
     "    float d = texelFetch(dz, p, 0).r;\n"
@@ -4097,38 +4146,52 @@ static const char *k_ao_common =
     "vec3 P(vec2 px, float w) {\n"
     "    vec2 ndc = px / pc.sz.xy * 2.0 - 1.0;\n"
     "    return vec3(ndc * pc.proj.xy * w, w);\n"
-    "}\n";
+    "}\n"
+    /* full-size pixels per reduced pixel; the full-size pixel a reduced one
+     * stands for, and its centre; the distance there, from pass 1 */
+    "vec2 RT() { return pc.sz.xy / pc.lo.xy; }\n"
+    "ivec2 FULL(ivec2 lp) { return ivec2((vec2(lp) + 0.5) * RT()); }\n"
+    "vec2 FC(ivec2 lp) { return vec2(FULL(lp)) + 0.5; }\n"
+    "float WL(ivec2 lp) { return texelFetch(lin, clamp(lp, ivec2(0), ivec2(pc.lo.xy) - 1), 0).r; }\n";
 
-/* proj.xy tan(half fov) x/y; prm radius, intensity, bias, far;
- * sz render size in pixels, 1/WREV_C, blur step. */
+/* proj.xy tan(half fov) x/y, z show mode, w near fade; prm radius, intensity,
+ * bias, far; sz full size in pixels, 1/WREV_C; lo reduced size, snapshot
+ * taken this frame. */
+static const char *k_ao_lin =
+    "void main() { o = vec4(W(FULL(ivec2(gl_FragCoord.xy)))); }\n";
+
 static const char *k_ao_main =
     "void main() {\n"
-    "    vec2 fc = gl_FragCoord.xy;\n"
-    "    ivec2 ip = ivec2(fc);\n"
-    "    float w = W(ip);\n"
+    "    ivec2 lp = ivec2(gl_FragCoord.xy);\n"
+    "    vec2 fc = FC(lp);\n"
+    "    float w = WL(lp);\n"
     "    if (pc.proj.z > 1.5 && pc.proj.z < 2.5) { o = vec4(fract(w / 4.0)); return; }\n"
     "    if (w > pc.prm.w) { o = vec4(1.0); return; }\n"
     "    vec3 p = P(fc, w);\n"
-    "    float wl = W(ip - ivec2(1, 0)), wr = W(ip + ivec2(1, 0));\n"
-    "    float wu = W(ip - ivec2(0, 1)), wd = W(ip + ivec2(0, 1));\n"
-    "    vec3 dx = abs(wr - w) < abs(w - wl) ? P(fc + vec2(1, 0), wr) - p : p - P(fc - vec2(1, 0), wl);\n"
-    "    vec3 dy = abs(wd - w) < abs(w - wu) ? P(fc + vec2(0, 1), wd) - p : p - P(fc - vec2(0, 1), wu);\n"
+    "    float wl = WL(lp - ivec2(1, 0)), wr = WL(lp + ivec2(1, 0));\n"
+    "    float wu = WL(lp - ivec2(0, 1)), wd = WL(lp + ivec2(0, 1));\n"
+    "    vec3 dx = abs(wr - w) < abs(w - wl) ? P(FC(lp + ivec2(1, 0)), wr) - p : p - P(FC(lp - ivec2(1, 0)), wl);\n"
+    "    vec3 dy = abs(wd - w) < abs(w - wu) ? P(FC(lp + ivec2(0, 1)), wd) - p : p - P(FC(lp - ivec2(0, 1)), wu);\n"
     "    vec3 n = normalize(cross(dy, dx));\n"
     "    if (n.z > 0.0) n = -n;\n"
     "    if (pc.proj.z > 2.5) { o = vec4(pc.proj.z > 3.5 ? abs(n.x) : -n.z); return; }\n"
     "    float R = pc.prm.x;\n"
-    "    float rpx = min(R / (w * pc.proj.y) * 0.5 * pc.sz.y, 0.1 * pc.sz.y);\n"
+    "    float rpx = min(R / (w * pc.proj.y) * 0.5 * pc.lo.y, 0.1 * pc.lo.y);\n"
     "    if (rpx < 1.0) { o = vec4(1.0); return; }\n"
     "    const int B[16] = int[](0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5);\n"
-    "    float phi = 6.2831853 * float(B[(ip.y & 3) * 4 + (ip.x & 3)]) / 16.0;\n"
+    "    float phi = 6.2831853 * float(B[(lp.y & 3) * 4 + (lp.x & 3)]) / 16.0;\n"
+    /* the spiral, 7 turns out to the radius, turned by phi */
+    "    const vec2 K[16] = vec2[](vec2(0.00610, 0.03065), vec2(-0.05208, -0.07795), vec2(0.12992, 0.08681), vec2(-0.21455, -0.04268), "
+    "        vec2(0.27585, -0.05487), vec2(-0.28582, 0.19098), vec2(0.22570, -0.33778), vec2(-0.09145, 0.45974), "
+    "        vec2(-0.10364, -0.52104), vec2(0.32987, 0.49369), vec2(-0.54565, -0.36459), vec2(0.70494, 0.14022), "
+    "        vec2(-0.76624, 0.15241), vec2(0.70155, -0.46876), vec2(-0.50349, 0.75352), vec2(0.18899, -0.95014));\n"
+    "    mat2 rot = mat2(cos(phi), sin(phi), -sin(phi), cos(phi)) * rpx;\n"
     "    float sum = 0.0;\n"
     "    const int N = 16;\n"
     "    for (int i = 0; i < N; i++) {\n"
-    "        float a = (float(i) + 0.5) / float(N);\n"
-    "        float ang = a * 6.2831853 * 7.0 + phi;\n"
-    "        vec2 q = fc + vec2(cos(ang), sin(ang)) * a * rpx;\n"
-    "        if (any(lessThan(q, vec2(0.0))) || any(greaterThanEqual(q, pc.sz.xy))) continue;\n"
-    "        vec3 v = P(q, W(ivec2(q))) - p;\n"
+    "        ivec2 q = ivec2(vec2(lp) + 0.5 + rot * K[i]);\n"
+    "        if (any(lessThan(q, ivec2(0))) || any(greaterThanEqual(q, ivec2(pc.lo.xy)))) continue;\n"
+    "        vec3 v = P(FC(q), WL(q)) - p;\n"
     "        float vv = dot(v, v), vn = dot(v, n);\n"
     "        float f = max(R * R - vv, 0.0);\n"
     "        sum += f * f * f * max((vn - pc.prm.z) / (0.01 + vv), 0.0);\n"
@@ -4140,38 +4203,74 @@ static const char *k_ao_main =
     "    o = vec4(ao);\n"
     "}\n";
 
-/* Depth-aware blur of the occlusion, as a factor the target is multiplied by. */
+/* The snapshot: distance bits, packed colour, at the reduced size. */
+static const char *k_ao_snap =
+    "layout(set = 0, binding = 4) uniform sampler2D sc;\n"
+    "void main() {\n"
+    "    ivec2 lp = ivec2(gl_FragCoord.xy);\n"
+    "    o = uvec4(floatBitsToUint(W(FULL(lp))), packUnorm4x8(texelFetch(sc, FULL(lp), 0)), 0u, 0u);\n"
+    "}\n";
+
+/* 4x4 depth-aware blur of the occlusion (aot), then the mask: 1 where the
+ * pixel was drawn over translucently since the snapshot (same distance,
+ * other colour). sc = the scene's colour. */
+static const char *k_ao_blur =
+    "layout(set = 0, binding = 2) uniform usampler2D snap;\n"
+    "layout(set = 0, binding = 4) uniform sampler2D sc;\n"
+    "void main() {\n"
+    "    ivec2 lp = ivec2(gl_FragCoord.xy);\n"
+    "    float w0 = WL(lp);\n"
+    "    if (w0 > pc.prm.w) { o = vec4(1.0); return; }\n"
+    "    if (pc.lo.z > 0.5) {\n"
+    "        uvec2 sv = texelFetch(snap, lp, 0).xy;\n"
+    "        if (floatBitsToUint(w0) == sv.x\n"
+    "                && packUnorm4x8(texelFetch(sc, FULL(lp), 0)) != sv.y) { o = vec4(1.0); return; }\n"
+    "    }\n"
+    "    float s = 0.0, ws = 0.0;\n"
+    "    for (int y = -2; y < 2; y++)\n"
+    "        for (int x = -2; x < 2; x++) {\n"
+    "            ivec2 q = clamp(lp + ivec2(x, y), ivec2(0), ivec2(pc.lo.xy) - 1);\n"
+    "            float k = max(0.0, 1.0 - abs(WL(q) - w0) / (0.05 * w0));\n"
+    "            s += texelFetch(aot, q, 0).r * k;\n"
+    "            ws += k;\n"
+    "        }\n"
+    "    o = vec4(ws > 0.0 ? s / ws : 1.0);\n"
+    "}\n";
+
+/* Full size: the factor (aot), upscaled bilinearly with depth weights. */
 static const char *k_ao_apply =
     "void main() {\n"
     "    ivec2 ip = ivec2(gl_FragCoord.xy);\n"
     "    float w0 = W(ip);\n"
     "    if (w0 > pc.prm.w) { o = vec4(1.0); return; }\n"
+    "    vec2 lpf = gl_FragCoord.xy / RT() - 0.5;\n"
+    "    ivec2 l0 = ivec2(floor(lpf));\n"
+    "    vec2 f = lpf - vec2(l0);\n"
     "    float s = 0.0, ws = 0.0;\n"
-    "    for (int y = -2; y < 2; y++)\n"
-    "        for (int x = -2; x < 2; x++) {\n"
-    "            ivec2 q = clamp(ip + ivec2(x, y), ivec2(0), ivec2(pc.sz.xy) - 1);\n"
-    "            float k = max(0.0, 1.0 - abs(W(q) - w0) / (0.05 * w0));\n"
+    "    for (int j = 0; j < 2; j++)\n"
+    "        for (int i = 0; i < 2; i++) {\n"
+    "            ivec2 q = clamp(l0 + ivec2(i, j), ivec2(0), ivec2(pc.lo.xy) - 1);\n"
+    "            float b = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);\n"
+    "            float k = b * (max(0.0, 1.0 - abs(WL(q) - w0) / (0.05 * w0)) + 1e-3);\n"
     "            s += texelFetch(aot, q, 0).r * k;\n"
     "            ws += k;\n"
     "        }\n"
-    "    float ao = ws > 0.0 ? s / ws : 1.0;\n"
-    "    o = vec4(vec3(ao), 1.0);\n"
+    "    o = vec4(vec3(s / ws), 1.0);\n"
     "}\n";
 
-static VkPipeline ao_build(const char *body, int ms, VkFormat fmt, uint32_t samples)
+static VkPipeline ao_build(const char *body, int ms, const char *defs, VkFormat fmt,
+                           uint32_t samples, int blend)
 {
     char src[8192];
     VkShaderModule fs;
     VkPipeline p;
-    /* #version must stay first: the define goes after it. */
-    snprintf(src, sizeof src, "#version 450\n%s%s%s", ms ? "#define MS 1\n" : "",
+    /* #version must stay first: the defines go after it. */
+    snprintf(src, sizeof src, "#version 450\n%s%s%s%s", ms ? "#define MS 1\n" : "", defs,
              strchr(k_ao_common, '\n') + 1, body);
     fs = glsl_module(src, 1);
     if (!fs)
         return VK_NULL_HANDLE;
-    /* RECOMP_VK_AO_SHOW=1: the occlusion term alone, in place of the scene. */
-    p = post_pipeline(fs, fmt, samples,
-                      fmt == VK_FORMAT_R8_UNORM || getenv("RECOMP_VK_AO_SHOW") ? 0 : 1);
+    p = post_pipeline(fs, fmt, samples, blend);
     vkDestroyShaderModule(V.dev, fs, NULL);
     return p;
 }
@@ -4190,7 +4289,7 @@ static void ao_init(void)
     e = getenv("RECOMP_VK_AO_NEAR");
     V.ao_near = e ? (float)atof(e) : 8.0f;
     e = getenv("RECOMP_VK_AO_BIAS");
-    V.ao_bias = e ? (float)atof(e) : 0.03f;
+    V.ao_bias = e ? (float)atof(e) : 0.1f;
     e = getenv("RECOMP_VK_AO_FAR");
     V.ao_far = e ? (float)atof(e) : 150.0f;
     e = getenv("RECOMP_VK_AO_FOV");
@@ -4200,14 +4299,18 @@ static void ao_init(void)
             V.ao_radius, V.ao_intensity, fov);
 }
 
-/* The fullscreen pass `pipe` into one attachment. */
+/* The fullscreen pass `pipe` into one attachment; `pcsize` bytes of `pc`. */
 static void ao_pass(VkImageView target, VkImageView resolve, uint32_t w, uint32_t h,
-                    VkPipeline pipe, VkDescriptorSet set, const float *pc)
+                    VkPipeline pipe, VkDescriptorSet set, const float *pc, uint32_t pcsize)
 {
     VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
     VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
     VkViewport vp;
     VkRect2D sc;
+    int k, whole = 0;
+    for (k = 0; k < 2; k++)        /* passes that write every pixel they cover */
+        whole |= pipe == V.ao_lin[k] || pipe == V.ao_pipe[k] || pipe == V.ao_blur[k]
+              || pipe == V.ao_snap[k];
     sc.offset.x = sc.offset.y = 0;
     sc.extent.width = w;
     sc.extent.height = h;
@@ -4215,8 +4318,7 @@ static void ao_pass(VkImageView target, VkImageView resolve, uint32_t w, uint32_
     ri.layerCount = 1;
     ca.imageView = target;
     ca.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    ca.loadOp = pipe == V.ao_pipe[0] || pipe == V.ao_pipe[1]
-              ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD;
+    ca.loadOp = whole ? VK_ATTACHMENT_LOAD_OP_DONT_CARE : VK_ATTACHMENT_LOAD_OP_LOAD;
     ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     if (resolve) {
         ca.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
@@ -4236,7 +4338,7 @@ static void ao_pass(VkImageView target, VkImageView resolve, uint32_t w, uint32_
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
-    vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, pc);
+    vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pcsize, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     vkCmdEndRendering(V.dcb);
 }
@@ -4260,18 +4362,92 @@ static void ao_barrier(void)
                          0, 1, &mb, 0, NULL, 0, NULL);
 }
 
-/* Before each draw: is this where the presented scene's 3D ends? The first
- * draw without a depth test after the frame's depth-tested ones, into a
- * surface that is shown. Runs the passes and ends the rendering instance
- * (the caller begins it again); returns 1 when it did. */
+/* The pipelines for depth with `ms` samples (0/1) and a `fmt` target. */
+static int ao_pipelines(int ms, VkFormat fmt)
+{
+    int show = getenv("RECOMP_VK_AO_SHOW") != NULL;
+    if (!V.ao_lin[ms])
+        V.ao_lin[ms] = ao_build(k_ao_lin, ms, "", VK_FORMAT_R32_SFLOAT, 1, 0);
+    if (!V.ao_pipe[ms])
+        V.ao_pipe[ms] = ao_build(k_ao_main, ms, "", VK_FORMAT_R8_UNORM, 1, 0);
+    if (!V.ao_blur[ms])
+        V.ao_blur[ms] = ao_build(k_ao_blur, ms, "", VK_FORMAT_R8_UNORM, 1, 0);
+    if (!V.ao_snap[ms])
+        V.ao_snap[ms] = ao_build(k_ao_snap, ms, "#define UOUT 1\n", VK_FORMAT_R32G32_UINT, 1, 0);
+    if (!V.ao_apply[ms])     /* RECOMP_VK_AO_SHOW: in place of the scene */
+        V.ao_apply[ms] = ao_build(k_ao_apply, ms, "", fmt, ms ? V.msaa : 1, show ? 0 : 1);
+    if (V.ao_lin[ms] && V.ao_pipe[ms] && V.ao_blur[ms] && V.ao_snap[ms] && V.ao_apply[ms])
+        return 1;
+    fprintf(stderr, "  [VK] ambient occlusion shaders failed -- off\n");
+    V.ao_on = 0;
+    return 0;
+}
+
+/* The work images, all at the reduced size, for the largest frame. */
+static int ao_images(void)
+{
+    static const VkFormat fmt[4] = { VK_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM,
+                                     VK_FORMAT_R32G32_UINT, VK_FORMAT_R32_SFLOAT };
+    uint32_t fw = 640 * V.sx, fh = 480 * V.scale, i;
+    const char *e = getenv("RECOMP_VK_AO_RES");
+    uint32_t res = e ? (uint32_t)atoi(e) : V.scale / 2;
+    if (V.ao_img[0])
+        return 1;
+    if (res < 1) res = 1;
+    if (res > V.scale) res = V.scale;
+    V.ao_lw = (fw * res + V.scale - 1) / V.scale;
+    V.ao_lh = (fh * res + V.scale - 1) / V.scale;
+    for (i = 0; i < 4; i++) {
+        if (!image_create(V.ao_lw, V.ao_lh, 1, 1, fmt[i],
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
+                          VK_IMAGE_ASPECT_COLOR_BIT, &V.ao_img[i], &V.ao_mem[i], &V.ao_view[i])) {
+            V.ao_on = 0;
+            return 0;
+        }
+        barrier_image(V.dcb, V.ao_img[i], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+    }
+    fprintf(stderr, "  [VK] ambient occlusion at %ux%u (frame %ux%u)\n",
+            V.ao_lw, V.ao_lh, fw, fh);
+    return 1;
+}
+
+static int zeta_depth_view(Zeta *zs)
+{
+    VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+    if (zs->dview)
+        return 1;
+    vi.image = zs->img;
+    vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vi.format = V.dsfmt;
+    vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    vi.subresourceRange.levelCount = 1;
+    vi.subresourceRange.layerCount = 1;
+    if (vkCreateImageView(V.dev, &vi, NULL, &zs->dview) != VK_SUCCESS) {
+        zs->dview = VK_NULL_HANDLE;
+        return 0;
+    }
+    return 1;
+}
+
+/* Before each draw into the presented scene. At the frame's first blended
+ * draw without depth writes (after the first 32 depth-tested ones), the
+ * snapshot; at the first draw without a depth test after those, the
+ * occlusion -- the HUD comes next. Either ends the rendering instance (the
+ * caller begins it again) and returns 1. */
 static int ao_maybe(const Nv2aVkState *st)
 {
+    static int snap_on = -1;
     Surf *cs = V.cur_cs;
     Zeta *zs = V.cur_zs;
-    int ms;
-    uint32_t w, h, va;
-    float pc[12];
+    int ms, snap = 0;
+    uint32_t w, h, lw, lh, va;
+    float pc[16];
     VkDescriptorSet set;
+    VkImageView v[5];
 
     if (!cs || !zs || cs->swz || cs->bpp != 4 || cs->w != 640)
         return 0;
@@ -4282,56 +4458,26 @@ static int ao_maybe(const Nv2aVkState *st)
         V.ao_frame = V.frame;
         V.ao_zdraws = 0;
     }
+    if (snap_on < 0)
+        snap_on = !getenv("RECOMP_VK_AO_SNAP") || atoi(getenv("RECOMP_VK_AO_SNAP")) != 0;
     if (st->depth_test) {
-        if (depth_mode(st) == 2 && V.wrev)
-            V.ao_zdraws++;
+        if (!(snap_on && st->blend_enable && !st->depth_mask && V.ao_zdraws >= 32
+                && V.ao_snapped != V.frame + 1 && V.ao_done != V.frame + 1)) {
+            if (depth_mode(st) == 2 && V.wrev)
+                V.ao_zdraws++;
+            return 0;
+        }
+        snap = 1;
+    } else if (V.ao_zdraws < 32 || V.ao_done == V.frame + 1)
         return 0;
-    }
-    if (V.ao_zdraws < 32 || V.ao_done == V.frame + 1)
-        return 0;
-    V.ao_done = V.frame + 1;
     ms = cs->msimg && zs->samples > 1;
-    if (!V.ao_pipe[ms])
-        V.ao_pipe[ms] = ao_build(k_ao_main, ms, VK_FORMAT_R8_UNORM, 1);
-    if (!V.ao_apply[ms])
-        V.ao_apply[ms] = ao_build(k_ao_apply, ms, cs->fmt, ms ? V.msaa : 1);
-    if (!V.ao_pipe[ms] || !V.ao_apply[ms]) {
-        fprintf(stderr, "  [VK] ambient occlusion shaders failed -- off\n");
-        V.ao_on = 0;
+    if (!ao_pipelines(ms, cs->fmt) || !ao_images() || !zeta_depth_view(zs))
         return 0;
-    }
-    if (!V.ao_img) {
-        if (!image_create(640 * V.sx, 480 * V.scale, 1, 1, VK_FORMAT_R8_UNORM,
-                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
-                          VK_IMAGE_ASPECT_COLOR_BIT, &V.ao_img, &V.ao_mem, &V.ao_view)) {
-            V.ao_on = 0;
-            return 0;
-        }
-        barrier_image(V.dcb, V.ao_img, VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
-                      VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
-    }
-    if (!zs->dview) {
-        VkImageViewCreateInfo vi = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-        vi.image = zs->img;
-        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vi.format = V.dsfmt;
-        vi.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        vi.subresourceRange.levelCount = 1;
-        vi.subresourceRange.layerCount = 1;
-        if (vkCreateImageView(V.dev, &vi, NULL, &zs->dview) != VK_SUCCESS) {
-            zs->dview = VK_NULL_HANDLE;
-            return 0;
-        }
-    }
-    set = post_set(zs->dview, V.ao_view);
-    if (!set)
-        return 0;
-    end_rendering();
     w = 640 * V.sx;
     h = (cs->msimg ? cs->msh : (cs->rows < 480 ? cs->rows : 480)) * V.scale;
+    lw = V.ao_lw;
+    lh = (h * V.ao_lh + 480 * V.scale - 1) / (480 * V.scale);
+    end_rendering();
     pc[0] = V.ao_tan * (fb_widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f);
     pc[1] = V.ao_tan;
     pc[2] = getenv("RECOMP_VK_AO_SHOW") ? (float)atof(getenv("RECOMP_VK_AO_SHOW")) : 0.0f;
@@ -4343,14 +4489,54 @@ static int ao_maybe(const Nv2aVkState *st)
     pc[8] = (float)w;
     pc[9] = (float)h;
     pc[10] = 1.0f / WREV_C;
-    pc[11] = (float)((V.scale + 1) / 2);
+    pc[11] = 0.0f;
+    pc[12] = (float)lw;
+    pc[13] = (float)lh;
+    pc[14] = V.ao_snapped == V.frame + 1 ? 1.0f : 0.0f;
+    pc[15] = 0.0f;
+    /* Unread bindings still get a view of the right kind: depth at 0,
+     * single-sample colour elsewhere. */
+    v[0] = zs->dview;
+    v[1] = V.ao_view[0];
+    v[2] = V.ao_view[2];
+    v[3] = V.ao_view[3];
+    v[4] = cs->view;
     ao_barrier();
-    ao_pass(V.ao_view, VK_NULL_HANDLE, w, h, V.ao_pipe[ms], set, pc);
+    if (snap) {
+        V.ao_snapped = V.frame + 1;
+        v[2] = V.ao_view[1];        /* [2] is the target */
+        if ((set = post_set_v(v, V.post_samp)) != VK_NULL_HANDLE)
+            ao_pass(V.ao_view[2], VK_NULL_HANDLE, lw, lh, V.ao_snap[ms], set, pc, 64);
+        ao_barrier();
+        V.last_set = VK_NULL_HANDLE;
+        return 1;
+    }
+    V.ao_done = V.frame + 1;
+    /* 1: distances (binding 3 is the target here: bind another) */
+    v[3] = V.ao_view[1];
+    if ((set = post_set_v(v, V.post_samp)) != VK_NULL_HANDLE)
+        ao_pass(V.ao_view[3], VK_NULL_HANDLE, lw, lh, V.ao_lin[ms], set, pc, 64);
     ao_barrier();
-    if (ms)
-        ao_pass(cs->msview, cs->view, w, h, V.ao_apply[ms], set, pc);
-    else
-        ao_pass(cs->view, VK_NULL_HANDLE, w, h, V.ao_apply[ms], set, pc);
+    v[3] = V.ao_view[3];
+    /* 2: occlusion (binding 1 is the target: bind another) */
+    v[1] = V.ao_view[1];
+    if ((set = post_set_v(v, V.post_samp)) != VK_NULL_HANDLE)
+        ao_pass(V.ao_view[0], VK_NULL_HANDLE, lw, lh, V.ao_pipe[ms], set, pc, 64);
+    ao_barrier();
+    /* 3: blur and mask, from [0] into [1] */
+    v[1] = V.ao_view[0];
+    if ((set = post_set_v(v, V.post_samp)) != VK_NULL_HANDLE)
+        ao_pass(V.ao_view[1], VK_NULL_HANDLE, lw, lh, V.ao_blur[ms], set, pc, 64);
+    ao_barrier();
+    /* 4: into the scene (binding 4, the scene, is the target: bind [1]) */
+    v[1] = V.ao_view[1];
+    v[4] = V.ao_view[1];
+    if ((set = post_set_v(v, V.post_samp)) != VK_NULL_HANDLE) {
+        if (ms)
+            ao_pass(cs->msview, cs->view, w, h, V.ao_apply[ms], set, pc, 64);
+        else
+            ao_pass(cs->view, VK_NULL_HANDLE, w, h, V.ao_apply[ms], set, pc, 64);
+    }
     ao_barrier();
     cs->dirty = 1;
     cs->gen = ++V.gen;
@@ -6407,7 +6593,7 @@ static VkImage gamma_apply(Surf *s, uint32_t w, uint32_t h)
     vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     memset(pc, 0, sizeof pc);
-    ao_pass(V.gm_img_view, VK_NULL_HANDLE, w, h, V.gm_pipe, set, pc);
+    ao_pass(V.gm_img_view, VK_NULL_HANDLE, w, h, V.gm_pipe, set, pc, sizeof pc);
     mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,

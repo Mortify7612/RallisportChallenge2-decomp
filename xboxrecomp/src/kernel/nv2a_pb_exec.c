@@ -4865,6 +4865,30 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         {
+            /* RECOMP_MEMDUMP=<file>:<frame>: the guest's 64 MB of RAM, as
+             * the title left it at that presented frame, to search offline
+             * for objects and settings (file offset = guest address). */
+            static long md = -2;
+            static char mdf[512];
+            if (md == -2) {
+                const char *e = getenv("RECOMP_MEMDUMP"), *c;
+                md = -1;
+                if (e && (c = strrchr(e, ':')) && (size_t)(c - e) < sizeof mdf) {
+                    memcpy(mdf, e, (size_t)(c - e));
+                    mdf[c - e] = 0;
+                    md = atol(c + 1);
+                }
+            }
+            if (md >= 0 && s_presented == (uint32_t)md) {
+                FILE *f = fopen(mdf, "wb");
+                if (f) {
+                    fwrite((const uint8_t *)xbox_GetMemoryOffset(), 1, 64u << 20, f);
+                    fclose(f);
+                }
+                fprintf(stderr, "[MEMDUMP] F%u -> %s%s\n", s_presented, mdf, f ? "" : " (failed)");
+            }
+        }
+        {
             /* RECOMP_READ_TRAP=<va>:<bytes>:<frame> arms at that frame. */
             static long at = -2;
             if (at == -2) {
