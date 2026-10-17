@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#if defined(_WIN32)
+#include <mmsystem.h>   /* timeBeginPeriod */
+#endif
 
 extern ptrdiff_t g_xbox_mem_offset;
 
@@ -461,6 +464,15 @@ void xbox_kernel_init(void)
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_THUNK,
             "WARNING: %u kernel imports are unresolved - game may crash!", unresolved);
     }
+
+#if defined(_WIN32)
+    /* 1 ms timer resolution for the whole process. Windows otherwise rounds
+     * every Sleep up to its 15.6 ms tick, where Linux's nanosleep is exact:
+     * the flip pacer's short sleeps overshot, and RalliSport Challenge 2's
+     * menus, which always sleep, sat at exactly 40 fps under a 120 fps
+     * limit with the GPU busy 0.3 ms a frame. */
+    timeBeginPeriod(1);
+#endif
 
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_THUNK,
         "=== Xbox Kernel Replacement Layer ready ===");

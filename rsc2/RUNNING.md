@@ -154,7 +154,8 @@ On Windows, as on Linux:
   fullscreen on the monitor. F11 or Alt+Enter toggles it.
 
 Known Windows issues:
-- The menus run slower than on Linux (about 40 fps).
+- The menus run at 60 fps at most, as on the console. On a display that
+  isn't 60 or 120 Hz they judder; set the display to 60 Hz.
 - The Z: cache (`%LOCALAPPDATA%\xboxrecomp\Cache`) is emptied at every start,
   because the game copies it again on each boot (`RECOMP_CACHE_FRESH=0`
   keeps it, and the second launch then stalls).

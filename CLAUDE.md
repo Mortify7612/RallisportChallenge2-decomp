@@ -122,9 +122,6 @@ has never been tried: the launcher uses `#embed` and GNU extensions.
 
 **Known Windows bugs:**
 
-- **Menus are slow on Windows:** about 40 fps in the menus and car
-  select, worse than Linux on the same title (owner's report, from a VM
-  with the GPU passed through). Not diagnosed yet.
 - **Headless under Wine** (`RECOMP_FB_WINDOW=0`) never reaches a frame dump,
   even with v0.4.0. Check Windows builds there by comparing logs with a
   previous release's.
@@ -139,6 +136,14 @@ FATX header it wrote into `Partition5.img`. With both persisted it rightly
 doesn't reformat Z:, so `RECOMP_CACHE_FRESH=1` (a default in `main.c`)
 empties the Cache folder at start. Headless runs on real Windows reach
 60 fps on both the first and second launch.
+
+**Timing on Windows** (once the 40 fps menus): `GetTickCount64` and
+`Sleep` move in the 15.6 ms Windows tick, where Linux's are exact. The
+kernel requests 1 ms timer resolution at start (`timeBeginPeriod`), and the
+vblank, interrupt time and kernel timers run on `xbox_now_100ns()` (the
+performance counter, in `kernel.h`). The menus pace themselves to vblank, so
+they run at 60 whatever the frame-rate limit. Judder at a steady 60 on the
+owner's VM came from its display; setting that to 60 Hz fixed it.
 
 **Where things are on Windows:**
 

@@ -1308,11 +1308,10 @@ VOID __stdcall xbox_DbgBreakPoint(void)
 ULONGLONG __stdcall xbox_KeQueryInterruptTime(void)
 {
     /*
-     * Time since boot in NT 100ns units. GetTickCount64 is milliseconds, so
-     * scale by 10,000. Resolution is coarser than the real kernel's, but it is
-     * monotonic, which is the property callers actually depend on.
+     * Time since boot in NT 100ns units, monotonic. The performance counter
+     * on Windows: GetTickCount64 moved in 15.6 ms steps there.
      */
-    return (ULONGLONG)GetTickCount64() * 10000ULL;
+    return xbox_now_100ns();
 }
 
 /* ============================================================================

@@ -553,6 +553,31 @@ typedef char  xbox_host_char;
 #endif
 
 /*
+ * Monotonic time in 100 ns units, for the kernel's own clocks (interrupt
+ * time, timers, vblank). On Windows GetTickCount64 moves in 15.6 ms steps,
+ * so anything scheduled on it ran on that grid; the performance counter is
+ * exact. Elsewhere GetTickCount64 is already precise and stays.
+ */
+static inline ULONGLONG xbox_now_100ns(void)
+{
+#if defined(_WIN32)
+    static LONGLONG freq;
+    LARGE_INTEGER c;
+    if (!freq) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        freq = f.QuadPart;
+    }
+    QueryPerformanceCounter(&c);
+    return (ULONGLONG)(c.QuadPart / freq) * 10000000ull
+         + (ULONGLONG)(c.QuadPart % freq) * 10000000ull / (ULONGLONG)freq;
+#else
+    return (ULONGLONG)GetTickCount64() * 10000ull;
+#endif
+}
+#define xbox_now_ms() ((long long)(xbox_now_100ns() / 10000ull))
+
+/*
  * Translate an Xbox path to a host path.
  * Returns TRUE on success, FALSE if the path couldn't be translated.
  * host_path_buf must be at least MAX_PATH characters (not bytes).

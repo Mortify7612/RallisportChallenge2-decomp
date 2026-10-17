@@ -2377,7 +2377,8 @@ static int kernel_raise_interrupt(uint32_t vector)
 static void kernel_vblank_tick(void)
 {
     static int enabled = -1;
-    static long long next_ms;
+    static double next_ms;
+    double now_hr;
     long long now;
 
     if (enabled < 0)
@@ -2385,22 +2386,29 @@ static void kernel_vblank_tick(void)
     if (!enabled)
         return;
 
-    now = (long long)GetTickCount64();
+    /* A 60 Hz grid on the performance counter. GetTickCount64 moves in the
+     * Windows tick, 15.6 ms, so "now + 16" fired on every second tick: about
+     * 32 vblanks a second, and RalliSport Challenge 2's menus, which wait on
+     * them, sat at 40 fps on Windows. */
+    now_hr = (double)xbox_now_100ns() / 10000.0;
+    now = (long long)now_hr;
 
     /* With the interrupt registers modelled (nv2a_irq.c) the line follows
-     * the sources: the CRTC's vblank every 16 ms, the PTIMER alarm whenever
+     * the sources: the CRTC's vblank every 16.7 ms, the PTIMER alarm whenever
      * it is due, raised while anything enabled is pending. */
     if (xbox_Nv2aIrqEnabled()) {
-        if (now >= next_ms) {
-            next_ms = now + 16;
+        if (now_hr >= next_ms) {
+            next_ms = now_hr - next_ms < 50.0 ? next_ms + 1000.0 / 60.0
+                                              : now_hr + 1000.0 / 60.0;
             xbox_Nv2aIrqRaiseVblank();
         }
         if (!xbox_GetConnectedInterrupt(NV2A_VECTOR) || !xbox_Nv2aIrqTick())
             return;
     } else {
-    if (now < next_ms)
+    if (now_hr < next_ms)
         return;
-    next_ms = now + 16;                       /* ~60 Hz */
+    next_ms = now_hr - next_ms < 50.0 ? next_ms + 1000.0 / 60.0
+                                      : now_hr + 1000.0 / 60.0;   /* 60 Hz */
 
     if (!xbox_GetConnectedInterrupt(NV2A_VECTOR))
         return;
@@ -2736,7 +2744,7 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         Sleep(xbox_Nv2aIrqEnabled() ? 2 : 10);
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
-        now = (long long)GetTickCount64();
+        now = xbox_now_ms();
 
         for (i = 0; i < XBOX_MAX_TIMERS; i++) {
             uint32_t dpc, fired_va;
@@ -2793,7 +2801,7 @@ static void kernel_set_timer(uint32_t timer_va, long long due_100ns,
     if (free_slot >= 0) {
         g_timers[free_slot].timer_va  = timer_va;
         g_timers[free_slot].dpc_va    = dpc_va;
-        g_timers[free_slot].due_ms    = (long long)GetTickCount64() + delay_ms;
+        g_timers[free_slot].due_ms    = xbox_now_ms() + delay_ms;
         g_timers[free_slot].period_ms = period_ms;
     }
     LeaveCriticalSection(&g_timer_lock);
@@ -6538,7 +6546,7 @@ static void bridge_MmGlobalData(void)
 static void bridge_KeInterruptTime(void)
 {
     /* Refresh the 100ns-since-boot counter before handing out the pointer. */
-    ULONGLONG t = (ULONGLONG)GetTickCount64() * 10000ull;
+    ULONGLONG t = xbox_now_100ns();
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 0) = (uint32_t)t;
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME + 4) = (uint32_t)(t >> 32);
     g_eax = XBOX_KERNEL_DATA_BASE + KDATA_INTERRUPT_TIME;
