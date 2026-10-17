@@ -83,9 +83,17 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
   already filters linearly with mipmaps.
 - `RECOMP_VK_AO=1`: screen-space ambient occlusion. It's worked out from the
   game's w-buffer and applied to the shown scene before the HUD.
-  - Tuning: `RECOMP_VK_AO_RADIUS` (default 1), `_INTENSITY` (0.7), `_FOV`
-    (50, vertical), `_NEAR` (8: fades in past the car), `_FAR` (150).
-  - `RECOMP_VK_AO_SHOW=1` shows the occlusion term on its own.
+  - It's computed at reduced size, `RECOMP_VK_AO_RES` render-scale steps
+    (default half the render scale, at least 1), then blurred and scaled
+    up with depth weights. Only the last step runs at full size.
+  - Things drawn see-through (tree billboards, fading meshes, smoke, glass)
+    write no depth, so they used to get the shading of what's behind them.
+    A snapshot at the frame's first such draw finds those pixels, which
+    are left alone. `RECOMP_VK_AO_SNAP=0` turns that off.
+  - Tuning: `RECOMP_VK_AO_RADIUS` (default 1), `_INTENSITY` (0.7), `_BIAS`
+    (0.1; lower brings back banding on flat surfaces), `_FOV` (50,
+    vertical), `_NEAR` (8: fades in past the car), `_FAR` (150).
+  - `RECOMP_VK_AO_SHOW=1` shows the shading factor on its own.
 - The launcher sets these three from its Graphics section. Its default is
   16x anisotropic, with MSAA and AO off.
 - `RECOMP_HDR=1`: HDR output, when the window offers an HDR format. On
