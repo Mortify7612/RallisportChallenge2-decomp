@@ -544,6 +544,9 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
             { "RECOMP_NV2A_IRQ",      "1" },  /* PMC/PTIMER/PCRTC model */
             { "RECOMP_VULKAN",        "1" },  /* GPU renderer */
             { "RECOMP_VK_SCALE",      "2" },  /* 2x internal resolution */
+            /* Empty Z: at start (Windows): the game recopies its cache every
+             * boot and cannot rename over last run's files. */
+            { "RECOMP_CACHE_FRESH",   "1" },
 #if defined(__aarch64__)
             /* ARM may reorder memory accesses that x86 keeps in order, and
              * the game's threads were written for the Xbox's single CPU:

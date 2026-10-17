@@ -156,6 +156,34 @@ static int resolve_symlink(const char* xbox_path, char* out, size_t out_size)
     return 0;
 }
 
+#if defined(_WIN32)
+/*
+ * A bare drive letter ("z:" or "\??\z:") as the drive's root directory.
+ *
+ * XAPI's CreateDirectory strips the trailing separator, so RalliSport
+ * Challenge 2's CreateDirectory("z:\") before each cache file reaches the
+ * kernel as "z:". The rules all carry the separator, so it came back
+ * "Unrecognized Xbox path" and was handed to CreateFileW as the host's own Z:
+ * drive. Win32 only for now: the POSIX backend has the same gap, untested.
+ *
+ * Returns 1 and fills `out` with the root form ("z:\") to translate instead.
+ */
+static int bare_drive_root(const char* xbox_path, char* out, size_t out_size)
+{
+    if (!xbox_path || out_size < 4)
+        return 0;
+    if (match_prefix(xbox_path, "\\??\\"))
+        xbox_path += 4;
+    if (!isalpha((unsigned char)xbox_path[0]) || xbox_path[1] != ':' || xbox_path[2])
+        return 0;
+    out[0] = xbox_path[0];
+    out[1] = ':';
+    out[2] = '\\';
+    out[3] = '\0';
+    return 1;
+}
+#endif
+
 /* ======================================================================== */
 /* Shared by both backends, for the same reason as xbox_LastFileError: the
  * bridge calls it unconditionally, and a _WIN32-only definition breaks every
@@ -189,6 +217,15 @@ static BOOL  s_initialized = FALSE;
  *
  * The table is the standard retail geometry. This is emulating a device that
  * has to be there, not fabricating anything the title owns.
+ *
+ * Written once, when the image is created, never over an existing one. Sector
+ * 4 is also where XAPI's utility-drive mount keeps its cache database: it
+ * reads the sector, finds no database of its own on a fresh image, formats a
+ * cache partition and writes the database back there. Rewriting the table on
+ * every start erased that record, so each launch looked like a new title to
+ * XMountUtilityDrive. RalliSport Challenge 2 then copied its archives into Z:
+ * again (the format is a stub, so the old copies were still there) and stalled
+ * on its loading screen when renaming the fresh misc.fa onto the old one.
  */
 #define XBOX_DISK_IMAGE_NAME   L"Partition0.img"
 #define XBOX_PART_TABLE_OFFSET 0x800
@@ -210,8 +247,9 @@ static void xbox_write_partition_table(const WCHAR *path)
     LARGE_INTEGER off;
     size_t i;
 
+    /* CREATE_NEW: an existing image keeps what the title wrote to it. */
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-                    OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                    CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE)
         return;
 
@@ -268,6 +306,82 @@ static BOOL xbox_partition_device_path(const char *xbox_path, WCHAR *out, DWORD 
 
     swprintf_s(out, n, L"%s\\Partition%c.img", s_save_dir, (WCHAR)digit);
     return TRUE;
+}
+
+/*
+ * The directory a partition's files live in, for a directory open of the
+ * partition device ("\Device\Harddisk0\Partition5\", which is also where
+ * XAPI's Z: link points once XMountUtilityDrive has mounted the cache).
+ *
+ * The open is a volume root: titles query it for free space, create
+ * directories at it and can open files relative to it. NtCreateFile used to
+ * fall back to the folder holding the images, which is none of those
+ * partitions' root. FALSE for a partition with no files (Partition0, the raw
+ * disk).
+ */
+BOOL xbox_partition_root_dir(const WCHAR *image, WCHAR *out, DWORD n)
+{
+    char probe[40];
+    const WCHAR *name = wcsrchr(image, L'\\');
+    WCHAR digit;
+
+    name = name ? name + 1 : image;
+    if (_wcsnicmp(name, L"Partition", 9) != 0)
+        return FALSE;
+    digit = name[9];
+    if (digit < L'1' || digit > L'9' || _wcsicmp(name + 10, L".img") != 0)
+        return FALSE;
+    snprintf(probe, sizeof(probe), "\\Device\\Harddisk0\\Partition%c\\x", (char)digit);
+    for (int i = 0; i < PATH_RULE_COUNT; i++) {
+        WCHAR sub[MAX_PATH] = L"";
+        if (!match_prefix(probe, s_rules[i].prefix))
+            continue;
+        if (s_rules[i].sub_win)
+            MultiByteToWideChar(CP_ACP, 0, s_rules[i].sub_win, -1, sub, MAX_PATH);
+        swprintf_s(out, n, L"%s%s", s_rules[i].to_save ? s_save_dir : s_game_dir, sub);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/*
+ * Empty a directory, keeping the directory itself.
+ *
+ * For RECOMP_CACHE_FRESH: a fresh cache partition at every start, for a title
+ * that writes its utility drive from scratch on each boot. RalliSport
+ * Challenge 2 copies its archives into Z: and renames each into place without
+ * replacing, then waits forever on the copy thread when the rename fails. The
+ * cache database XMountUtilityDrive keeps says Z: is still this title's, so
+ * nothing formats it, and the second launch stalled on its loading screen.
+ * Links are removed, never followed.
+ */
+static void empty_directory(const WCHAR *dir)
+{
+    WCHAR pattern[MAX_PATH], path[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE h;
+
+    swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
+    h = FindFirstFileW(pattern, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
+            continue;
+        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_READONLY)
+            SetFileAttributesW(path, fd.dwFileAttributes & ~FILE_ATTRIBUTE_READONLY);
+        if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            empty_directory(path);
+            RemoveDirectoryW(path);
+        } else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            RemoveDirectoryW(path);     /* a junction or directory link */
+        } else {
+            DeleteFileW(path);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
 }
 
 void xbox_path_init(const char* game_dir, const char* save_dir)
@@ -333,6 +447,10 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         WCHAR image[MAX_PATH];
         WCHAR dir[MAX_PATH];
         SHCreateDirectoryExW(NULL, s_save_dir, NULL);
+        if (getenv("RECOMP_CACHE_FRESH")) {
+            swprintf_s(dir, MAX_PATH, L"%s\\Cache", s_save_dir);
+            empty_directory(dir);
+        }
         for (int i = 0; i < (int)(sizeof(subs) / sizeof(subs[0])); i++) {
             swprintf_s(dir, MAX_PATH, L"%s\\%s", s_save_dir, subs[i]);
             SHCreateDirectoryExW(NULL, dir, NULL);
@@ -410,6 +528,8 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     {
         char linked[512];
         if (resolve_symlink(xbox_path, linked, sizeof(linked)))
+            return xbox_translate_path(linked, host_path_buf, buf_size);
+        if (bare_drive_root(xbox_path, linked, sizeof(linked)))
             return xbox_translate_path(linked, host_path_buf, buf_size);
     }
 

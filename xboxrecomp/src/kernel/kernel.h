@@ -561,6 +561,10 @@ typedef char  xbox_host_char;
 const wchar_t *xbox_LastHostPath(void);
 
 BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, DWORD buf_size);
+#if defined(_WIN32)
+/* The directory holding a partition's files, given its PartitionN.img. */
+BOOL xbox_partition_root_dir(const WCHAR *image, WCHAR *out, DWORD n);
+#endif
 
 /* Optional: a project sets this to see the guest paths the kernel translates
  * (for example to print who opened a file). NULL by default; called before the

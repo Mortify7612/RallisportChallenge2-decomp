@@ -137,10 +137,79 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
         if (!used || used >= buf_size || used + 1 >= buf_size) return FALSE;
         if (win_path[used - 1] != L'\\') win_path[used++] = L'\\';
         int count = MultiByteToWideChar(CP_ACP, 0, xbox_path, -1,
-            win_path + used, (int)(buf_size - used));
-        return count != 0;
+            win_path + used, (int)(buf_size - used));        return count != 0;
     }
     return xbox_translate_path(xbox_path, win_path, buf_size);
+}
+
+/* Cluster size of a partition opened as a volume, from its FATX header.
+ *
+ * A directory open of a partition device lands on the directory holding its
+ * image (below), so a size query on the handle no longer knows which
+ * partition it is. XMountUtilityDrive formats a cache partition with clusters
+ * of 16 KB << (XBE init flags >> 30) -- 64 KB for RalliSport Challenge 2 --
+ * then mounts it only if the volume reports that same cluster size. Answering
+ * the fixed 16 KB failed the mount, so the title formatted Z: on every launch
+ * and copied its archives into it again. The header the format wrote is
+ * read when the volume is opened and remembered for that handle. */
+#define MAX_VOL_GEOMETRY 16
+static struct { HANDLE h; ULONG spc; } s_vol_geometry[MAX_VOL_GEOMETRY];
+static CRITICAL_SECTION s_vol_cs;
+static INIT_ONCE s_vol_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK vol_cs_init(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)param; (void)ctx;
+    InitializeCriticalSection(&s_vol_cs);
+    return TRUE;
+}
+
+static ULONG fatx_sectors_per_cluster(const WCHAR *image)
+{
+    unsigned char hdr[12];
+    DWORD got = 0;
+    ULONG spc = 0;
+    HANDLE h = CreateFileW(image, GENERIC_READ,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+        return 0;
+    if (ReadFile(h, hdr, sizeof(hdr), &got, NULL) && got == sizeof(hdr)
+            && memcmp(hdr, "FATX", 4) == 0)
+        memcpy(&spc, hdr + 8, sizeof(spc));
+    CloseHandle(h);
+    /* A power of two that fits a cluster in 1 MB, or it is not a header. */
+    return spc && spc <= 2048 && !(spc & (spc - 1)) ? spc : 0;
+}
+
+static void vol_geometry_set(HANDLE h, ULONG spc)
+{
+    int i, slot = -1;
+    InitOnceExecuteOnce(&s_vol_once, vol_cs_init, NULL, NULL);
+    EnterCriticalSection(&s_vol_cs);
+    for (i = 0; i < MAX_VOL_GEOMETRY; i++) {
+        if (s_vol_geometry[i].h == h || (slot < 0 && s_vol_geometry[i].h == NULL))
+            slot = i;
+        if (s_vol_geometry[i].h == h)
+            break;
+    }
+    if (slot >= 0) {
+        s_vol_geometry[slot].h = spc ? h : NULL;
+        s_vol_geometry[slot].spc = spc;
+    }
+    LeaveCriticalSection(&s_vol_cs);
+}
+
+static ULONG vol_geometry_get(HANDLE h)
+{
+    ULONG spc = 0;
+    InitOnceExecuteOnce(&s_vol_once, vol_cs_init, NULL, NULL);
+    EnterCriticalSection(&s_vol_cs);
+    for (int i = 0; i < MAX_VOL_GEOMETRY; i++)
+        if (s_vol_geometry[i].h == h)
+            spc = s_vol_geometry[i].spc;
+    LeaveCriticalSection(&s_vol_cs);
+    return spc;
 }
 
 NTSTATUS __stdcall xbox_NtCreateFile(
@@ -152,6 +221,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     WCHAR win_path[MAX_PATH];
     HANDLE h;
     DWORD flags_and_attrs = FILE_ATTRIBUTE_NORMAL;
+    ULONG vol_spc = 0;
     (void)AllocationSize;
 
     if (!FileHandle || !ObjectAttributes)
@@ -178,7 +248,13 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         GetFileAttributesW(win_path) != INVALID_FILE_ATTRIBUTES &&
         !(GetFileAttributesW(win_path) & FILE_ATTRIBUTE_DIRECTORY)) {
         WCHAR *slash = wcsrchr(win_path, L'\\');
-        if (slash && slash != win_path) {
+        WCHAR root[MAX_PATH];
+        vol_spc = fatx_sectors_per_cluster(win_path);
+        /* A partition with files is opened at the directory holding them
+         * (see xbox_partition_root_dir); the raw disk keeps the old answer. */
+        if (xbox_partition_root_dir(win_path, root, MAX_PATH)) {
+            wcscpy_s(win_path, MAX_PATH, root);
+        } else if (slash && slash != win_path) {
             *slash = 0;
             xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE,
                      "NtCreateFile: directory open of a device image, "
@@ -197,6 +273,13 @@ NTSTATUS __stdcall xbox_NtCreateFile(
             flags_and_attrs |= FILE_FLAG_NO_BUFFERING;
         if (FileAttributes & XBOX_FILE_ATTRIBUTE_READONLY)
             flags_and_attrs |= FILE_ATTRIBUTE_READONLY;
+        /* NT opens an existing directory without FILE_DIRECTORY_FILE too;
+         * CreateFileW refuses one without backup semantics. */
+        {
+            DWORD a = GetFileAttributesW(win_path);
+            if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY))
+                flags_and_attrs |= FILE_FLAG_BACKUP_SEMANTICS;
+        }
         h = CreateFileW(win_path, xbox_access_to_win32(DesiredAccess),
             xbox_share_to_win32(ShareAccess), NULL,
             xbox_disposition_to_win32(CreateDisposition), flags_and_attrs, NULL);
@@ -229,6 +312,7 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = h;
+    vol_geometry_set(h, vol_spc);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -573,9 +657,12 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
+    ULONG spc = vol_geometry_get(FileHandle);
+    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
+    if (!spc)
+        spc = XBOX_SECTORS_PER_CLUSTER;
 
     switch (FsInformationClass) {
         case XboxFileFsSizeInformation: {
@@ -583,13 +670,13 @@ NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
             if (GetDiskFreeSpaceExW(NULL, &free_bytes, &total_bytes, &total_free)) {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+                info->SectorsPerAllocationUnit = spc;
                 ULONGLONG cs = (ULONGLONG)info->BytesPerSector * info->SectorsPerAllocationUnit;
                 info->TotalAllocationUnits.QuadPart = total_bytes.QuadPart / cs;
                 info->AvailableAllocationUnits.QuadPart = free_bytes.QuadPart / cs;
             } else {
                 info->BytesPerSector = XBOX_BYTES_PER_SECTOR;
-                info->SectorsPerAllocationUnit = XBOX_SECTORS_PER_CLUSTER;
+                info->SectorsPerAllocationUnit = spc;
                 info->TotalAllocationUnits.QuadPart = 1048576;
                 info->AvailableAllocationUnits.QuadPart = 524288;
             }
@@ -687,6 +774,7 @@ static DIR_CONTEXT* find_or_create_dir_context(HANDLE FileHandle, BOOL create)
  * value: its first answer was the old search's next entry. */
 void xbox_dir_context_drop(HANDLE FileHandle)
 {
+    vol_geometry_set(FileHandle, 0);
     if (!s_dir_cs_init)
         return;
     EnterCriticalSection(&s_dir_cs);

@@ -125,14 +125,20 @@ has never been tried: the launcher uses `#embed` and GNU extensions.
 - **Linux profiles don't load:** a profile saved by the Linux build is
   listed but "Unable to load 0000". The Windows build never opens
   `user.profile`.
-- **Second-launch stall:** the second launch can stall while rebuilding
-  the Z: cache under `%LOCALAPPDATA%\xboxrecomp\Cache`. The Win32 path
-  queries `Z:\` instead of opening `z:\Misc.fa` as Linux does, recopies
-  `misc.fa`, and the rename collides. Workaround: delete that folder
-  between runs.
 - **Headless under Wine** (`RECOMP_FB_WINDOW=0`) never reaches a frame dump,
   even with v0.4.0. Check Windows builds there by comparing logs with a
   previous release's.
+
+**The Z: cache on Windows** (once the second-launch stall): RSC2's
+CacheManager copies every archive into Z: on each boot and renames each one
+into place without replacing; a failed rename leaves the main thread waiting
+forever on the cache thread. Win32 backs the raw disk with
+`Partition0.img`, where XAPI's XMountUtilityDrive keeps its cache database
+(sector 4), and it reads the cluster size (64 KB for this title) from the
+FATX header it wrote into `Partition5.img`. With both persisted it rightly
+doesn't reformat Z:, so `RECOMP_CACHE_FRESH=1` (a default in `main.c`)
+empties the Cache folder at start. Headless runs on real Windows reach
+60 fps on both the first and second launch.
 
 **Where things are on Windows:**
 

@@ -155,8 +155,9 @@ On Windows, as on Linux:
 
 Known Windows issues:
 - A profile saved by the Linux build is listed but "Unable to load".
-- A second launch can stall rebuilding its Z: cache; delete
-  `%LOCALAPPDATA%\xboxrecomp\Cache` between runs.
+- The Z: cache (`%LOCALAPPDATA%\xboxrecomp\Cache`) is emptied at every start,
+  because the game copies it again on each boot (`RECOMP_CACHE_FRESH=0`
+  keeps it, and the second launch then stalls).
 
 Rebuilding `third_party/mingw`:
 
