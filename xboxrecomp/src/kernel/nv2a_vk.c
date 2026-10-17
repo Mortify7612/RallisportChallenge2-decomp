@@ -1617,6 +1617,30 @@ static void slot_wait(Slot *sl, int kick, uint32_t nts)
         vkResetCommandPool(V.dev, sl->pool, 0);
 }
 
+/* Whether a presented surface's pixels need to reach guest RAM at all.
+ * When the swapchain shows the frame, the guest copy of the two surfaces
+ * being flipped is read by nothing -- unless frames are dumped or recorded
+ * from it. It was 0.6 MB of copy (and hashing) a frame, a tenth of the
+ * executor's time on a Snapdragon 870 tablet. RECOMP_VK_FB_WRITEBACK=1
+ * always copies them, =0 never does (headless too, for testing). */
+static int flip_copy_needed(const Surf *s)
+{
+    static int mode = -2;
+    uint32_t va = s->va & 0x0FFFFFFFu;
+    if (mode == -2) {
+        const char *e = getenv("RECOMP_VK_FB_WRITEBACK");
+        mode = e ? atoi(e) != 0 : -1;
+        if (mode < 0 && (getenv("RECOMP_FB_DUMP") || getenv("RECOMP_FB_DUMP_AT")
+                         || getenv("RECOMP_VIDEO_RECORD") || getenv("RECOMP_FB_DUMP_FLIPS")))
+            mode = 1;
+    }
+    if (va != (V.flip_va[0] & 0x0FFFFFFFu) && va != (V.flip_va[1] & 0x0FFFFFFFu))
+        return 1;
+    if (mode >= 0)
+        return mode;
+    return !V.surface_handle;
+}
+
 /* Copy-backs that have landed into guest RAM. `deferred`: they are a
  * flipped frame's, and a surface drawn again since stays dirty. */
 static void write_back(const RbEnt *list, int n, int deferred)
@@ -1646,7 +1670,9 @@ static void write_back(const RbEnt *list, int n, int deferred)
             if (q->hnow_ep && q->va < s->va + surf_bytes(s) && s->va < q->va + surf_bytes(q))
                 q->hnow_ep = 0;
         }
-        if (s->swz)
+        if (!flip_copy_needed(s))
+            ;   /* shown by the swapchain; the guest copy is never read */
+        else if (s->swz)
             surf_swizzle(s, guest(s->va), V.rb.map + list[i].off, rows, 1);
         else
             for (y = 0; y < rows; y++)

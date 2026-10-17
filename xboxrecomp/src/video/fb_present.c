@@ -631,10 +631,25 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
         s_fb_pitch = pitch;
 }
 
+/* The Vulkan window shows the swapchain; the converted copy below is then
+ * only read to record video or dump frames. */
+static int s_vk_sdl;
+
+static int rgb_copy_needed(void)
+{
+    static int need = -1;
+    if (need < 0)
+        need = getenv("RECOMP_VIDEO_RECORD") || getenv("RECOMP_FB_DUMP")
+            || getenv("RECOMP_FB_DUMP_AT") || getenv("RECOMP_FB_DUMP_FLIPS");
+    return need;
+}
+
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 {
     int next;
     if (!s_fb_running || !fb_va || !pitch || getenv("RECOMP_FB_VA"))
+        return;
+    if (s_vk_sdl && !rgb_copy_needed())
         return;
     next = (__atomic_load_n(&s_present_idx, __ATOMIC_ACQUIRE) == 0) ? 1 : 0;
     if (!s_present[next]) {
@@ -976,6 +991,7 @@ static void *fb_thread(void *unused)
                 s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
                 fprintf(stderr, "  [FBWIN] window open, presented by Vulkan (%dx%d, SDL %s)\n",
                         dw, dh, SDL_GetCurrentVideoDriver());
+                s_vk_sdl = 1;
                 return fb_vk_loop(win);
             }
             fprintf(stderr, "  [FBWIN] Vulkan surface failed (%s) -- SDL renderer\n",

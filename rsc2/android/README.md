@@ -146,8 +146,16 @@ unstripped `rsc2/build-android/libmain.so` for it.
 
 - The stock driver is Vulkan 1.1.128; with Turnip (Mesa 26.2.5) the
   renderer gets Vulkan 1.3. Intro, menus and races run, 2560x1600 output.
-- Menus 60 fps; races about 33-39 fps at the default 2x (attract races
-  47-60). Not yet profiled.
+- Menus 60 fps; races at the default 2x: 33-39 fps at first, about
+  49-59 fps now. The limit is the CPU, not the GPU (about 12 ms a frame):
+  the game's D3D waits at every kick until the executor has run what it
+  submitted, so frame time is game plus executor. Profiled with simpleperf
+  (`--call-graph dwarf` for callers through libc). Fixes so far:
+  - the two flipped surfaces are no longer copied back into guest RAM
+    when the swapchain shows them (nothing reads that copy), and
+  - the window no longer converts the guest framebuffer for itself when
+    Vulkan presents (only video recording and dumps used it);
+    together a tenth of the executor's time.
 
 Not done yet: race performance on mobile GPUs, touch controls (use a
 Bluetooth or USB controller), the launcher, and importing the game folder
