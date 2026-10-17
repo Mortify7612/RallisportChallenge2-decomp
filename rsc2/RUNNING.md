@@ -88,9 +88,15 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
   - `RECOMP_VK_AO_SHOW=1` shows the occlusion term on its own.
 - The launcher sets these three from its Graphics section. Its default is
   16x anisotropic, with MSAA and AO off.
-- `RECOMP_HDR=1`: HDR output, when the window offers an HDR format. scRGB
+- `RECOMP_HDR=1`: HDR output, when the window offers an HDR format. On
+  Wayland the game first asks the compositor for its own colour space
+  (KWin: BT.2020, gamma 2.2, 0 to the screen's peak, white at the SDR
+  brightness) and draws 10-bit frames in it, so KWin has nothing to
+  convert or tonemap. The log says "HDR in the compositor's space". Paper
+  white and peak then scale with the SDR brightness slider (203 nits is
+  its white), and the peak stops at the screen's. Otherwise scRGB
   (16-bit linear) is used if available, else HDR10 (10-bit PQ, BT.2020);
-  `RECOMP_HDR_FORMAT=scrgb|a2b10|a2r10` picks one. Turn HDR on in the
+  `RECOMP_HDR_FORMAT=match|scrgb|a2b10|a2r10` picks one. Turn HDR on in the
   system's display settings first; otherwise the game says so and stays SDR.
   The game draws in SDR, so its frame is mapped up:
   - its white sits at paper white, `RECOMP_HDR_PAPER` nits (default 203);

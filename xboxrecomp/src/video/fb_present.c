@@ -573,6 +573,7 @@ void xbox_FramebufferWindowStart(void)
  * All SDL video calls stay on the window thread. */
 #include <SDL.h>
 #include <SDL_vulkan.h>
+#include <SDL_syswm.h>
 #include "../../include/xbox/keymap.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -587,6 +588,7 @@ extern ptrdiff_t xbox_GetMemoryOffset(void);
 extern void *nv2a_vk_instance_handle(void);
 extern void  nv2a_vk_set_surface(uint64_t surface);
 extern void  nv2a_vk_set_window_size(int w, int h);
+extern void  nv2a_vk_set_wayland(void *wl_display, void *wl_surface);
 
 static volatile int  s_fb_running;
 static uint32_t      s_fb_va, s_fb_pitch, s_fb_width = 640, s_fb_height = 480;
@@ -944,6 +946,15 @@ static void *fb_thread(void *unused)
                 int dw, dh;
                 SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
                 nv2a_vk_set_window_size(dw, dh);
+#if defined(SDL_VIDEO_DRIVER_WAYLAND) && !defined(__ANDROID__)
+                {
+                    /* For HDR in the compositor's own colour space. */
+                    SDL_SysWMinfo wm;
+                    SDL_VERSION(&wm.version);
+                    if (SDL_GetWindowWMInfo(win, &wm) && wm.subsystem == SDL_SYSWM_WAYLAND)
+                        nv2a_vk_set_wayland(wm.info.wl.display, wm.info.wl.surface);
+                }
+#endif
                 nv2a_vk_set_surface((uint64_t)(uintptr_t)surf);
                 s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
                 fprintf(stderr, "  [FBWIN] window open, presented by Vulkan (%dx%d, SDL %s)\n",

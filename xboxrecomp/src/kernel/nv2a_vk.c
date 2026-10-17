@@ -53,6 +53,7 @@ void *nv2a_vk_instance_handle(void) { return NULL; }
 int nv2a_vk_device_names(char (*names)[256], int max) { (void)names; (void)max; return 0; }
 int nv2a_vk_attach_hwnd(void *hinstance, void *hwnd) { (void)hinstance; (void)hwnd; return 0; }
 void nv2a_vk_set_surface(uint64_t surface) { (void)surface; }
+void nv2a_vk_set_wayland(void *d, void *s) { (void)d; (void)s; }
 void nv2a_vk_set_window_size(int w, int h) { (void)w; (void)h; }
 int nv2a_vk_program(uint32_t hash, uint8_t inputs[16])
 { (void)hash; (void)inputs; return -1; }
@@ -111,6 +112,7 @@ static int vk_load_device_fns(VkDevice dev)
 }
 #endif
 #include "../d3d/d3d8_swizzle.h"
+#include "wl_color.h"
 #if defined(XBOXRECOMP_HAVE_GLSLANG)
 #include <glslang/Include/glslang_c_interface.h>
 #include <glslang/Public/resource_limits_c.h>
@@ -441,11 +443,15 @@ static struct {
     uint64_t present_id;
     /* RECOMP_HDR: an HDR swapchain and the pass that fills it (hdr_*). */
     int hdr_want;               /* asked for; hdr_mode: what the window got */
-    int hdr_mode;               /* 0 SDR, 1 HDR10 (PQ), 2 scRGB (linear) */
+    int hdr_mode;               /* 0 SDR, 1 HDR10 (PQ), 2 scRGB (linear), 3 the
+                                 * compositor's own space (wl_color.h) */
+    int wl_ok;                  /* a Wayland window wl_color can describe */
+    int wsi_hdr_used;           /* the driver described the window (mode 1/2) */
+    WlcDesc wl_desc;            /* mode 3: what the window was told */
     float hdr_paper, hdr_peak, hdr_strength, hdr_glow, hdr_knee;
     int has_colorspace_ext, has_hdr_meta;
     VkImageView sc_view[8];
-    VkPipeline hdr_pipe[3];     /* per mode, 0: the headless dump's */
+    VkPipeline hdr_pipe[4];     /* per mode, 0: the headless dump's */
     VkSampler hdr_samp;
     VkImage hdr_dimg;           /* RECOMP_HDR_DUMP target */
     VkDeviceMemory hdr_dmem;
@@ -2136,7 +2142,7 @@ static void post_init(void)
     lci.pBindings = b;
     pr.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
     pr.offset = 0;
-    pr.size = 64;
+    pr.size = 80;                      /* the HDR pass's; the rest use 64 */
     plci.setLayoutCount = 1;
     plci.pSetLayouts = &V.post_dsl;
     plci.pushConstantRangeCount = 1;
@@ -6487,6 +6493,11 @@ void nv2a_vk_set_surface(uint64_t surface)
     V.surface_handle = surface;
 }
 
+void nv2a_vk_set_wayland(void *wl_display, void *wl_surface)
+{
+    V.wl_ok = wlc_attach(wl_display, wl_surface);
+}
+
 /* The Win32 window (fb_present.c's GDI window) as a Vulkan surface. */
 int nv2a_vk_attach_hwnd(void *hinstance, void *hwnd)
 {
@@ -6556,8 +6567,9 @@ static void hdr_settings(void)
 /* The mapping, per window pixel. `src` the title's frame through its gamma
  * ramp (display values, sampled over uv.xy of it), `aux` the side buffer
  * (uv.zw). mode.x: 1 HDR10 (BT.2020 primaries, PQ), 2 scRGB (BT.709,
- * 1.0 = 80 nits), 3 nits (the dump); mode.y: aux holds this frame; mode.z:
- * flat -- the FPS counter, at paper white. */
+ * 1.0 = 80 nits), 3 the compositor's space (enc: its luminance range,
+ * transfer function, primaries), 4 nits (the dump); mode.y: aux holds this
+ * frame; mode.z: flat -- the FPS counter, at paper white. */
 static const char *k_hdr_fs =
     "#version 450\n"
     "layout(set = 0, binding = 0) uniform sampler2D src;\n"
@@ -6567,6 +6579,7 @@ static const char *k_hdr_fs =
     "    vec4 lum;   /* paper, peak (nits), strength, glow */\n"
     "    vec4 uv;    /* src u, v extent; aux u, v extent */\n"
     "    vec4 mode;  /* output, aux on, flat, knee */\n"
+    "    vec4 enc;   /* mode 3: min, max nits, tf (1 gamma 2.2, 2 PQ, 3 sRGB), BT.2020 */\n"
     "} p;\n"
     "layout(location = 0) out vec4 o;\n"
     "const vec3 Y = vec3(0.2126, 0.7152, 0.0722);\n"
@@ -6599,10 +6612,20 @@ static const char *k_hdr_fs =
     "            dbg = clamp(a.a, 0.0, 1.0) * 0.5 + floor(g * 64.0);\n"
     "        }\n"
     "    }\n"
+    "    const mat3 to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880,\n"
+    "                             0.0433, 0.0114, 0.8956);\n"
     "    if (p.mode.x == 1.0) {\n"
-    "        const mat3 to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880,\n"
-    "                                 0.0433, 0.0114, 0.8956);\n"
     "        o = vec4(pq(to2020 * n / 10000.0), 1.0);\n"
+    "    } else if (p.mode.x == 3.0) {\n"
+    "        vec3 m = p.enc.w != 0.0 ? to2020 * n : n;\n"
+    "        vec3 e = clamp((m - p.enc.x) / (p.enc.y - p.enc.x), 0.0, 1.0);\n"
+    "        if (p.enc.z == 2.0)\n"
+    "            e = pq(m / 10000.0);\n"
+    "        else if (p.enc.z == 3.0)\n"
+    "            e = mix(e * 12.92, 1.055 * pow(e, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, e));\n"
+    "        else\n"
+    "            e = pow(e, vec3(1.0 / 2.2));\n"
+    "        o = vec4(e, 1.0);\n"
     "    } else if (p.mode.x == 2.0) {\n"
     "        o = vec4(n / 80.0, 1.0);\n"
     "    } else {\n"
@@ -6613,7 +6636,7 @@ static const char *k_hdr_fs =
 /* The pass's pipeline for target format `fmt` (one per output mode). */
 static VkPipeline hdr_pipeline(int mode, VkFormat fmt)
 {
-    static VkFormat built[3];
+    static VkFormat built[4];
     VkShaderModule fs;
     if (V.hdr_pipe[mode] && built[mode] == fmt)
         return V.hdr_pipe[mode];
@@ -6663,7 +6686,7 @@ static int hdr_swapchain_ready(void)
     }
     if (!hdr_pipeline(V.hdr_mode, V.sc_fmt))
         return 0;
-    if (V.has_hdr_meta) {
+    if (V.has_hdr_meta && V.hdr_mode != 3) {
         /* What the frames hold, for the compositor's own mapping to the
          * screen: BT.709 colours, up to the peak. */
         PFN_vkSetHdrMetadataEXT set_md =
@@ -6701,8 +6724,20 @@ static void hdr_pass(VkImageView target, VkImageLayout layout, VkPipeline pipe, 
     VkDescriptorSet set;
     VkViewport vp;
     VkRect2D sc;
-    float pc[16];
+    float pc[20];
+    float paper = V.hdr_paper, peak = V.hdr_peak;
 
+    if (mode == 3) {
+        /* The compositor's space: white where it puts white (its
+         * reference, scaled as RECOMP_HDR_PAPER is to 203 nits), the peak
+         * likewise but no brighter than its range. */
+        const WlcDesc *d = &V.wl_desc;
+        paper = d->ref * V.hdr_paper / 203.0f;
+        peak = d->ref * V.hdr_peak / 203.0f;
+        if (paper > d->lmax) paper = d->lmax;
+        if (peak > d->lmax) peak = d->lmax;
+        if (peak < paper) peak = paper;
+    }
     mb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     vkCmdPipelineBarrier(V.dcb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
@@ -6740,8 +6775,8 @@ static void hdr_pass(VkImageView target, VkImageLayout layout, VkPipeline pipe, 
     pc[1] = (float)oy;
     pc[2] = (float)dw;
     pc[3] = (float)dh;
-    pc[4] = V.hdr_paper;
-    pc[5] = V.hdr_peak;
+    pc[4] = paper;
+    pc[5] = peak;
     pc[6] = V.hdr_strength;
     pc[7] = V.hdr_glow;
     pc[8] = su;
@@ -6752,7 +6787,11 @@ static void hdr_pass(VkImageView target, VkImageLayout layout, VkPipeline pipe, 
     pc[13] = aux ? 1.0f : 0.0f;
     pc[14] = flat ? 1.0f : 0.0f;
     pc[15] = V.hdr_knee;
-    vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, pc);
+    pc[16] = V.wl_desc.lmin;
+    pc[17] = V.wl_desc.lmax > V.wl_desc.lmin ? V.wl_desc.lmax : V.wl_desc.lmin + 1.0f;
+    pc[18] = (float)V.wl_desc.tf;
+    pc[19] = V.wl_desc.bt2020 ? 1.0f : 0.0f;
+    vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     if (V.ov_dst[2] > 0 && V.ov_view
             && (set = post_set_s(V.ov_view, V.ov_view, V.post_samp)) != VK_NULL_HANDLE) {
@@ -6770,7 +6809,7 @@ static void hdr_pass(VkImageView target, VkImageLayout layout, VkPipeline pipe, 
         pc[8] = pc[9] = 1.0f;
         pc[13] = 0.0f;
         pc[14] = 1.0f;
-        vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, pc);
+        vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 80, pc);
         vkCmdDraw(V.dcb, 3, 1, 0, 0);
     }
     vkCmdEndRendering(V.dcb);
@@ -6858,7 +6897,7 @@ static void hdr_dump(uint32_t va, uint32_t pitch)
     g = src == V.gm_img;
     aux = aux_for(s, &is3d);
     V.ov_dst[2] = 0;
-    hdr_pass(V.hdr_dview, VK_IMAGE_LAYOUT_GENERAL, pipe, 3, w, h,
+    hdr_pass(V.hdr_dview, VK_IMAGE_LAYOUT_GENERAL, pipe, 4, w, h,
              g ? V.gm_img_view : s->view, g ? 1.0f : (float)sw / s->w,
              g ? 1.0f : (float)sh / s->h, aux ? V.aux_view : VK_NULL_HANDLE,
              aux ? (float)w / V.aux_w : 1.0f, aux ? (float)h / V.aux_h : 1.0f, !is3d,
@@ -7021,19 +7060,38 @@ static int swapchain_create(void)
     vkGetPhysicalDeviceSurfacePresentModesKHR(V.pd, V.surface, &nm, modes);
     V.sc_fmt = fmts[0].format;
     V.hdr_mode = 0;
-    /* RECOMP_HDR: scRGB (linear half floats, BT.709) if the window takes
-     * it, else HDR10 (10-bit PQ, BT.2020); drawn into by hdr_pass(). scRGB
-     * first: with KWin compositing on another GPU (PRIME), a PQ window
+    /* RECOMP_HDR: on Wayland, 10 bits in the compositor's own colour space
+     * if it names one (wl_color.h: nothing for it to convert or tonemap);
+     * else scRGB (linear half floats, BT.709) if the window takes it, else
+     * HDR10 (10-bit PQ, BT.2020); drawn into by hdr_pass(). scRGB before
+     * HDR10: with KWin compositing on another GPU (PRIME), a PQ window
      * missed a refresh on one frame in five at 120 Hz, scRGB on one in
-     * seventy, at the same picture. RECOMP_HDR_FORMAT=scrgb|a2b10|a2r10
+     * seventy, at the same picture. RECOMP_HDR_FORMAT=match|scrgb|a2b10|a2r10
      * picks one. */
     if (V.hdr_want && V.has_colorspace_ext && V.post_pl
             && (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
         const char *hf = getenv("RECOMP_HDR_FORMAT");
-        VkFormat only = !hf || !*hf ? VK_FORMAT_UNDEFINED
+        int match_ok = !hf || !*hf || !strcmp(hf, "match");
+        VkFormat only = !hf || !*hf || !strcmp(hf, "match") ? VK_FORMAT_UNDEFINED
                       : !strcmp(hf, "a2b10") ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
                       : !strcmp(hf, "a2r10") ? VK_FORMAT_A2R10G10B10_UNORM_PACK32
                       : VK_FORMAT_R16G16B16A16_SFLOAT;
+        /* (Not after the driver described the window: one description
+         * object per surface, and its may outlive the old swapchain.) */
+        if (match_ok && V.wl_ok && !V.wsi_hdr_used) {
+            for (i = 0; i < nf; i++)
+                if (fmts[i].colorSpace == VK_COLOR_SPACE_PASS_THROUGH_EXT
+                        && (fmts[i].format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
+                            || fmts[i].format == VK_FORMAT_A2R10G10B10_UNORM_PACK32))
+                    break;
+            if (i < nf && wlc_take_preferred(&V.wl_desc)) {
+                V.sc_fmt = fmts[i].format;
+                ci.imageColorSpace = fmts[i].colorSpace;
+                V.hdr_mode = 3;
+            }
+        }
+        if (!V.hdr_mode)
+            wlc_release();
         for (i = 0; i < nf && !V.hdr_mode; i++)
             if (fmts[i].colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
                     && fmts[i].format == VK_FORMAT_R16G16B16A16_SFLOAT
@@ -7041,6 +7099,7 @@ static int swapchain_create(void)
                 V.sc_fmt = fmts[i].format;
                 ci.imageColorSpace = fmts[i].colorSpace;
                 V.hdr_mode = 2;
+                V.wsi_hdr_used = 1;
             }
         for (i = 0; i < nf && !V.hdr_mode; i++)
             if (fmts[i].colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT
@@ -7051,6 +7110,7 @@ static int swapchain_create(void)
                 V.sc_fmt = fmts[i].format;
                 ci.imageColorSpace = fmts[i].colorSpace;
                 V.hdr_mode = 1;
+                V.wsi_hdr_used = 1;
             }
         if (!V.hdr_mode) {
             static int said;
@@ -7059,6 +7119,8 @@ static int swapchain_create(void)
                         " (is HDR on in the display settings?) -- SDR\n");
         }
     }
+    if (!V.hdr_mode)
+        wlc_release();         /* SDR: the driver's sRGB again */
     for (i = 0; i < nf && !V.hdr_mode; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM
             || fmts[i].format == VK_FORMAT_R8G8B8A8_UNORM) {
@@ -7136,7 +7198,13 @@ static int swapchain_create(void)
     }
     fprintf(stderr, "  [VK] presenting %ux%u, format %d, mode %d, %u images (min %u)%s\n", V.sc_ext.width,
             V.sc_ext.height, (int)V.sc_fmt, (int)mode, V.sc_n, caps.minImageCount,
-            V.hdr_mode == 1 ? ", HDR10" : V.hdr_mode == 2 ? ", HDR scRGB" : "");
+            V.hdr_mode == 1 ? ", HDR10" : V.hdr_mode == 2 ? ", HDR scRGB"
+            : V.hdr_mode == 3 ? ", HDR in the compositor's space" : "");
+    if (V.hdr_mode == 3)
+        fprintf(stderr, "  [VK] HDR: compositor space %s %s, %.4f-%.0f nits, white %.0f\n",
+                V.wl_desc.bt2020 ? "BT.2020" : "BT.709",
+                V.wl_desc.tf == WLC_TF_GAMMA22 ? "gamma 2.2" : V.wl_desc.tf == WLC_TF_PQ ? "PQ" : "sRGB",
+                V.wl_desc.lmin, V.wl_desc.lmax, V.wl_desc.ref);
     return 1;
 }
 
@@ -7596,6 +7664,9 @@ static void present_frame(uint32_t va, uint32_t pitch)
         int g = src == V.gm_img, is3d;
         int aux = aux_for(s, &is3d);
         overlay_frame(ox, oy);
+        if (V.hdr_mode == 3 && wlc_poll(&V.wl_desc))
+            fprintf(stderr, "  [VK] HDR: compositor space now %.4f-%.0f nits, white %.0f\n",
+                    V.wl_desc.lmin, V.wl_desc.lmax, V.wl_desc.ref);
         hdr_pass(V.sc_view[V.sc_idx], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                  V.hdr_pipe[V.hdr_mode], V.hdr_mode, V.sc_ext.width, V.sc_ext.height,
                  g ? V.gm_img_view : s->view, g ? 1.0f : (float)sw / s->w,
