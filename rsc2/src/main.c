@@ -52,6 +52,8 @@
 #include <stdbool.h>
 #include <string.h>
 #include <math.h>
+#include <ctype.h>
+#include <sys/stat.h>
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
@@ -113,6 +115,255 @@ extern ptrdiff_t g_xbox_mem_offset;
 /* ── Forward declarations ──────────────────────────────────── */
 
 static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
+
+/* ── The player's game folder ──────────────────────────────── */
+
+/*
+ * Players bring their own copy, and setting it up is where most first runs
+ * go wrong: no "game" folder, the files one folder too deep
+ * (game\RalliSport2\default.xbe), a disc image nobody extracted, or half
+ * the folders missing. Each gets a message that says which, instead of a
+ * failed load or a crash in the intro.
+ */
+#ifdef _WIN32
+#define GAME_SEP "\\"
+#else
+#define GAME_SEP "/"
+#endif
+
+static int game_path_is_dir(const char *p)
+{
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int game_path_is_file(const char *p)
+{
+    struct stat st;
+    return stat(p, &st) == 0 && !S_ISDIR(st.st_mode);
+}
+
+static int game_name_eq(const char *a, const char *b)
+{
+    for (; *a && *b; a++, b++)
+        if (tolower((unsigned char)*a) != tolower((unsigned char)*b))
+            return 0;
+    return *a == *b;
+}
+
+static int game_name_ends(const char *name, const char *ext)
+{
+    size_t n = strlen(name), e = strlen(ext);
+    return n > e && game_name_eq(name + n - e, ext);
+}
+
+typedef struct {
+    const char *dir;
+    unsigned found;             /* bit per required folder, any case */
+    char nested[700];           /* a subfolder holding default.xbe */
+    char image[700];            /* a disc image */
+} GameScan;
+
+static const char *const k_game_folders[] = { "Media", "Movies", "Layer0", "Layer1", "Locale" };
+#define GAME_NFOLDERS (sizeof k_game_folders / sizeof k_game_folders[0])
+
+static void game_scan_entry(GameScan *s, const char *name)
+{
+    char p[1024];
+    size_t i;
+    if (name[0] == '.')
+        return;
+    snprintf(p, sizeof p, "%s" GAME_SEP "%s", s->dir, name);
+    for (i = 0; i < GAME_NFOLDERS; i++)
+        if (game_name_eq(name, k_game_folders[i]) && game_path_is_dir(p))
+            s->found |= 1u << i;
+    if (!s->nested[0] && game_path_is_dir(p)) {
+        char x[1100];
+        snprintf(x, sizeof x, "%s" GAME_SEP "default.xbe", p);
+        if (game_path_is_file(x))
+            snprintf(s->nested, sizeof s->nested, "%s", p);
+    }
+    if (!s->image[0] && (game_name_ends(name, ".iso") || game_name_ends(name, ".xiso")))
+        snprintf(s->image, sizeof s->image, "%s", p);
+}
+
+static void game_scan(GameScan *s, const char *dir)
+{
+    memset(s, 0, sizeof *s);
+    s->dir = dir;
+#ifdef _WIN32
+    {
+        WIN32_FIND_DATAA fd;
+        char pat[1024];
+        HANDLE h;
+        snprintf(pat, sizeof pat, "%s\\*", dir);
+        h = FindFirstFileA(pat, &fd);
+        if (h == INVALID_HANDLE_VALUE)
+            return;
+        do
+            game_scan_entry(s, fd.cFileName);
+        while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+#else
+    {
+        DIR *d = opendir(dir);
+        struct dirent *e;
+        if (!d)
+            return;
+        while ((e = readdir(d)) != NULL)
+            game_scan_entry(s, e->d_name);
+        closedir(d);
+    }
+#endif
+}
+
+/* The one default.xbe the code was translated from. Every address in the
+ * translated code is that build's, so another one cannot work. Its
+ * certificate says all regions, so the region does not tell versions
+ * apart; size and CRC-32 do. */
+#define GAME_TITLE_ID  0x4D530039u
+#define GAME_XBE_SIZE  4718592u
+#define GAME_XBE_CRC   0xD4665F3Bu
+
+static uint32_t game_crc32(const uint8_t *p, size_t n)
+{
+    uint32_t c = 0xFFFFFFFFu;
+    size_t i;
+    int k;
+    for (i = 0; i < n; i++) {
+        c ^= p[i];
+        for (k = 0; k < 8; k++)
+            c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+    }
+    return ~c;
+}
+
+/* No window, so nobody to click OK. By now the env defaults have run, and
+ * they remove RECOMP_FB_WINDOW when it was 0: unset is headless, as in
+ * fb_present.c. */
+static int game_headless(void)
+{
+    const char *fb = getenv("RECOMP_FB_WINDOW");
+    return !fb || !*fb || strcmp(fb, "0") == 0;
+}
+
+/* An error the player has to see. */
+static void game_message(const char *msg)
+{
+    fprintf(stderr, "[GAME] %s\n", msg);
+    if (!game_headless())
+        MessageBoxA(NULL, msg, "RalliSport Challenge 2", MB_ICONERROR);
+}
+
+/* 1 to go on. A different game stops; a different build of this one asks. */
+static int check_game_version(const void *xbe, size_t size)
+{
+    const uint8_t *d = (const uint8_t *)xbe;
+    uint32_t base, cert, tid = 0, crc;
+    char msg[800];
+    if (size >= 0x178) {
+        memcpy(&base, d + 0x104, 4);
+        memcpy(&cert, d + 0x118, 4);
+        if (cert >= base && cert - base + 12 <= size)
+            memcpy(&tid, d + (cert - base) + 8, 4);
+    }
+    if (tid != GAME_TITLE_ID) {
+        snprintf(msg, sizeof msg, "game" GAME_SEP "default.xbe is not RalliSport Challenge 2 "
+                 "(its title ID is %08X, the game's is %08X).", tid, GAME_TITLE_ID);
+        game_message(msg);
+        return 0;
+    }
+    crc = game_crc32(d, size);
+    if (size == GAME_XBE_SIZE && crc == GAME_XBE_CRC) {
+        fprintf(stderr, "[GAME] default.xbe is the expected build (CRC %08X)\n", crc);
+        return 1;
+    }
+    snprintf(msg, sizeof msg,
+             "game" GAME_SEP "default.xbe is a different build of RalliSport Challenge 2 "
+             "than the one this program was made from (size %zu, CRC %08X; expected %u, %08X).\n\n"
+             "It will most likely crash. Start anyway?", size, crc, GAME_XBE_SIZE, GAME_XBE_CRC);
+    fprintf(stderr, "[GAME] %s\n", msg);
+    if (game_headless())
+        return 1;
+#ifdef _WIN32
+    return MessageBoxA(NULL, msg, "RalliSport Challenge 2", MB_ICONWARNING | MB_YESNO) == IDYES;
+#else
+    MessageBoxA(NULL, msg, "RalliSport Challenge 2", MB_ICONWARNING);
+    return 1;
+#endif
+}
+
+/* 1 when the game folder looks usable; otherwise says why and returns 0. */
+static int check_game_folder(void)
+{
+    char msg[2400], cwd[700] = "?";
+    GameScan s;
+#ifdef _WIN32
+    /* Started from elsewhere (a shortcut with another "Start in", another
+     * folder's command line): the game folder is the one next to the
+     * program. */
+    if (!game_path_is_dir(YOUR_GAME_DIR)) {
+        char exe[MAX_PATH + 16], *slash;
+        DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH);
+        if (n && n < MAX_PATH && (slash = strrchr(exe, '\\'))) {
+            slash[1] = 0;
+            strcat(exe, YOUR_GAME_DIR);
+            if (game_path_is_dir(exe)) {
+                slash[1] = 0;
+                SetCurrentDirectoryA(exe);
+                fprintf(stderr, "[GAME] using the game folder next to the program, in %s\n", exe);
+            }
+        }
+    }
+    GetCurrentDirectoryA(sizeof cwd, cwd);
+#else
+    if (!getcwd(cwd, sizeof cwd))
+        snprintf(cwd, sizeof cwd, "?");
+#endif
+
+    if (game_path_is_file(YOUR_GAME_XBE_PATH)) {
+        char missing[200] = "";
+        size_t i;
+        game_scan(&s, YOUR_GAME_DIR);
+        for (i = 0; i < GAME_NFOLDERS; i++)
+            if (!(s.found & (1u << i))) {
+                strcat(missing, "  ");
+                strcat(missing, k_game_folders[i]);
+            }
+        if (!missing[0])
+            return 1;
+        snprintf(msg, sizeof msg,
+                 "The game folder is incomplete.\n\n%s" GAME_SEP "game has default.xbe but "
+                 "not these folders:\n%s\n\nCopy all of the game's files into it.", cwd, missing);
+    } else if (!game_path_is_dir(YOUR_GAME_DIR)) {
+        game_scan(&s, ".");
+        snprintf(msg, sizeof msg,
+                 "There is no \"game\" folder in\n%s\n\nPut your copy of the game's files "
+                 "(default.xbe, Layer0, Layer1, Locale, Media, Movies) in a folder called "
+                 "\"game\" next to the program.%s%s%s", cwd,
+                 s.image[0] ? "\n\nThere is a disc image here (" : "",
+                 s.image[0] ? s.image : "",
+                 s.image[0] ? "): its files have to be extracted first, see the README." : "");
+    } else {
+        game_scan(&s, YOUR_GAME_DIR);
+        if (s.nested[0])
+            snprintf(msg, sizeof msg,
+                     "The game's files are one folder too deep:\n%s\n\nMove everything inside "
+                     "that folder up into \"game\", so that default.xbe is directly in "
+                     "\"game\".", s.nested);
+        else if (s.image[0])
+            snprintf(msg, sizeof msg,
+                     "The \"game\" folder holds a disc image (%s), not the game's files.\n\n"
+                     "Extract its files into \"game\" first, see the README.", s.image);
+        else
+            snprintf(msg, sizeof msg,
+                     "%s" GAME_SEP "game has no default.xbe.\n\nPut your copy of the game's "
+                     "files (default.xbe, Layer0, Layer1, Locale, Media, Movies) in it.", cwd);
+    }
+    game_message(msg);
+    return 0;
+}
 
 /* Recompiled entry point and flat dispatch table (generated by the recomp
  * pipeline; declared in recomp_types.h, which main.c does not include). */
@@ -604,13 +855,19 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
 #endif
 
     /* Step 1: Load XBE */
+#ifndef __ANDROID__
+    if (!check_game_folder())
+        return 1;
+#endif
     if (!load_xbe(YOUR_GAME_XBE_PATH, &xbe_data, &xbe_size)) {
-        MessageBoxA(NULL, "Failed to load default.xbe.\n"
-                    "Place the game files in the 'game' subdirectory.",
-                    "Recomp", MB_ICONERROR);
+        game_message("game" GAME_SEP "default.xbe could not be read.");
         return 1;
     }
     printf("XBE loaded: %zu bytes\n", xbe_size);
+#ifndef __ANDROID__
+    if (!check_game_version(xbe_data, xbe_size))
+        return 1;
+#endif
 
     /* Step 2: Initialize Xbox memory layout */
     printf("Initializing Xbox memory layout...\n");
