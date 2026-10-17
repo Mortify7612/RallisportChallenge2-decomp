@@ -86,8 +86,16 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
   - Tuning: `RECOMP_VK_AO_RADIUS` (default 1), `_INTENSITY` (0.7), `_FOV`
     (50, vertical), `_NEAR` (8: fades in past the car), `_FAR` (150).
   - `RECOMP_VK_AO_SHOW=1` shows the occlusion term on its own.
-- The launcher sets these three from its Graphics section. Its default is
-  16x anisotropic, with MSAA and AO off.
+- `RSC2_DRAW_DISTANCE=k` (1 to 4; 1 is the original): how far objects,
+  trees, spectators and grass are drawn. Each stage sets its own view
+  distances along the track ("hotspots"); objects stop at 130 to 550 m on
+  Monte Carlo. This multiplies those distances and the undergrowth's by k,
+  and divides the projected-size cull threshold by k. The renderer's
+  object lists have fixed sizes, so with k above 1 a cull keeps at most
+  1024 objects, dropping the smallest on screen first.
+  `RSC2_CULL_STATS=1` prints the most objects one cull let through.
+- The launcher sets these four from its Graphics section. Its default is
+  16x anisotropic, with MSAA and AO off and the original draw distance.
 - `RECOMP_HDR=1`: HDR output, when the window offers an HDR format. On
   Wayland the game first asks the compositor for its own colour space
   (KWin: BT.2020, gamma 2.2, 0 to the screen's peak, white at the SDR
@@ -252,3 +260,7 @@ Defaults are baked into `src/main.c`; `NAME=0` turns one off.
   `RSC2_PROFILE_DELAY=s`), `RECOMP_PIXEL_PROBE=x,y`, `RECOMP_BATCH_LOG`,
   `RECOMP_PROG_STATS`, `RECOMP_PROG_DUMP=hash`, `RECOMP_APU_STATS`,
   `RECOMP_ACK_STATS`, `RECOMP_WATCH=va`, `RSC2_FIBER_TRACE`.
+- Guest memory: `RECOMP_PEEKF=va:count:every` prints floats every so many
+  frames, `RECOMP_POKEF=va=value,...` writes floats at every flip, and
+  `RECOMP_MEMDUMP=file:frame` saves the 64 MB of guest RAM at that frame
+  (file offset = guest address) for searching offline.

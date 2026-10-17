@@ -922,3 +922,161 @@ void sub_00365590(void)
 #undef ecx
 #undef edx
 #undef esp
+
+/* ── Hotspot view settings (0x0026EA80, HotspotManager: stdcall, 4 args) ─
+ *
+ * Each stage carries "hotspots": keyframes along the track, each holding
+ * fifteen view settings for 1, 2, 3 and 4 players (names in the table at
+ * 0x003C3358). This interpolates them at the camera's track position and
+ * returns a fresh record in eax (or 0 when the stage has none): a float
+ * position, the group in use, then four groups of fifteen floats from +8.
+ * The race view copies them into the renderers every frame
+ * (sub_0029C5F0): meshViewDist becomes the far plane objects are culled
+ * against (130-550 m on Monte Carlo), meshFadeScale multiplies the
+ * projected-size cull threshold, and the undergrowth pair bounds the grass.
+ *
+ * RSC2_DRAW_DISTANCE=<k> stretches all of them by k: k times the view
+ * distance for objects and undergrowth, and objects k times smaller on
+ * screen before the size cull drops them. 1 (or unset) is the original.
+ *
+ * The record lives in the manager (+0x14) and the next call starts from it:
+ * settings a keyframe leaves unset carry over from the last result. So the
+ * originals are put back before each call and only what the callers read is
+ * scaled -- scaling in place compounded (k=2 gave 3.7 times the distance).
+ *
+ * More objects survive the cull than the title ever produced, and the lists
+ * they are sorted into have fixed sizes and no bounds checks; see the cull
+ * wrapper below (sub_0010F0D0) for the cap that keeps them inside.
+ */
+extern void sub_0026EA80_gen(void);
+
+#define HS_MESH_VIEW_DIST         1
+#define HS_MESH_FADE_SCALE        2
+#define HS_UNDERGROWTH_VIEW_DIST  7
+#define HS_UNDERGROWTH_FADE_DIST  8
+
+static const int s_hs_scaled[4] = {
+    HS_MESH_VIEW_DIST, HS_MESH_FADE_SCALE,
+    HS_UNDERGROWTH_VIEW_DIST, HS_UNDERGROWTH_FADE_DIST,
+};
+
+static float draw_distance_scale(void)
+{
+    static float k = -1.0f;
+    if (k < 0.0f) {
+        const char *e = getenv("RSC2_DRAW_DISTANCE");
+        k = e ? strtof(e, NULL) : 1.0f;
+        if (!(k >= 0.25f && k <= 4.0f))
+            k = 1.0f;
+    }
+    return k;
+}
+
+void sub_0026EA80(void)
+{
+    static uint32_t s_rec;                  /* record last scaled */
+    static uint32_t s_orig[4][4], s_mine[4][4];
+    float k = draw_distance_scale();
+    uint32_t rec, g, i;
+
+    if (k == 1.0f) {
+        sub_0026EA80_gen();
+        return;
+    }
+    /* Undo the last scaling, unless the title rewrote the value since. */
+    if (s_rec)
+        for (g = 0; g < 4; g++)
+            for (i = 0; i < 4; i++) {
+                uint32_t a = s_rec + 8 + g * 0x3C + s_hs_scaled[i] * 4;
+                if (MEM32(a) == s_mine[g][i])
+                    MEM32(a) = s_orig[g][i];
+            }
+    sub_0026EA80_gen();
+    rec = g_eax;
+    s_rec = rec;
+    if (!rec)
+        return;
+    for (g = 0; g < 4; g++)
+        for (i = 0; i < 4; i++) {
+            uint32_t a = rec + 8 + g * 0x3C + s_hs_scaled[i] * 4;
+            float v = MEMF(a);
+            s_orig[g][i] = MEM32(a);
+            MEMF(a) = s_hs_scaled[i] == HS_MESH_FADE_SCALE ? v / k : v * k;
+            s_mine[g][i] = MEM32(a);
+        }
+}
+
+/* ── Object cull (0x0010F0D0, stdcall: ctx, camera, ?, ?, &count, out, ...) ─
+ *
+ * The mesh renderer's projected-size cull: every candidate whose
+ * radius * focal / distance clears the threshold is appended to `out` as a
+ * 24-byte record {instance, distance, class, ..., weight}, and its projected
+ * size is left in instance+0x10. sub_00273E70 then sorts the records into
+ * four lists inside the renderer -- 1536, 1024, 256 and 256 records, none
+ * bounds-checked. On a stock stage that is plenty (about 260 objects on
+ * Monte Carlo); RSC2_DRAW_DISTANCE=4 produced well over a thousand, overran
+ * the 1024-record list of fading objects and wrote over function pointers.
+ *
+ * So with draw distance raised, the output is capped at 1024 records: the
+ * smallest on screen go first, which is the title's own rule with a higher
+ * threshold, and the rest keep their order. The 256-record lists only take
+ * special classes, which the cap does not change in kind.
+ */
+extern void sub_0010F0D0_gen(void);
+
+#define CULL_MAX_OBJECTS 1024u
+
+static int cmp_float_desc(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+
+#define esp g_esp
+void sub_0010F0D0(void)
+{
+    uint32_t count_p = MEM32(esp + 0x14), out = MEM32(esp + 0x18), n, i, j;
+    static float size[3200];
+
+    sub_0010F0D0_gen();
+    n = MEM32(count_p);
+    {
+        /* RSC2_CULL_STATS=1: the most objects one cull let through, per
+         * 600 calls (about 5 s: the race culls twice a frame). */
+        static int on = -1;
+        static uint32_t calls, most;
+        if (on < 0)
+            on = getenv("RSC2_CULL_STATS") != NULL;
+        if (on) {
+            if (n > most)
+                most = n;
+            if (++calls % 600 == 0) {
+                fprintf(stderr, "[CULL] most objects in one cull: %u (cap %u)\n",
+                        most, CULL_MAX_OBJECTS);
+                most = 0;
+            }
+        }
+    }
+    if (draw_distance_scale() <= 1.0f)
+        return;
+    if (n <= CULL_MAX_OBJECTS || n > sizeof size / sizeof size[0])
+        return;
+    for (i = 0; i < n; i++)
+        size[i] = MEMF(MEM32(out + i * 24) + 0x10);
+    qsort(size, n, sizeof size[0], cmp_float_desc);
+    {
+        float cut = size[CULL_MAX_OBJECTS - 1];
+        for (i = j = 0; i < n && j < CULL_MAX_OBJECTS; i++) {
+            if (MEMF(MEM32(out + i * 24) + 0x10) < cut)
+                continue;
+            if (i != j) {
+                uint32_t w;
+                for (w = 0; w < 24; w += 4)
+                    MEM32(out + j * 24 + w) = MEM32(out + i * 24 + w);
+            }
+            j++;
+        }
+    }
+    MEM32(count_p) = j;
+}
+#undef esp

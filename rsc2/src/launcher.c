@@ -40,7 +40,7 @@ int nv2a_vk_device_names(char (*names)[256], int max);
 enum {
     O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS, O_FPSCOUNT, O_HDR, O_HDRPAPER,
     O_SHOW,
-    O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_KEYBOARD, O_KEYS, O_STEER, O_RUMBLE,
+    O_MSAA, O_ANISO, O_AO, O_DRAWDIST, O_SOUND, O_REVERB, O_KEYBOARD, O_KEYS, O_STEER, O_RUMBLE,
     O_COUNT
 };
 
@@ -221,6 +221,16 @@ static void opts_init(int list_gpus)
                 "Not in the original game; costs some GPU time.");
     opt_add(o, "Off", "0");
     opt_add(o, "On", "1");
+
+    o = opt_def(O_DRAWDIST, "draw_distance", "RSC2_DRAW_DISTANCE", NULL, 1, "Draw distance",
+                "How far away trees, buildings, spectators and grass are still drawn. "
+                "The original pops them in at a few hundred metres; further costs "
+                "some GPU and CPU time.");
+    opt_add(o, "Original", "1");
+    opt_add(o, "1.5\xC3\x97", "1.5");
+    opt_add(o, "2\xC3\x97", "2");
+    opt_add(o, "3\xC3\x97", "3");
+    opt_add(o, "4\xC3\x97", "4");
 
     o = opt_def(O_SOUND, "sound", "RECOMP_AUDIO", "AUDIO", 1, "Sound",
                 "Turns all game audio on or off.");
@@ -455,16 +465,16 @@ static int launcher_window(void) { return 1; }
 
 /* Layout in logical units; the renderer's pixels per unit is s_px. */
 #define WIN_W 1000
-#define WIN_H 816
+#define WIN_H 858
 #define ROW_H 42
 #define SEC_H 34
 #define COL_W 444
 #define COL0_X 40
 #define COL1_X 516
 #define TOP_Y 128
-#define HELP_Y 644                      /* the focused row's help text */
-#define FOOT_Y 702                      /* key hints; a rule below them */
-#define BTN_Y 752
+#define HELP_Y 686                      /* the focused row's help text */
+#define FOOT_Y 744                      /* key hints; a rule below them */
+#define BTN_Y 794
 
 enum { B_DEFAULTS = O_COUNT, B_STEAM, B_QUIT, B_START, FOCUS_COUNT };
 
@@ -1286,6 +1296,79 @@ static int hit(float x, float y)
     return -1;
 }
 
+/* ── fitting the window to its screen ──────────────────────────
+ *
+ * The layout is WIN_W x WIN_H units. On a screen too small for that (a
+ * 1024x768 monitor), the whole window is drawn smaller: s_fit window points
+ * per unit, s_px pixels per unit, the fonts rasterised for that size, and
+ * mouse positions turned back into units as they arrive. Checked again
+ * whenever the window turns up on another screen.
+ */
+static float s_fit = 1.0f;
+static int s_fit_display = -2;
+static float s_hidpi = 1.0f;            /* pixels per window point */
+
+static Font *const s_fonts[5] = { &s_body, &s_bold, &s_title, &s_small, &s_smallb };
+
+static void fonts_free(void)
+{
+    int i;
+    for (i = 0; i < 5; i++)
+        if (s_fonts[i]->tex) {
+            SDL_DestroyTexture(s_fonts[i]->tex);
+            s_fonts[i]->tex = NULL;
+        }
+}
+
+static int fonts_init(void)
+{
+    return font_init(&s_body, k_font_Regular, 16) && font_init(&s_bold, k_font_Bold, 16)
+        && font_init(&s_title, k_font_Bold, 32) && font_init(&s_small, k_font_Regular, 13)
+        && font_init(&s_smallb, k_font_Bold, 12);
+}
+
+/* Size the window for the screen it is on. 1 when the scale changed. */
+static int fit_window(SDL_Window *win)
+{
+    int d = SDL_GetWindowDisplayIndex(win);
+    float fit = 1.0f;
+    SDL_Rect ub;
+
+    if (d == s_fit_display)
+        return 0;
+    s_fit_display = d;
+    /* Room for the title bar and the panel. */
+    if (d >= 0 && SDL_GetDisplayUsableBounds(d, &ub) == 0 && ub.w > 0 && ub.h > 0) {
+        float fw = (float)(ub.w - 24) / WIN_W, fh = (float)(ub.h - 56) / WIN_H;
+        fit = fw < fh ? fw : fh;
+        if (fit > 1.0f) fit = 1.0f;
+        if (fit < 0.5f) fit = 0.5f;
+    }
+    if (fit > s_fit - 0.005f && fit < s_fit + 0.005f)
+        return 0;
+    s_fit = fit;
+    s_px = s_hidpi * fit;
+    SDL_SetWindowSize(win, (int)(WIN_W * fit + 0.5f), (int)(WIN_H * fit + 0.5f));
+    if (d >= 0)
+        SDL_SetWindowPosition(win, SDL_WINDOWPOS_CENTERED_DISPLAY(d),
+                              SDL_WINDOWPOS_CENTERED_DISPLAY(d));
+    return 1;
+}
+
+/* Mouse positions from window points to layout units. */
+static void unfit_event(SDL_Event *ev)
+{
+    if (s_fit == 1.0f)
+        return;
+    if (ev->type == SDL_MOUSEMOTION) {
+        ev->motion.x = (Sint32)(ev->motion.x / s_fit);
+        ev->motion.y = (Sint32)(ev->motion.y / s_fit);
+    } else if (ev->type == SDL_MOUSEBUTTONDOWN || ev->type == SDL_MOUSEBUTTONUP) {
+        ev->button.x = (Sint32)(ev->button.x / s_fit);
+        ev->button.y = (Sint32)(ev->button.y / s_fit);
+    }
+}
+
 static int launcher_window(void)
 {
     SDL_Window *win;
@@ -1320,10 +1403,9 @@ static int launcher_window(void)
     SDL_SetRenderDrawBlendMode(s_ren, SDL_BLENDMODE_BLEND);
     SDL_GetRendererOutputSize(s_ren, &ow, &oh);
     SDL_GetWindowSize(win, &ww, &wh);
-    s_px = ww > 0 ? (float)ow / (float)ww : 1.0f;
-    if (!font_init(&s_body, k_font_Regular, 16) || !font_init(&s_bold, k_font_Bold, 16)
-            || !font_init(&s_title, k_font_Bold, 32) || !font_init(&s_small, k_font_Regular, 13)
-            || !font_init(&s_smallb, k_font_Bold, 12)) {
+    s_hidpi = s_px = ww > 0 ? (float)ow / (float)ww : 1.0f;
+    fit_window(win);
+    if (!fonts_init()) {
         fprintf(stderr, "[LAUNCHER] font setup failed -- starting the game\n");
         result = 1;
     }
@@ -1339,6 +1421,13 @@ static int launcher_window(void)
 
     while (result < 0) {
         SDL_Event ev;
+        if (fit_window(win)) {
+            fonts_free();
+            if (!fonts_init()) {
+                result = 1;
+                break;
+            }
+        }
         SDL_SetRenderDrawColor(s_ren, C_BG0.r, C_BG0.g, C_BG0.b, 255);
         SDL_RenderClear(s_ren);
         if (s_page)
@@ -1347,7 +1436,9 @@ static int launcher_window(void)
             draw();
         if (getenv("RSC2_LAUNCHER_SHOT")) {
             /* RSC2_LAUNCHER_SHOT=<file.bmp>: the first frame, then quit. */
-            SDL_Surface *sf = SDL_CreateRGBSurfaceWithFormat(0, ow, oh, 32,
+            SDL_Surface *sf;
+            SDL_GetRendererOutputSize(s_ren, &ow, &oh);
+            sf = SDL_CreateRGBSurfaceWithFormat(0, ow, oh, 32,
                                                              SDL_PIXELFORMAT_ARGB8888);
             if (sf && SDL_RenderReadPixels(s_ren, NULL, SDL_PIXELFORMAT_ARGB8888,
                                            sf->pixels, sf->pitch) == 0)
@@ -1367,6 +1458,7 @@ static int launcher_window(void)
             continue;
         }
         do {
+            unfit_event(&ev);
             if (s_page && ev.type != SDL_QUIT && ev.type != SDL_CONTROLLERDEVICEADDED) {
                 keys_event(&ev);
                 continue;
@@ -1456,12 +1548,7 @@ static int launcher_window(void)
     for (i = 0; i < 8; i++)
         if (pads[i])
             SDL_GameControllerClose(pads[i]);
-    {
-        Font *fs[5] = { &s_body, &s_bold, &s_title, &s_small, &s_smallb };
-        for (i = 0; i < 5; i++)
-            if (fs[i]->tex)
-                SDL_DestroyTexture(fs[i]->tex);
-    }
+    fonts_free();
     SDL_DestroyRenderer(s_ren);
     s_ren = NULL;
     SDL_DestroyWindow(win);
