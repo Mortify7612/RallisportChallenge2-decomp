@@ -829,7 +829,11 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
         WCHAR* clean_path = dir_path;
         if (wcsncmp(clean_path, L"\\\\?\\", 4) == 0)
             clean_path += 4;
-        if (FileName && FileName->Buffer) {
+        /* An empty name matches everything, as NT and the POSIX backend
+         * treat it. Searching for "dir\" instead found nothing, so a save
+         * directory listed this way looked empty: RalliSport Challenge 2
+         * then never opened user.profile and called the profile corrupt. */
+        if (FileName && FileName->Buffer && FileName->Length > 0) {
             WCHAR pattern_wide[MAX_PATH];
             MultiByteToWideChar(CP_ACP, 0, FileName->Buffer, FileName->Length,
                                 pattern_wide, MAX_PATH);
