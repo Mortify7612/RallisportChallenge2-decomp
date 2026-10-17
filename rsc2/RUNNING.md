@@ -219,6 +219,23 @@ outside the MSYS2 shell, copy them next to the program:
 ldd rsc2/build/rsc2.exe | awk '/\/mingw64\//{print $3}' | sort -u | xargs -I{} cp {} rsc2/build/
 ```
 
+A self-contained release build (v0.5.1 was made this way) links MSYS2's
+static libraries instead. Give the paths in `C:/` form: Ninja is a Windows
+program and does not resolve `/c/...`.
+
+```sh
+L=C:/msys64/mingw64/lib
+cmake -S rsc2 -B rsc2/build-release -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      "-DCMAKE_C_FLAGS=-D_WIN32_WINNT=0x0A00 -DNTDDI_VERSION=0x0A000007" \
+      -DXBOXRECOMP_GLSLANG_LIB=$L/libglslang.a \
+      -DXBOXRECOMP_GLSLANG_RL_LIB=$L/libglslang-default-resource-limits.a \
+      "-DXBOXRECOMP_GLSLANG_EXTRA_LIBS=$L/libSPIRV.a;$L/libMachineIndependent.a;$L/libOSDependent.a;$L/libGenericCodeGen.a;$L/libMachineIndependent.a;$L/libSPIRV-Tools-opt.a;$L/libSPIRV-Tools.a;stdc++"
+ninja -C rsc2/build-release
+```
+
+`objdump -p rsc2/build-release/rsc2.exe | grep "DLL Name"` should then list
+only Windows system DLLs and `vulkan-1.dll`.
+
 ## ARM64 test build (Linux on aarch64, run under qemu)
 
 This build is groundwork for an Android port, not a release. It lets the
