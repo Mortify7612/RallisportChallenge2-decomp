@@ -1442,7 +1442,9 @@ static void vk_sync_inner(int readback);
 
 /* End the segment and submit it, with the surfaces' copy-backs when
  * `readback` (listed in `list`). Does not wait. 0 on failure. */
-static int segment_submit(int readback, RbEnt *list, int *nrb)
+static int deferred_copy_needed(const Surf *s);
+
+static int segment_submit(int readback, RbEnt *list, int *nrb, int deferred)
 {
     VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
     VkCommandBuffer cbs[2];
@@ -1459,6 +1461,8 @@ static int segment_submit(int readback, RbEnt *list, int *nrb)
             VkDeviceSize off;
             uint32_t rows = s->dirty_rows < s->h ? s->dirty_rows : s->h;
             if (s->dirty != 1 || !rows)   /* 2: already on its way */
+                continue;
+            if (deferred && !deferred_copy_needed(s))
                 continue;
             if (!ring_alloc(&V.rb, (VkDeviceSize)s->w * rows * s->bpp, 16, &off))
                 continue;         /* ponytail: 64 MB of surfaces per sync */
@@ -1617,13 +1621,20 @@ static void slot_wait(Slot *sl, int kick, uint32_t nts)
         vkResetCommandPool(V.dev, sl->pool, 0);
 }
 
-/* Whether a presented surface's pixels need to reach guest RAM at all.
- * When the swapchain shows the frame, the guest copy of the two surfaces
- * being flipped is read by nothing -- unless frames are dumped or recorded
- * from it. It was 0.6 MB of copy (and hashing) a frame, a tenth of the
- * executor's time on a Snapdragon 870 tablet. RECOMP_VK_FB_WRITEBACK=1
- * always copies them, =0 never does (headless too, for testing). */
-static int flip_copy_needed(const Surf *s)
+/* Whether the end-of-frame copy-back of `s` is worth making. It lands a
+ * frame late and nobody waits for it; it is for whatever reads guest RAM
+ * later. The two surfaces being flipped are read by nothing there when a
+ * window's swapchain shows them -- 0.6 MB of copy and hashing a frame, with
+ * the window's own conversion a tenth of the executor's time on a
+ * Snapdragon 870 tablet. They stay dirty, so anything that does read them
+ * through guest RAM still syncs and gets a fresh copy (vk_sync).
+ * RECOMP_VK_FB_WRITEBACK=1 makes every copy-back as before, =0 skips these
+ * even headless (for testing); frame dumps and video recording keep them.
+ *
+ * Render targets the GPU samples directly (rt_tex, e.g. the 1.2 MB
+ * car-shadow mask) were tried too: no measurable gain on the tablet, and a
+ * surface sharing their memory then synced on every frame, so not done. */
+static int deferred_copy_needed(const Surf *s)
 {
     static int mode = -2;
     uint32_t va = s->va & 0x0FFFFFFFu;
@@ -1634,11 +1645,11 @@ static int flip_copy_needed(const Surf *s)
                          || getenv("RECOMP_VIDEO_RECORD") || getenv("RECOMP_FB_DUMP_FLIPS")))
             mode = 1;
     }
+    if (mode == 1)
+        return 1;
     if (va != (V.flip_va[0] & 0x0FFFFFFFu) && va != (V.flip_va[1] & 0x0FFFFFFFu))
         return 1;
-    if (mode >= 0)
-        return mode;
-    return !V.surface_handle;
+    return mode == 0 ? 0 : !V.surface_handle;
 }
 
 /* Copy-backs that have landed into guest RAM. `deferred`: they are a
@@ -1670,9 +1681,7 @@ static void write_back(const RbEnt *list, int n, int deferred)
             if (q->hnow_ep && q->va < s->va + surf_bytes(s) && s->va < q->va + surf_bytes(q))
                 q->hnow_ep = 0;
         }
-        if (!flip_copy_needed(s))
-            ;   /* shown by the swapchain; the guest copy is never read */
-        else if (s->swz)
+        if (s->swz)
             surf_swizzle(s, guest(s->va), V.rb.map + list[i].off, rows, 1);
         else
             for (y = 0; y < rows; y++)
@@ -1772,7 +1781,7 @@ static void vk_sync_inner(int readback)
     pend_retire_all();
     if (!V.recording)
         return;
-    if (!segment_submit(readback, list, &nrb))
+    if (!segment_submit(readback, list, &nrb, 0))
         return;
     slot_wait(&V.slots[V.cur_slot], V.kick, V.nts);
     V.kick = 0;
@@ -1893,7 +1902,7 @@ static void vk_flip(void)
         vk_sync(1);
         return;
     }
-    if (!segment_submit(1, p->rb, &p->nrb))
+    if (!segment_submit(1, p->rb, &p->nrb, 1))
         return;
     for (i = 0; i < p->nrb; i++)
         p->rb[i].s->dirty = 2;
