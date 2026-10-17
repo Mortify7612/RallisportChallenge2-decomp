@@ -88,8 +88,9 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
   - `RECOMP_VK_AO_SHOW=1` shows the occlusion term on its own.
 - The launcher sets these three from its Graphics section. Its default is
   16x anisotropic, with MSAA and AO off.
-- `RECOMP_HDR=1`: HDR output, when the window offers an HDR format. HDR10
-  (10-bit PQ, BT.2020) is used if available, else scRGB. Turn HDR on in the
+- `RECOMP_HDR=1`: HDR output, when the window offers an HDR format. scRGB
+  (16-bit linear) is used if available, else HDR10 (10-bit PQ, BT.2020);
+  `RECOMP_HDR_FORMAT=scrgb|a2b10|a2r10` picks one. Turn HDR on in the
   system's display settings first; otherwise the game says so and stays SDR.
   The game draws in SDR, so its frame is mapped up:
   - its white sits at paper white, `RECOMP_HDR_PAPER` nits (default 203);

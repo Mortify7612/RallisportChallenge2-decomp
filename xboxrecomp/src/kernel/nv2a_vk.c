@@ -7021,24 +7021,36 @@ static int swapchain_create(void)
     vkGetPhysicalDeviceSurfacePresentModesKHR(V.pd, V.surface, &nm, modes);
     V.sc_fmt = fmts[0].format;
     V.hdr_mode = 0;
-    /* RECOMP_HDR: HDR10 (10-bit PQ, BT.2020) if the window takes it, else
-     * scRGB (linear half floats); drawn into by hdr_present(). */
+    /* RECOMP_HDR: scRGB (linear half floats, BT.709) if the window takes
+     * it, else HDR10 (10-bit PQ, BT.2020); drawn into by hdr_pass(). scRGB
+     * first: with KWin compositing on another GPU (PRIME), a PQ window
+     * missed a refresh on one frame in five at 120 Hz, scRGB on one in
+     * seventy, at the same picture. RECOMP_HDR_FORMAT=scrgb|a2b10|a2r10
+     * picks one. */
     if (V.hdr_want && V.has_colorspace_ext && V.post_pl
             && (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+        const char *hf = getenv("RECOMP_HDR_FORMAT");
+        VkFormat only = !hf || !*hf ? VK_FORMAT_UNDEFINED
+                      : !strcmp(hf, "a2b10") ? VK_FORMAT_A2B10G10R10_UNORM_PACK32
+                      : !strcmp(hf, "a2r10") ? VK_FORMAT_A2R10G10B10_UNORM_PACK32
+                      : VK_FORMAT_R16G16B16A16_SFLOAT;
+        for (i = 0; i < nf && !V.hdr_mode; i++)
+            if (fmts[i].colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
+                    && fmts[i].format == VK_FORMAT_R16G16B16A16_SFLOAT
+                    && (only == VK_FORMAT_UNDEFINED || only == VK_FORMAT_R16G16B16A16_SFLOAT)) {
+                V.sc_fmt = fmts[i].format;
+                ci.imageColorSpace = fmts[i].colorSpace;
+                V.hdr_mode = 2;
+            }
         for (i = 0; i < nf && !V.hdr_mode; i++)
             if (fmts[i].colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT
+                    && (only == VK_FORMAT_UNDEFINED || only == VK_FORMAT_R16G16B16A16_SFLOAT
+                        || fmts[i].format == only)
                     && (fmts[i].format == VK_FORMAT_A2B10G10R10_UNORM_PACK32
                         || fmts[i].format == VK_FORMAT_A2R10G10B10_UNORM_PACK32)) {
                 V.sc_fmt = fmts[i].format;
                 ci.imageColorSpace = fmts[i].colorSpace;
                 V.hdr_mode = 1;
-            }
-        for (i = 0; i < nf && !V.hdr_mode; i++)
-            if (fmts[i].colorSpace == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT
-                    && fmts[i].format == VK_FORMAT_R16G16B16A16_SFLOAT) {
-                V.sc_fmt = fmts[i].format;
-                ci.imageColorSpace = fmts[i].colorSpace;
-                V.hdr_mode = 2;
             }
         if (!V.hdr_mode) {
             static int said;
