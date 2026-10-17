@@ -121,7 +121,7 @@ if(WIN32)
         d3d11
         dxgi
         dxguid
-        xinput
+        xinput1_4   # in Windows 8+; xinput1_3 needs the old DirectX runtime
         winmm
         # Lets the fault handler resolve the host RIP back to the generated
         # function's symbol, i.e. to the guest function that faulted.
