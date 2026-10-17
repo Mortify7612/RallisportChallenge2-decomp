@@ -12,6 +12,16 @@
 
 #include "xinput_xbox.h"
 #include "../../include/xbox/keymap.h"
+
+/* A steering wheel through SDL's joystick API (wheel_sdl.c), merged on top
+ * of port 0 like the keyboard. */
+#ifdef XBOX_INPUT_WHEEL
+#include "wheel_sdl.h"
+#else
+#define xbox_WheelMerge(port, st)       0
+#define xbox_WheelConnected(port)       0
+#define xbox_WheelRumble(port, lo, hi)  ((void)0)
+#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -268,12 +278,21 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
+#ifdef XBOX_INPUT_WHEEL
+    xbox_WheelStart();
+#endif
 
     result = XInputGetState(dwPort, &xi_state);
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
+            xbox_WheelMerge(dwPort, pState);
+            return ERROR_SUCCESS;
+        }
+        if (xbox_WheelConnected(dwPort)) {
+            memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+            xbox_WheelMerge(dwPort, pState);
             return ERROR_SUCCESS;
         }
         return result;
@@ -322,6 +341,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
      * and there is no special case left to get wrong. */
     if (dwPort == 0 && keyboard_enabled())
         keyboard_merge(pState);
+    xbox_WheelMerge(dwPort, pState);
 
     return ERROR_SUCCESS;
 }
@@ -329,19 +349,24 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
     XINPUT_VIBRATION xi_vib;
+    DWORD result;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(dwPort, &xi_vib);
+    result = XInputSetState(dwPort, &xi_vib);
+    xbox_WheelRumble(dwPort, pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
+    if (result != ERROR_SUCCESS && xbox_WheelConnected(dwPort))
+        result = ERROR_SUCCESS;
+    return result;
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
-    return g_controller_connected[dwPort];
+    return g_controller_connected[dwPort] || xbox_WheelConnected(dwPort);
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
@@ -353,6 +378,12 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
         return ERROR_DEVICE_NOT_CONNECTED;
 
     result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
+    if (result != ERROR_SUCCESS && xbox_WheelConnected(dwPort)) {
+        memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+        pCaps->Type = 1;      /* a gamepad, which is what the wheel plays as */
+        pCaps->SubType = 1;
+        return ERROR_SUCCESS;
+    }
     if (result != ERROR_SUCCESS) return result;
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
@@ -399,15 +430,26 @@ void xbox_InputSdlInit(void)
     if (!SDL_WasInit(SDL_INIT_GAMECONTROLLER)
             && SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0)
         fprintf(stderr, "  [INPUT] SDL game controller init failed: %s\n", SDL_GetError());
+#ifdef XBOX_INPUT_WHEEL
+    xbox_WheelSdlInit();
+#endif
 }
 
 /* Hotplug: a new pad takes the lowest free port, a removed one frees it. */
 void xbox_InputSdlEvent(const SDL_Event *ev)
 {
     int port;
+#ifdef XBOX_INPUT_WHEEL
+    xbox_WheelSdlEvent(ev);
+#endif
     if (ev->type == SDL_CONTROLLERDEVICEADDED) {
         SDL_GameController *c;
         SDL_JoystickID id;
+#ifdef XBOX_INPUT_WHEEL
+        /* A wheel with a gamepad mapping is still the wheel's. */
+        if (xbox_WheelIsWheel(ev->cdevice.which))
+            return;
+#endif
         for (port = 0; port < XBOX_MAX_CONTROLLERS; port++) {
             if (g_pads[port] && SDL_JoystickInstanceID(
                     SDL_GameControllerGetJoystick(g_pads[port]))
@@ -499,6 +541,9 @@ void xbox_InputSdlPoll(void)
     static Uint32 last_rumble[XBOX_MAX_CONTROLLERS];
     Uint32 now = SDL_GetTicks();
     int port;
+#ifdef XBOX_INPUT_WHEEL
+    xbox_WheelSdlPoll();
+#endif
     for (port = 0; port < XBOX_MAX_CONTROLLERS; port++) {
         XBOX_INPUT_STATE st;
         WORD lo, hi;
@@ -535,6 +580,12 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (!have) {
         if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
+            xbox_WheelMerge(dwPort, pState);
+            return ERROR_SUCCESS;
+        }
+        if (xbox_WheelConnected(dwPort)) {
+            memset(pState, 0, sizeof(XBOX_INPUT_STATE));
+            xbox_WheelMerge(dwPort, pState);
             return ERROR_SUCCESS;
         }
         return ERROR_DEVICE_NOT_CONNECTED;
@@ -542,6 +593,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++g_packet[dwPort];
     if (dwPort == 0 && keyboard_enabled())
         keyboard_merge(pState);
+    xbox_WheelMerge(dwPort, pState);
     return ERROR_SUCCESS;
 }
 
@@ -566,7 +618,9 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
         g_rumble_dirty[dwPort] = 1;
     }
     pthread_mutex_unlock(&g_lock);
-    return g_controller_connected[dwPort] ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
+    xbox_WheelRumble(dwPort, pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
+    return g_controller_connected[dwPort] || xbox_WheelConnected(dwPort)
+        ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
@@ -575,7 +629,7 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
     /* The keyboard stands in for pad 0, so a title asking whether it is
      * there gets the same answer xbox_InputGetState gives. */
     if (dwPort == 0 && keyboard_enabled()) return TRUE;
-    return g_controller_connected[dwPort];
+    return g_controller_connected[dwPort] || xbox_WheelConnected(dwPort);
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
@@ -583,7 +637,8 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     (void)dwFlags;
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
-    if (!g_pads[dwPort] && !(dwPort == 0 && keyboard_enabled()))
+    if (!g_pads[dwPort] && !(dwPort == 0 && keyboard_enabled())
+            && !xbox_WheelConnected(dwPort))
         return ERROR_DEVICE_NOT_CONNECTED;
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));

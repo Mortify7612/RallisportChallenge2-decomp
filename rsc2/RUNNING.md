@@ -43,6 +43,40 @@ a menu is up. The bindings reach the runtime as `RECOMP_KEYMAP`
 (`id=vk[+vk];...`, see `xboxrecomp/include/xbox/keymap.h`) and the easing
 as `RECOMP_KEY_STEER_MS`.
 
+### Steering wheels (test)
+
+A wheel and pedals drive pad 1, on top of any pad or keyboard, on Windows
+and Linux alike (`xboxrecomp/src/input/wheel_sdl.c`, through SDL's joystick
+API: Windows' XInput never sees DirectInput wheels, and SDL's gamepad layer
+skips devices without a gamepad mapping). Any device SDL knows as a wheel
+is used, or one with "wheel" in its name, or the one
+`RECOMP_WHEEL_DEVICE=<part of its name>` picks.
+
+Steering is linear. The game reads the stick through a 24% dead zone (full
+scale at 95%) and then a two-slope curve: the first 60% of the stick turns
+the front wheels to 20% of full lock (25 degrees), the rest covers the other
+80%. The wheel position goes through the exact inverse, so half a turn of
+the wheel is half of full lock. `RECOMP_WHEEL_LOCK=n` reaches full lock at
+n% of the wheel's travel, `RECOMP_WHEEL_DEADZONE=n` ignores n% at the
+centre, and `RECOMP_WHEEL_LINEAR=0` sends the raw position instead. The car
+still turns its wheels toward that angle at its own rate (about 0.7 s to
+full lock); that part is the game's.
+
+| Setting | Default | |
+|---|---|---|
+| `RECOMP_WHEEL_AXES=s,t,b` | `0,1,2` (Windows), `0,2,3` (Linux) | Steering, throttle and brake axes (a G29's). The same axis for throttle and brake is a combined pedal axis. Pedals find their resting end themselves. |
+| `RECOMP_WHEEL_BUTTONS` | `a=0,x=1,b=2,y=3,b=4,x=5,black=6,white=7,back=8,start=9,rs=10,ls=11` | Pad input = wheel button(s), `b=2+4` for more than one. The hat is the d-pad. A is the e-brake; B and X shift up and down, so the paddles (4, 5) shift. |
+| `RECOMP_WHEEL_SPRING` | 30 | Centring spring, percent (the autocentre where a driver has no spring effect). |
+| `RECOMP_WHEEL_DAMPER` | 10 | Damper, percent. |
+| `RECOMP_WHEEL_RUMBLE` | 50 | The game's pad rumble as a vibration, percent. `RECOMP_RUMBLE=0` also stops it. |
+| `RECOMP_WHEEL_FFB` | 100 | Overall force feedback gain, percent. |
+| `RECOMP_WHEEL_LOG=1` | | Prints axes and buttons as they move, to find the numbers above. |
+| `RECOMP_WHEEL=0` | | Off. |
+
+`RECOMP_WHEEL_VIRTUAL=<file>` adds a scripted wheel for testing without
+one: lines of `ms steer throttle brake buttons-hex hat`, from when input
+starts. It can drive the menus and a race headless.
+
 The launcher's **Add to Steam** button puts the game in the Steam library
 as a non-Steam game (`run.sh` on Linux, the `.exe` on Windows), for the
 account that logged in last. Quit Steam first: it rewrites
