@@ -368,6 +368,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 /* ======================================================================== */
 
 #include <SDL.h>
+#include "touch_pad.h"
 #include <pthread.h>
 
 /* SDL's joystick layer belongs to the thread that pumps its events, which is
@@ -494,6 +495,20 @@ static void read_pad(SDL_GameController *c, XBOX_INPUT_STATE *st)
  * the rumble the title asked for. Rumble is re-sent while it is on, with a
  * short duration, so a title that stops updating it (a pause, a crash)
  * does not leave the pad buzzing. */
+/* Whether a pad's state changed in a way a player meant: a button, a
+ * trigger, or a stick past a dead zone. */
+static int pad_moved(const XBOX_INPUT_STATE *a, const XBOX_INPUT_STATE *b)
+{
+    int i;
+    if (a->Gamepad.wButtons != b->Gamepad.wButtons)
+        return 1;
+    for (i = 0; i < 8; i++)
+        if ((a->Gamepad.bAnalogButtons[i] > 32) != (b->Gamepad.bAnalogButtons[i] > 32))
+            return 1;
+    return abs(b->Gamepad.sThumbLX) > 12000 || abs(b->Gamepad.sThumbLY) > 12000
+        || abs(b->Gamepad.sThumbRX) > 12000 || abs(b->Gamepad.sThumbRY) > 12000;
+}
+
 void xbox_InputSdlPoll(void)
 {
     static Uint32 last_rumble[XBOX_MAX_CONTROLLERS];
@@ -503,9 +518,16 @@ void xbox_InputSdlPoll(void)
         XBOX_INPUT_STATE st;
         WORD lo, hi;
         int dirty;
-        if (!g_pads[port])
+        if (!g_pads[port]) {
+            if (port == 0)
+                touchpad_pad_present(0);
             continue;
+        }
         read_pad(g_pads[port], &st);
+        if (port == 0)
+            touchpad_pad_present(1);
+        if (touchpad_enabled() && pad_moved(&g_snap[port], &st))
+            touchpad_pad_activity();        /* the touch controls hide */
         pthread_mutex_lock(&g_lock);
         g_snap[port] = st;
         lo = g_rumble[port][0];
@@ -535,6 +557,14 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (!have) {
         if (dwPort == 0 && keyboard_enabled()) {
             keyboard_state(pState);
+            touchpad_merge(pState);
+            return ERROR_SUCCESS;
+        }
+        if (dwPort == 0 && touchpad_shown()) {
+            /* The touch controls stand in for a missing controller 1. */
+            memset(pState, 0, sizeof *pState);
+            touchpad_merge(pState);
+            pState->dwPacketNumber = ++g_packet[0];
             return ERROR_SUCCESS;
         }
         return ERROR_DEVICE_NOT_CONNECTED;
@@ -542,6 +572,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     pState->dwPacketNumber = ++g_packet[dwPort];
     if (dwPort == 0 && keyboard_enabled())
         keyboard_merge(pState);
+    if (dwPort == 0)
+        touchpad_merge(pState);
     return ERROR_SUCCESS;
 }
 
@@ -574,7 +606,7 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
     /* The keyboard stands in for pad 0, so a title asking whether it is
      * there gets the same answer xbox_InputGetState gives. */
-    if (dwPort == 0 && keyboard_enabled()) return TRUE;
+    if (dwPort == 0 && (keyboard_enabled() || touchpad_shown())) return TRUE;
     return g_controller_connected[dwPort];
 }
 
@@ -583,7 +615,7 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     (void)dwFlags;
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
-    if (!g_pads[dwPort] && !(dwPort == 0 && keyboard_enabled()))
+    if (!g_pads[dwPort] && !(dwPort == 0 && (keyboard_enabled() || touchpad_shown())))
         return ERROR_DEVICE_NOT_CONNECTED;
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));

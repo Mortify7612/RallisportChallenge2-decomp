@@ -786,6 +786,10 @@ static void video_close(void)
 extern void xbox_InputSdlInit(void);
 extern void xbox_InputSdlEvent(const SDL_Event *ev);
 extern void xbox_InputSdlPoll(void);
+/* The on-screen touch controls (src/input/touch_pad.c). */
+extern int  touchpad_enabled(void);
+extern void touchpad_finger(int kind, int64_t id, float x, float y);
+extern void touchpad_set_view(int w, int h);
 
 /* One round of window events; returns the window's new drawable size
  * through *resized when it changed. */
@@ -855,6 +859,10 @@ static void fb_events(SDL_Window *win, int *resized)
         } else if (ev.type == SDL_CONTROLLERDEVICEADDED
                    || ev.type == SDL_CONTROLLERDEVICEREMOVED) {
             xbox_InputSdlEvent(&ev);
+        } else if (ev.type == SDL_FINGERDOWN || ev.type == SDL_FINGERMOTION
+                   || ev.type == SDL_FINGERUP) {
+            touchpad_finger(ev.type == SDL_FINGERDOWN ? 0 : ev.type == SDL_FINGERUP ? 2 : 1,
+                            (int64_t)ev.tfinger.fingerId, ev.tfinger.x, ev.tfinger.y);
         } else if (ev.type == SDL_WINDOWEVENT
                    && ev.window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
             /* Leaving with a key held would leave it held for ever. */
@@ -886,6 +894,7 @@ static void *fb_vk_loop(SDL_Window *win)
             int dw, dh;
             SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
             nv2a_vk_set_window_size(dw, dh);
+            touchpad_set_view(dw, dh);
         }
         idx = __atomic_load_n(&s_present_idx, __ATOMIC_ACQUIRE);
         {
@@ -948,6 +957,12 @@ static void *fb_thread(void *unused)
         return NULL;
     }
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+    if (touchpad_enabled()) {
+        /* Touches drive the on-screen controls, not a pretend mouse; on a
+         * desktop (RECOMP_TOUCH=1) the mouse stands in for a finger. */
+        SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+        SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "1");
+    }
     xbox_InputSdlInit();
     {
         const char *vp = getenv("RECOMP_VK_PRESENT");
@@ -978,6 +993,7 @@ static void *fb_thread(void *unused)
                 int dw, dh;
                 SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
                 nv2a_vk_set_window_size(dw, dh);
+                touchpad_set_view(dw, dh);
 #if defined(SDL_VIDEO_DRIVER_WAYLAND) && !defined(__ANDROID__)
                 {
                     /* For HDR in the compositor's own colour space. */

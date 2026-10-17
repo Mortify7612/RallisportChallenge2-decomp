@@ -470,6 +470,9 @@ static struct {
     float hdr_paper, hdr_peak, hdr_strength, hdr_glow, hdr_knee;
     int has_colorspace_ext, has_hdr_meta;
     VkImageView sc_view[8];
+    int sc_attach;              /* the images can be drawn into (touch controls) */
+    VkPipeline touch_pipe;      /* the on-screen touch controls, for touch_fmt */
+    VkFormat touch_fmt;
     VkPipeline hdr_pipe[4];     /* per mode, 0: the headless dump's */
     VkSampler hdr_samp;
     VkImage hdr_dimg;           /* RECOMP_HDR_DUMP target */
@@ -2135,6 +2138,16 @@ static VkPipeline post_pipeline(VkShaderModule fs, VkFormat fmt, uint32_t sample
     memset(&ba, 0, sizeof ba);
     ba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    if (blend == 2) {
+        /* Premultiplied alpha over what is there (the touch controls). */
+        ba.blendEnable = VK_TRUE;
+        ba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        ba.colorBlendOp = VK_BLEND_OP_ADD;
+        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        ba.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
     if (blend == 1) {
         ba.blendEnable = VK_TRUE;
         ba.srcColorBlendFactor = VK_BLEND_FACTOR_DST_COLOR;
@@ -7063,8 +7076,186 @@ static VkPipeline hdr_pipeline(int mode, VkFormat fmt)
     return V.hdr_pipe[mode];
 }
 
-/* A new HDR swapchain: views of its images, the pass for its format. */
-static int hdr_swapchain_ready(void)
+/* ---- on-screen touch controls ------------------------------------------ */
+
+/* Drawn over the presented frame, from the layout in src/input/touch_pad.c:
+ * the shader is generated from that table (positions, colours, labels in a
+ * 5x7 font), so what is drawn is exactly what is hit. One pass, blended,
+ * into the swapchain image (V.sc_attach); nothing when they are hidden.
+ * The input layer may not be linked in: weak, then never shown. */
+#include "../input/touch_pad.h"
+__attribute__((weak)) int touchpad_enabled(void);
+__attribute__((weak)) int touchpad_layout(const TouchButton **buttons);
+__attribute__((weak)) int touchpad_draw_state(float *opacity, uint32_t *held, int *stick_on,
+                                              float stick[4]);
+
+static int touch_wanted(void)
+{
+    return touchpad_enabled && touchpad_enabled();
+}
+
+static const char k_touch_chars[] = "ABCGIKMRSTXY";
+static const uint8_t k_touch_font[][7] = {
+    {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}, {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E},
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, {0x0E,0x11,0x10,0x17,0x11,0x11,0x0F},
+    {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}, {0x11,0x12,0x14,0x18,0x14,0x12,0x11},
+    {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}, {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11},
+    {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}, {0x1F,0x04,0x04,0x04,0x04,0x04,0x04},
+    {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}, {0x11,0x11,0x0A,0x04,0x04,0x04,0x04},
+};
+
+static VkPipeline touch_build(VkFormat fmt)
+{
+    const TouchButton *b;
+    int n = touchpad_layout ? touchpad_layout(&b) : 0, i, k;
+    size_t cap = 16384, len = 0;
+    char *src;
+    VkShaderModule fs;
+    VkPipeline p;
+#define TAPP(...) (len += (size_t)snprintf(src + len, cap - len, __VA_ARGS__))
+    if (!n || !V.post_pl || !(src = (char *)malloc(cap)))
+        return VK_NULL_HANDLE;
+    TAPP("#version 450\n"
+         "layout(push_constant) uniform PC { vec4 sz; vec4 st; vec4 misc; } pc;\n"
+         "layout(location = 0) out vec4 o;\n"
+         "const int NB = %d;\n", n);
+    /* anchor, x, y, r in height units; colour; up to three glyphs + count */
+    TAPP("const vec4 B[NB] = vec4[](");
+    for (i = 0; i < n; i++)
+        TAPP("%svec4(%d.0, %.4f, %.4f, %.4f)", i ? ", " : "", b[i].anchor, b[i].x, b[i].y, b[i].r);
+    TAPP(");\nconst vec3 C[NB] = vec3[](");
+    for (i = 0; i < n; i++)
+        TAPP("%svec3(%.3f, %.3f, %.3f)", i ? ", " : "", ((b[i].rgb >> 16) & 255) / 255.0,
+             ((b[i].rgb >> 8) & 255) / 255.0, (b[i].rgb & 255) / 255.0);
+    TAPP(");\nconst uvec4 L[NB] = uvec4[](");
+    for (i = 0; i < n; i++) {
+        unsigned g[3] = { 0, 0, 0 }, c = 0;
+        for (k = 0; b[i].label[k] && c < 3; k++) {
+            const char *q = strchr(k_touch_chars, b[i].label[k]);
+            if (q)
+                g[c++] = (unsigned)(q - k_touch_chars);
+        }
+        TAPP("%suvec4(%uu, %uu, %uu, %uu)", i ? ", " : "", g[0], g[1], g[2], c);
+    }
+    TAPP(");\nconst uint F[%d] = uint[](", (int)(sizeof k_touch_font));
+    for (i = 0; i < (int)(sizeof k_touch_font / 7); i++)
+        for (k = 0; k < 7; k++)
+            TAPP("%s%uu", i || k ? ", " : "", (unsigned)k_touch_font[i][k]);
+    TAPP(");\n"
+        "float glyph(uint g, vec2 q) {\n"
+        "    if (q.x < 0.0 || q.y < 0.0 || q.x >= 5.0 || q.y >= 7.0) return 0.0;\n"
+        "    return float((F[g * 7u + uint(q.y)] >> (4u - uint(q.x))) & 1u);\n"
+        "}\n"
+        /* s over acc, both premultiplied */
+        "vec4 over(vec4 s, vec4 acc) { return s + acc * (1.0 - s.a); }\n"
+        "void main() {\n"
+        "    vec2 p = gl_FragCoord.xy;\n"
+        "    float u = pc.sz.y;\n"
+        "    uint held = floatBitsToUint(pc.sz.w);\n"
+        "    vec4 acc = vec4(0.0);\n"
+        "    for (int i = 0; i < NB; i++) {\n"
+        "        vec2 c = vec2(B[i].x == 0.0 ? B[i].y * u : B[i].x == 1.0 ? pc.sz.x - B[i].y * u\n"
+        "                      : pc.sz.x * 0.5 + B[i].y * u, B[i].z * u);\n"
+        "        float r = B[i].w * u, d = length(p - c);\n"
+        "        if (d > r + 2.0) continue;\n"
+        "        bool pr = ((held >> uint(i)) & 1u) != 0u;\n"
+        "        float in_ = clamp(r - d, 0.0, 1.0);\n"
+        "        float w = max(2.0, r * 0.06);\n"
+        "        float ring = clamp(w * 0.5 - abs(d - (r - w * 0.5)), 0.0, 1.0);\n"
+        "        float a = in_ * (pr ? 0.55 : 0.28);\n"
+        "        vec4 s = vec4(C[i] * (pr ? 1.0 : 0.75) * a, a);\n"
+        "        s = over(vec4(mix(C[i], vec3(1.0), 0.45) * 0.8 * ring, 0.8 * ring), s);\n"
+        "        float cell = r * 0.5 / 7.0;\n"
+        "        float tw = (float(L[i].w) * 6.0 - 1.0) * cell;\n"
+        "        vec2 q = (p - vec2(c.x - tw * 0.5, c.y - 3.5 * cell)) / cell;\n"
+        "        int ci = int(floor(q.x / 6.0));\n"
+        "        if (ci >= 0 && ci < int(L[i].w)) {\n"
+        "            uint g = ci == 0 ? L[i].x : ci == 1 ? L[i].y : L[i].z;\n"
+        "            float on = glyph(g, vec2(q.x - float(ci) * 6.0, q.y)) * 0.9;\n"
+        "            s = over(vec4(vec3(on), on), s);\n"
+        "        }\n"
+        "        acc = over(s, acc);\n"
+        "    }\n"
+        /* the stick: its travel as a ring, the knob filled */
+        "    {\n"
+        "        float R = pc.misc.y, kr = pc.misc.z, on = pc.misc.x;\n"
+        "        float d = length(p - pc.st.xy);\n"
+        "        float ring = clamp(1.5 - abs(d - R), 0.0, 1.0) * (on > 0.5 ? 0.7 : 0.35);\n"
+        "        float base = clamp(R - d, 0.0, 1.0) * (on > 0.5 ? 0.12 : 0.06);\n"
+        "        float k = clamp(kr - length(p - pc.st.zw), 0.0, 1.0) * (on > 0.5 ? 0.6 : 0.3);\n"
+        "        acc = over(vec4(vec3(0.85) * base, base), acc);\n"
+        "        acc = over(vec4(vec3(0.9) * ring, ring), acc);\n"
+        "        acc = over(vec4(vec3(0.9) * k, k), acc);\n"
+        "    }\n"
+        "    o = acc * pc.sz.z;\n"
+        "}\n");
+#undef TAPP
+    fs = len < cap ? glsl_module(src, 1) : VK_NULL_HANDLE;
+    free(src);
+    if (!fs)
+        return VK_NULL_HANDLE;
+    p = post_pipeline(fs, fmt, 1, 2);
+    vkDestroyShaderModule(V.dev, fs, NULL);
+    return p;
+}
+
+/* The controls into the swapchain image `view` (COLOR_ATTACHMENT_OPTIMAL). */
+static void touch_pass(VkImageView view)
+{
+    float pc[12], op, st[4];
+    uint32_t held;
+    int stick_on;
+    VkRenderingInfo ri = { VK_STRUCTURE_TYPE_RENDERING_INFO };
+    VkRenderingAttachmentInfo ca = { VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO };
+    VkViewport vp;
+    VkRect2D sc;
+    float w = (float)V.sc_ext.width, h = (float)V.sc_ext.height;
+
+    if (!view || !touchpad_draw_state || !touchpad_draw_state(&op, &held, &stick_on, st))
+        return;
+    if (!V.touch_pipe || V.touch_fmt != V.sc_fmt) {
+        V.touch_pipe = touch_build(V.sc_fmt);
+        V.touch_fmt = V.sc_fmt;
+        if (!V.touch_pipe) {
+            fprintf(stderr, "  [VK] touch controls: shader failed\n");
+            return;
+        }
+    }
+    pc[0] = w; pc[1] = h; pc[2] = op;
+    memcpy(&pc[3], &held, 4);
+    pc[4] = st[0] * w; pc[5] = st[1] * h; pc[6] = st[2] * w; pc[7] = st[3] * h;
+    pc[8] = (float)stick_on;
+    pc[9] = TOUCH_STICK_R * h;
+    pc[10] = TOUCH_KNOB_R * h;
+    pc[11] = 0.0f;
+    sc.offset.x = sc.offset.y = 0;
+    sc.extent = V.sc_ext;
+    ri.renderArea = sc;
+    ri.layerCount = 1;
+    ca.imageView = view;
+    ca.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ca.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    ca.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &ca;
+    vkCmdBeginRendering(V.dcb, &ri);
+    vp.x = vp.y = 0.0f;
+    vp.width = w;
+    vp.height = h;
+    vp.minDepth = 0.0f;
+    vp.maxDepth = 1.0f;
+    vkCmdSetViewport(V.dcb, 0, 1, &vp);
+    vkCmdSetScissor(V.dcb, 0, 1, &sc);
+    vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.touch_pipe);
+    V.bound_pipe = VK_NULL_HANDLE;
+    vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+    vkCmdDraw(V.dcb, 3, 1, 0, 0);
+    vkCmdEndRendering(V.dcb);
+    V.last_set = VK_NULL_HANDLE;
+}
+
+/* Views of the swapchain's images, for passes that draw into them. */
+static int sc_views_create(void)
 {
     uint32_t i;
     for (i = 0; i < V.sc_n && i < 8; i++) {
@@ -7080,6 +7271,14 @@ static int hdr_swapchain_ready(void)
             return 0;
         }
     }
+    return 1;
+}
+
+/* A new HDR swapchain: views of its images, the pass for its format. */
+static int hdr_swapchain_ready(void)
+{
+    if (!sc_views_create())
+        return 0;
     if (!hdr_pipeline(V.hdr_mode, V.sc_fmt))
         return 0;
     if (V.has_hdr_meta && V.hdr_mode != 3) {
@@ -7556,9 +7755,11 @@ static int swapchain_create(void)
     ci.imageFormat = V.sc_fmt;
     ci.imageExtent = V.sc_ext;
     ci.imageArrayLayers = 1;
+    V.sc_attach = touch_wanted()
+                  && (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT
                   | (caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
-                  | (V.hdr_mode ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
+                  | (V.hdr_mode || V.sc_attach ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0);
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     /* Identity: frames are drawn upright and the compositor turns them to
      * the panel. currentTransform would promise they were already rotated --
@@ -7593,6 +7794,8 @@ static int swapchain_create(void)
         V.hdr_want = 0;
         return swapchain_create();
     }
+    if (!V.hdr_mode && V.sc_attach && !sc_views_create())
+        V.sc_attach = 0;
     fprintf(stderr, "  [VK] presenting %ux%u, format %d, mode %d, %u images (min %u)%s\n", V.sc_ext.width,
             V.sc_ext.height, (int)V.sc_fmt, (int)mode, V.sc_n, caps.minImageCount,
             V.hdr_mode == 1 ? ", HDR10" : V.hdr_mode == 2 ? ", HDR scRGB"
@@ -8070,6 +8273,7 @@ static void present_frame(uint32_t va, uint32_t pitch)
                  g ? 1.0f : (float)sh / s->h, aux ? V.aux_view : VK_NULL_HANDLE,
                  aux ? (float)(sw * V.sx) / V.aux_w : 1.0f,
                  aux ? (float)(sh * V.scale) / V.aux_h : 1.0f, !is3d, ox, oy, dw, dh);
+        touch_pass(V.sc_view[V.sc_idx]);
         barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
                       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -8103,6 +8307,20 @@ static void present_frame(uint32_t va, uint32_t pitch)
         barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                       VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
+    } else if (V.sc_attach && V.sc_view[V.sc_idx] && touchpad_draw_state
+               && touchpad_draw_state(&(float){0}, &(uint32_t){0}, &(int){0}, (float[4]){0})) {
+        /* The touch controls on top: drawn, so into the attachment layout. */
+        barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+        touch_pass(V.sc_view[V.sc_idx]);
+        barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,
+                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
     } else {
         barrier_image(V.dcb, V.sc_img[V.sc_idx], VK_IMAGE_ASPECT_COLOR_BIT, 1, 1,

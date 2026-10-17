@@ -157,6 +157,24 @@ unstripped `rsc2/build-android/libmain.so` for it.
     Vulkan presents (only video recording and dumps used it);
     together a tenth of the executor's time.
 
-Not done yet: race performance on mobile GPUs, touch controls (use a
-Bluetooth or USB controller), the launcher, and importing the game folder
-from the phone itself.
+## Touch controls
+
+On-screen controls stand in for controller 1 (`xboxrecomp/src/input/touch_pad.c`):
+
+- a floating stick on the left 45% of the screen, centred where the thumb
+  lands: steering, and menu navigation;
+- GAS (right trigger) and BRK (left trigger) at the bottom right, a thumb
+  can slide between them;
+- A, B, X, Y above them (A: select and e-brake, B: back);
+- CAM (Black), RST (White, car reset) at the top right, and II (Start,
+  pause) at the top centre.
+
+They show when no controller is connected or after the screen is touched,
+and hide as soon as a real controller is used. The renderer draws them in
+one blended pass over the presented frame, from the same layout table the
+touches are tested against. `RECOMP_TOUCH=0` turns them off;
+`RSC2_TOUCH_SHOW=1` keeps them on screen. On a desktop, `RECOMP_TOUCH=1`
+enables them with the mouse as a finger.
+
+Not done yet: the launcher, and importing the game folder from the phone
+itself.
