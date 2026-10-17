@@ -6348,8 +6348,10 @@ static VkImage gamma_apply(Surf *s, uint32_t w, uint32_t h)
         if (V.gm_img)
             retire(V.gm_img, V.gm_img_mem, V.gm_img_view);
         V.gm_img = VK_NULL_HANDLE;
+        /* Sampled: the HDR pass reads it. */
         if (!image_create(w, h, 1, 1, VK_FORMAT_B8G8R8A8_UNORM,
-                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, 0,
+                          VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                          | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
                           VK_IMAGE_ASPECT_COLOR_BIT, &V.gm_img, &V.gm_img_mem, &V.gm_img_view))
             return s->img;
         V.gm_w = w;
