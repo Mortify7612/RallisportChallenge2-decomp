@@ -716,14 +716,21 @@ void sub_0037E590(void)
     {
         /* A screen wider than 16:9 (a phone): the renderer widens the view
          * to it (nv2a_vk_view_aspect), and the game's culling frustum
-         * (sub_000F3F20) takes its aspect from 0x3DFE94, 16:9 as shipped.
-         * Widened with it, so the new edges are not left empty. Only in the
-         * game's widescreen mode (flag 0x488710). */
+         * (sub_000F3F20) takes its aspect from 0x3DFE94, 16:9 as shipped,
+         * and sub_002A9B10's view-edge tests theirs from 0x3B8DA0 (its only
+         * user; 4:3 at 0x3B86C8 otherwise). Both widened with it, so the
+         * new edges are not left empty or smeared, and put back to 16:9
+         * for the menus, which are not widened. Only in the game's
+         * widescreen mode (flag 0x488710). */
         extern float nv2a_vk_view_aspect(void);
+        static float set;
         if (MEM8(0x488710)) {
             float a = nv2a_vk_view_aspect();
-            if (a > 16.0f / 9.0f)
+            if (a > 16.0f / 9.0f || set > 16.0f / 9.0f) {
                 MEMF(0x3DFE94) = a;
+                MEMF(0x3B8DA0) = a;
+                set = a;
+            }
         }
     }
     if (!mode || !pstate)

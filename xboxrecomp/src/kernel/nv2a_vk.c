@@ -167,7 +167,7 @@ static const uint32_t s_frag_fast_spv[] =
 #define VK_MAX_ZETA    8
 #define VK_MAX_PIPES   4096          /* power of two: hashed */
 #define VK_MAX_PROGS   1024          /* power of two */
-#define VK_PROG_VERSION 10           /* translated-program cache files */
+#define VK_PROG_VERSION 11           /* translated-program cache files */
 #define VK_MAX_SAMPLERS 512
 #define VK_TEX_SLOTS   8192          /* power of two */
 #define VK_MAX_RETIRED 4096
@@ -228,6 +228,7 @@ typedef struct Surf_ {
     VkImageView msview;
     uint32_t msh;
     int ms_stale;
+    int squeezed;               /* last drawn widened (view_shown) */
 } Surf;
 
 /* A surface the title samples as a texture, copied on the GPU (rt_tex), or
@@ -382,6 +383,10 @@ static struct {
     uint32_t ao_lw, ao_lh;                /* the AO's own (reduced) size */
     VkPipeline ao_lin[2], ao_pipe[2], ao_blur[2], ao_snap[2], ao_apply[2]; /* [1]: MSAA */
     uint32_t flip_va[2];                  /* the last two presented surfaces */
+    /* Wide fill (view_shown): whether this frame is widened, and the
+     * depth-tested draws into the scene so far, which decide the next. */
+    int wide_frame, wide_runs;
+    uint32_t wide_zdraws;
     uint32_t ao_frame, ao_zdraws, ao_done, ao_snapped;
     VkCommandPool pool;
     VkCommandBuffer ucb, dcb;
@@ -685,9 +690,77 @@ static float view_aspect(void)
     return a;
 }
 
+/* The aspect this frame is drawn and shown at. A screen wider than 16:9
+ * widens the race view, but not the menus: the title lays them out to the
+ * 16:9 screen's edges (rows of items it cuts off there), so they are shown
+ * at 16:9 between black bars. A frame is a race's when the one before drew
+ * many depth-tested draws into the scene (a race draws hundreds, a menu's
+ * 3D props a few dozen); see wide_decide(). RECOMP_WIDE_MENUS=1 widens
+ * every frame. */
+static float view_shown(void)
+{
+    return V.wide_frame ? view_aspect() : 16.0f / 9.0f;
+}
+
+/* At a flip: whether the next frame is widened, from the depth-tested draws
+ * of the one just finished. A few frames either way before it changes, so a
+ * menu with a busy 3D prop or a race's loading frame do not flicker it.
+ * RECOMP_VK_WIDE_ZDRAWS=<n> sets the threshold; RECOMP_VK_WIDE_TRACE logs
+ * the counts and changes. */
+static void wide_decide(void)
+{
+    static int all = -1, trace;
+    static uint32_t limit;
+    static unsigned n;
+    int race;
+    if (all < 0) {
+        const char *e = getenv("RECOMP_WIDE_MENUS");
+        all = e && strcmp(e, "0") != 0;
+        e = getenv("RECOMP_VK_WIDE_ZDRAWS");
+        limit = e ? (uint32_t)atoi(e) : 150;
+        trace = getenv("RECOMP_VK_WIDE_TRACE") != NULL;
+        if (all)
+            V.wide_frame = 1;
+    }
+    if (trace && n++ % 60 == 0)
+        fprintf(stderr, "[VK] wide: %u depth-tested scene draws, %s\n", V.wide_zdraws,
+                V.wide_frame ? "widened" : "16:9");
+    race = V.wide_zdraws >= limit;
+    V.wide_zdraws = 0;
+    {
+        /* RECOMP_VK_WIDE_FILE=<path>: while that file exists, 16:9 (an A/B
+         * switch for a running game, e.g. over adb). */
+        static const char *path;
+        static int off;
+        if (!path)
+            path = getenv("RECOMP_VK_WIDE_FILE") ? getenv("RECOMP_VK_WIDE_FILE") : "";
+        if (*path && n % 30 == 0) {
+            FILE *f = fopen(path, "r");
+            off = f != NULL;
+            if (f)
+                fclose(f);
+        }
+        if (off) {
+            V.wide_frame = 0;
+            V.wide_runs = 0;
+            return;
+        }
+    }
+    if (all || race == V.wide_frame) {
+        V.wide_runs = 0;
+        return;
+    }
+    if (++V.wide_runs >= (race ? 3 : 10)) {
+        V.wide_frame = race;
+        V.wide_runs = 0;
+        if (trace)
+            fprintf(stderr, "[VK] wide: now %s\n", race ? "widened (race)" : "16:9 (menu)");
+    }
+}
+
 float nv2a_vk_view_aspect(void)
 {
-    return view_aspect();
+    return view_shown();
 }
 
 /* `s` contains `sub`, ignoring ASCII case. */
@@ -1083,6 +1156,15 @@ static int flight_active(void)
                 at = e ? atol(e) : -1;
             }
             if (at >= 0 && f == (uint32_t)at)
+                s_fl_dump = 1;
+        }
+        {
+            /* RECOMP_VK_FLIGHT_FILE=<path>: dump when that file appears
+             * (removed then), as F10 would -- for a device without keys. */
+            static const char *trig;
+            if (!trig)
+                trig = getenv("RECOMP_VK_FLIGHT_FILE") ? getenv("RECOMP_VK_FLIGHT_FILE") : "";
+            if (*trig && f % 15 == 0 && remove(trig) == 0)
                 s_fl_dump = 1;
         }
         if (s_fl_dump) {
@@ -5763,6 +5845,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     VkViewport vpt;
     VkRect2D sc;
     int i, stage_on[4];
+    uint32_t wmask = 0;         /* stages reading a widened surface */
     float zmax, bc[4];
     uint32_t doff[2];
     VkCullModeFlags cm = VK_CULL_MODE_NONE;
@@ -5857,6 +5940,14 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         samps[i] = samps[4 + i] = sampler(&st->tex[i], lv);
         if (V.state < 0)
             return 1;
+        if (stage_on[i] && V.wide_frame && (mode == 1 || mode == 2) && !st->tex[i].cube) {
+            int j;
+            for (j = 0; j < V.nsurf; j++)
+                if (V.surf[j].squeezed && !V.surf[j].swz && (V.surf[j].va & 0x0FFFFFFFu) == (st->tex[i].offset & 0x0FFFFFFFu)) {
+                    wmask |= 1u << i;
+                    break;
+                }
+        }
     }
 
     if (!begin_target(st))
@@ -5983,7 +6074,8 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         /* Draws into the scene targets (640 wide, 32-bit, linear, with depth
          * -- not shadow maps, reflections or effect textures) squeezed by
          * (16/9) / view_aspect() across: the view widened to a screen wider
-         * than 16:9. RECOMP_VK_WIDE_X=<k> forces the factor. */
+         * than 16:9, in a race's frames (view_shown). RECOMP_VK_WIDE_X=<k>
+         * forces the factor. */
         static float force = -1.0f;
         const Surf *c = V.cur_cs;
         float k;
@@ -5994,9 +6086,19 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                 force = 0.0f;
         }
         k = force > 0.0f ? force : (16.0f / 9.0f) / view_aspect();
-        ub->wide[0] = c && !c->swz && c->bpp == 4 && c->w == 640 && V.cur_zs && c->rows <= 480
-                    ? k : 1.0f;
-        ub->wide[1] = ub->wide[2] = ub->wide[3] = 0.0f;
+        if (c && !c->swz && c->bpp == 4 && c->w == 640 && V.cur_zs && c->rows <= 480) {
+            if (st->depth_test)
+                V.wide_zdraws++;
+            ub->wide[0] = V.wide_frame ? k : 1.0f;
+            V.cur_cs->squeezed = V.wide_frame && k < 1.0f;
+        } else {
+            ub->wide[0] = 1.0f;
+        }
+        /* Stages sampling a widened surface by screen position (the
+         * title's screen-space shadow mask): their coordinates, worked out
+         * by the program from the unwidened view, squeezed to match. */
+        ub->wide[1] = ub->wide[0] < 1.0f ? (float)wmask : 0.0f;
+        ub->wide[2] = ub->wide[3] = 0.0f;
     }
     memcpy(ubm, ub, sizeof *ub);
 
@@ -6378,7 +6480,8 @@ static const char k_prog_tail[] =
      * within a title pixel of it: D3D's half-pixel offset puts a full-screen
      * quad at -0.5 .. 639.5, just outside on the left and just inside on the
      * right, which a tighter test pinned on one side only. */
-    "    if (abs(w - 1.0) > 1e-5 || abs(ndc.x) < 1.0 - u.vp.x * 1.01) ndc.x *= u.wide.x;\n"
+    "    bool sq = abs(w - 1.0) > 1e-5 || abs(ndc.x) < 1.0 - u.vp.x * 1.01;\n"
+    "    if (sq) ndc.x *= u.wide.x;\n"
     "    gl_Position = vec4(ndc * w, u.vp.w == 2.0 ? WREV_C : R[12].z * u.vp.z * w, w);\n"
     "    v_zs = R[12].z * u.vp.z;\n"
     /* oD0/oD1 are clamped to [0,1] by the hardware before interpolation
@@ -6387,6 +6490,20 @@ static const char k_prog_tail[] =
     "    v_d0 = clamp(O[3], 0.0, 1.0); v_d1 = clamp(O[4], 0.0, 1.0);\n"
     "    v_fog = fog_factor(O[5].x);\n"
     "    v_t0 = O[9]; v_t1 = O[10]; v_t2 = O[11]; v_t3 = O[12];\n"
+    /* A stage reading a surface drawn widened by screen position (wide.y,
+     * a stage mask): s/q squeezed about the texture's centre as ndc.x was,
+     * s' = k s + c q (1 - k), which interpolates as s/q needs. */
+    "    if (sq && u.wide.y != 0.0) {\n"
+    "        uint m = uint(u.wide.y); float kk = u.wide.x;\n"
+    "        for (int i = 0; i < 4; i++) {\n"
+    "            if ((m & (1u << uint(i))) == 0u) continue;\n"
+    "            vec4 t = i == 0 ? v_t0 : i == 1 ? v_t1 : i == 2 ? v_t2 : v_t3;\n"
+    "            float q = t.w != 0.0 ? t.w : 1.0;\n"
+    "            float c = u.ts[i].x != 0.0 ? 0.5 / u.ts[i].x : 0.5;\n"
+    "            t.x = kk * t.x + c * q * (1.0 - kk);\n"
+    "            if (i == 0) v_t0 = t; else if (i == 1) v_t1 = t; else if (i == 2) v_t2 = t; else v_t3 = t;\n"
+    "        }\n"
+    "    }\n"
     /* Points: the program's oPts when point parameters are on, else
      * SET_POINT_SIZE -- either at the render scale. */
     "    gl_PointSize = max(u.pts.w != 0.0 ? O[6].x * u.pts.y : u.pts.x, 1.0);\n"
@@ -8137,6 +8254,7 @@ static void present_frame(uint32_t va, uint32_t pitch)
     VkClearColorValue black;
     VkImageSubresourceRange rng;
     uint32_t dw, dh, ox, oy, sw, sh;
+    float shown;
     int i;
 
     if (V.present_queued)          /* a flip without pacing in between */
@@ -8147,6 +8265,8 @@ static void present_frame(uint32_t va, uint32_t pitch)
     V.flip_va[1] = va;
     hires_dump(va, pitch);
     hdr_dump(va, pitch);
+    shown = view_shown();               /* what this frame was drawn for */
+    wide_decide();
     if (!V.has_swapchain_ext)
         return;
     if (!V.surface) {
@@ -8228,14 +8348,14 @@ static void present_frame(uint32_t va, uint32_t pitch)
         }
     }
     /* The title's frame, scaled to fit with its aspect kept: its own
-     * shape, or view_aspect() (16:9, or a wider screen's own) for a
-     * 4:3-sized frame a widescreen title drew anamorphic. */
+     * shape, or view_shown() (16:9, or a wider screen's own in a race) for
+     * a 4:3-sized frame a widescreen title drew anamorphic. */
     sw = s->w;
     sh = s->rows ? s->rows : s->h;
     {
         uint32_t aw = sw;
         if (fb_widescreen() && sw * 3 == sh * 4)
-            aw = (uint32_t)((float)sh * view_aspect() + 0.5f);
+            aw = (uint32_t)((float)sh * shown + 0.5f);
         if ((uint64_t)V.sc_ext.width * sh <= (uint64_t)V.sc_ext.height * aw) {
             dw = V.sc_ext.width;
             dh = (uint32_t)((uint64_t)V.sc_ext.width * sh / aw);
