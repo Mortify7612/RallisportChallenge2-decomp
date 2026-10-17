@@ -154,7 +154,7 @@ On Windows, as on Linux:
   fullscreen on the monitor. F11 or Alt+Enter toggles it.
 
 Known Windows issues:
-- A profile saved by the Linux build is listed but "Unable to load".
+- The menus run slower than on Linux (about 40 fps).
 - The Z: cache (`%LOCALAPPDATA%\xboxrecomp\Cache`) is emptied at every start,
   because the game copies it again on each boot (`RECOMP_CACHE_FRESH=0`
   keeps it, and the second launch then stalls).

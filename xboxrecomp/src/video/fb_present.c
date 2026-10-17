@@ -230,6 +230,14 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CLOSE:
+        /* Closing the window ends the program, as SDL_QUIT does on the other
+         * hosts. Only stopping this loop left the title running, and its
+         * next display-mode change opened a new window: each reopen rebuilt
+         * the Vulkan surface under the renderer, the swapchain was recreated
+         * every frame and the driver crashed a few closes later. */
+        fprintf(stderr, "  [FBWIN] window closed -- exiting\n");
+        fflush(stderr);
+        _Exit(0);
     case WM_DESTROY:
         InterlockedExchange(&s_fb_running, 0);
         return 0;

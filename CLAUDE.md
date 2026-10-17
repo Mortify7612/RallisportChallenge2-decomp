@@ -122,9 +122,9 @@ has never been tried: the launcher uses `#embed` and GNU extensions.
 
 **Known Windows bugs:**
 
-- **Linux profiles don't load:** a profile saved by the Linux build is
-  listed but "Unable to load 0000". The Windows build never opens
-  `user.profile`.
+- **Menus are slow on Windows:** about 40 fps in the menus and car
+  select, worse than Linux on the same title (owner's report, from a VM
+  with the GPU passed through). Not diagnosed yet.
 - **Headless under Wine** (`RECOMP_FB_WINDOW=0`) never reaches a frame dump,
   even with v0.4.0. Check Windows builds there by comparing logs with a
   previous release's.
