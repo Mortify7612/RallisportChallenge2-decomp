@@ -57,8 +57,8 @@ extern ptrdiff_t g_xbox_mem_offset;
 static void irql_publish(void)
 {
     if (g_fs_base)
-        *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + g_fs_base
-                              + 0x24) = (uint8_t)g_current_irql;
+        *(volatile uint8_t *)((uintptr_t)g_xbox_mem_offset + XBOX_FOLD(g_fs_base
+                              + 0x24)) = (uint8_t)g_current_irql;
 }
 
 /* How many threads are holding IRQL at or above DISPATCH_LEVEL.
@@ -135,7 +135,7 @@ static void irql_holder_add(void *ra)
             s_holders[i].ra = ra;
             s_holders[i].guest_esp = g_esp;
             s_holders[i].guest_ra = g_esp
-                ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp) : 0;
+                ? *(uint32_t *)((uintptr_t)g_xbox_mem_offset + XBOX_FOLD(g_esp)) : 0;
             return;
         }
 }

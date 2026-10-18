@@ -513,20 +513,20 @@ static uint32_t rd32(uint32_t va)
     va = bus_resolve(va);
     if (!guest_ok(va, 4))
         return 0;
-    return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va);
+    return *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + XBOX_FOLD(va));
 }
 static void wr32(uint32_t va, uint32_t v)
 {
     va = bus_resolve(va);
     if (!guest_ok(va, 4))
         return;
-    *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + va) = v;
+    *(uint32_t *)((uint8_t *)xbox_GetMemoryOffset() + XBOX_FOLD(va)) = v;
 }
 static uint8_t *guest_ptr(uint32_t va, uint32_t bytes)
 {
     va = bus_resolve(va);
     return guest_ok(va, bytes)
-         ? (uint8_t *)xbox_GetMemoryOffset() + va : NULL;
+         ? (uint8_t *)xbox_GetMemoryOffset() + XBOX_FOLD(va) : NULL;
 }
 
 /* Transfer counts for RECOMP_USB_STATS: input reports served, control
@@ -887,8 +887,8 @@ static int ohci_call_isr(OhciController *hc)
         return -1;                      /* nothing connected yet            */
 
     mem     = (uint8_t *)xbox_GetMemoryOffset();
-    routine = *(uint32_t *)(mem + kinterrupt + 0);
-    context = *(uint32_t *)(mem + kinterrupt + 4);
+    routine = *(uint32_t *)(mem + XBOX_FOLD(kinterrupt + 0));
+    context = *(uint32_t *)(mem + XBOX_FOLD(kinterrupt + 4));
     if (!routine)
         return -1;
 
@@ -1318,7 +1318,7 @@ void xbox_OhciInit(void)
         }
         for (i = 0; i < 2; i++) {
             DWORD old_protect;
-            LPVOID at = (LPVOID)((uintptr_t)off + s_hc[i].base);
+            LPVOID at = (LPVOID)((uintptr_t)off + XBOX_FOLD(s_hc[i].base));
             if (!VirtualProtect(at, XBOX_OHCI_SIZE, PAGE_NOACCESS,
                                 &old_protect)) {
                 s_enabled = 0;

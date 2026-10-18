@@ -9,13 +9,14 @@
  *          begin/end draw, inline vertex data)
  */
 
+#include "platform/guest_addr.h"   /* XBOX_FOLD */
 #include "nv2a_state.h"
 #include <stdio.h>
 #include <math.h>
 
 /* Xbox memory access (from recomp_types.h) */
 extern ptrdiff_t g_xbox_mem_offset;
-#define NV2A_TEST_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+#define NV2A_TEST_PTR(addr) ((uintptr_t)XBOX_FOLD(addr) + g_xbox_mem_offset)
 #define NV2A_TEST_MEM32(addr) (*(volatile uint32_t *)NV2A_TEST_PTR(addr))
 
 /* Push buffer pointers - game-specific, override before including.

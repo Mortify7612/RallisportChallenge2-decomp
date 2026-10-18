@@ -22,6 +22,7 @@
  * ponytail: decode is per texel and the hash covers every byte; upload BC
  * blocks directly and hash on write-watch if either shows in a profile.
  */
+#include "platform/guest_addr.h"   /* XBOX_FOLD */
 #include "nv2a_vk.h"
 
 #include <stdio.h>
@@ -969,7 +970,7 @@ static int tex_hash_sparse(void)
 
 static uint8_t *guest(uint32_t va)
 {
-    return (uint8_t *)((uintptr_t)va + xbox_GetMemoryOffset());
+    return (uint8_t *)((uintptr_t)XBOX_FOLD(va) + xbox_GetMemoryOffset());
 }
 
 /* RECOMP_VK_DRAWLOG=<file>:<frame>[,<frame>...]: every draw and clear of

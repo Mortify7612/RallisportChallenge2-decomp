@@ -14,6 +14,7 @@
  *
  * Off unless RECOMP_FB_WINDOW is set.
  */
+#include "platform/guest_addr.h"   /* XBOX_FOLD */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -99,7 +100,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             return;
     }
     bpp = pitch / s_fb_width;
-    src = (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset());
+    src = (const uint8_t *)((uintptr_t)XBOX_FOLD(fb_va) + xbox_GetMemoryOffset());
     for (y = 0; y < s_fb_height; y++) {
         const uint8_t *row = src + (size_t)y * pitch;
         uint32_t *dst = s_present[next] + (size_t)y * s_fb_width;
@@ -488,7 +489,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory as
              * before, which is also what a title that never flips needs. */
             const uint8_t *src =
-                (const uint8_t *)((uintptr_t)s_fb_va + xbox_GetMemoryOffset());
+                (const uint8_t *)((uintptr_t)XBOX_FOLD(s_fb_va) + xbox_GetMemoryOffset());
             fb_convert(src, s_fb_pitch / s_fb_width);
             fb_blit(hwnd, hdc, &bi);
         }
@@ -658,7 +659,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
             return;
     }
     fb_convert_rows(s_present[next],
-                    (const uint8_t *)((uintptr_t)fb_va + xbox_GetMemoryOffset()),
+                    (const uint8_t *)((uintptr_t)XBOX_FOLD(fb_va) + xbox_GetMemoryOffset()),
                     pitch);
     __atomic_store_n(&s_present_idx, next, __ATOMIC_RELEASE);  /* whole frame */
 }
@@ -1053,7 +1054,7 @@ static void *fb_thread(void *unused)
             fb_gamma(s_rgb, (size_t)s_fb_width * s_fb_height);
         } else if (s_fb_va && s_fb_pitch) {
             /* No flip yet, or pinned with RECOMP_FB_VA: read guest memory. */
-            fb_convert_rows(s_rgb, (const uint8_t *)((uintptr_t)s_fb_va
+            fb_convert_rows(s_rgb, (const uint8_t *)((uintptr_t)XBOX_FOLD(s_fb_va)
                                                      + xbox_GetMemoryOffset()),
                             s_fb_pitch);
         }

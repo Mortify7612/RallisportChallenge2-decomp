@@ -16,6 +16,7 @@
  *   7 = driver_details  (Progress / Rewards / Records / Profile / Settings / Training / Extras)
  */
 
+#include "platform/guest_addr.h"   /* XBOX_FOLD */
 #include "nv2a_pgraph_d3d11.h"
 #include "nv2a_state.h"
 #include <stdio.h>
@@ -72,7 +73,7 @@ static LARGE_INTEGER g_replay_freq;
 
 /* Xbox memory access */
 extern ptrdiff_t g_xbox_mem_offset;
-#define RMEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define RMEM32(addr) (*(volatile uint32_t *)((uintptr_t)XBOX_FOLD(addr) + g_xbox_mem_offset))
 
 static void init_pb_table(void)
 {

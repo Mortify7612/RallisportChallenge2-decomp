@@ -4,16 +4,20 @@
  * device models trap through, and a few libc gaps.
  *
  * Memory. Guest addresses are host addresses at a fixed offset, so the
- * guest's 4 GB has to be one contiguous host range with each window (RAM,
+ * guest's address space has to be one host range with each window (RAM,
  * the contiguous window, the device apertures) at its own guest address.
- * Horizon has no mmap, but svcMapPhysicalMemory maps fresh memory at an
- * address of our choosing inside the alias region, which is tens of GB on a
- * 39-bit address space. So a large anonymous mmap is a slot of the alias
+ * Horizon has no mmap, and the only place an unprivileged process may map
+ * memory at an address of its choosing is its stack region (svcMapMemory,
+ * which moves heap pages there). That region is under 2 GB, so the Switch
+ * build folds the guest's top half down (platform/guest_addr.h), which
+ * needs 0x44000000 bytes. A large anonymous mmap is then a slot of the stack
  * region with nothing behind it (a reservation, as PROT_NONE is elsewhere),
- * and fixed mappings and commits inside it map memory there. Small
- * anonymous mappings come from the heap. The memory for svcMapPhysicalMemory
- * is what the heap leaves over, so __libnx_initheap below holds some back.
- * There is no aliasing: a second view of one memfd fails.
+ * and fixed mappings and commits inside it are heap memory moved there.
+ * Small anonymous mappings come from the heap. There is no aliasing: a
+ * second view of one memfd fails. (svcMapPhysicalMemory into the alias
+ * region would place memory too, but needs a system resource budget, which
+ * homebrew does not reliably have -- RSC2_NX_PROBE=1 shows what a host
+ * allows.)
  *
  * Faults. The APU, AC'97, USB and NV2A timer models trap the title's
  * accesses to their registers and emulate the instruction (mmio_decode.h).
@@ -54,12 +58,7 @@
 #define EXCEPTION_BREAKPOINT 0x80000003u
 #endif
 
-/* Memory held back from the heap for svcMapPhysicalMemory: the guest's
- * windows (64 MB RAM, 64 MB contiguous, 16 MB NV2A, 8 MB MCPX, 1 MB flash)
- * with room to spare. */
-#define NX_PHYS_RESERVE (224ull << 20)
-
-/* Anonymous mappings this large are reservations in the alias region. */
+/* Anonymous mappings this large are reservations in the stack region. */
 #define NX_SPAN_MIN (256ull << 20)
 
 static pthread_mutex_t s_vm_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -68,61 +67,12 @@ static inline uint64_t pg_down(uint64_t v) { return v & ~(NX_PAGE - 1); }
 static inline uint64_t pg_up(uint64_t v)   { return (v + NX_PAGE - 1) & ~(NX_PAGE - 1); }
 
 /* ---------------------------------------------------------------------- */
-/* Heap split                                                              */
-/* ---------------------------------------------------------------------- */
-
-extern char *fake_heap_start;
-extern char *fake_heap_end;
-static uint64_t s_heap_size, s_phys_left;
-
-/* libnx's own takes everything the loader left (hbloader hands over all but
- * 2 MB as the heap); this gives NX_PHYS_RESERVE of it back for the guest's
- * windows by shrinking the heap before anything is allocated from it. */
-void __libnx_initheap(void)
-{
-    void *addr = NULL;
-    uint64_t size = 0, total = 0, used = 0;
-
-    if (envHasHeapOverride()) {
-        addr = envGetHeapOverrideAddr();
-        size = envGetHeapOverrideSize();
-        if (size > NX_PHYS_RESERVE + (256ull << 20)) {
-            uint64_t want = (size - NX_PHYS_RESERVE) & ~0x1FFFFFull;
-            void *a = NULL;
-            if (R_SUCCEEDED(svcSetHeapSize(&a, want))) {
-                addr = a;
-                size = want;
-            }
-        }
-    } else {
-        svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-        if (total > used + NX_PHYS_RESERVE + 0x200000)
-            size = (total - used - NX_PHYS_RESERVE - 0x200000) & ~0x1FFFFFull;
-        if (!size || R_FAILED(svcSetHeapSize(&addr, size)))
-            svcBreak(0, 0, 0);
-    }
-    fake_heap_start = (char *)addr;
-    fake_heap_end = (char *)addr + size;
-    s_heap_size = size;
-}
-
-static uint64_t phys_free(void)
-{
-    uint64_t total = 0, used = 0;
-    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
-    return total > used ? total - used : 0;
-}
-
-/* ---------------------------------------------------------------------- */
-/* Spans: reservations in the alias region                                 */
+/* Spans: reservations in the stack region                                 */
 /* ---------------------------------------------------------------------- */
 
 #define NX_MAX_SPANS 8
 static struct { uint64_t lo, hi; } s_span[NX_MAX_SPANS];
 static int s_nspan;
-static uint64_t s_alias_next, s_alias_end;
 
 static int in_span(uint64_t a, uint64_t len)
 {
@@ -133,33 +83,132 @@ static int in_span(uint64_t a, uint64_t len)
     return 0;
 }
 
+/* RSC2_NX_PROBE=1 (rsc2.env): log the address regions and which mapping
+ * syscalls this process may use, trying each on a page at `at`; with
+ * RSC2_NX_PROBE=2, also whether a fault can be resumed (a host that cannot,
+ * like an emulator without user exception handlers, ends the process). */
+static LONG CALLBACK probe_veh(PEXCEPTION_POINTERS ep)
+{
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    ep->ContextRecord->X[0] = 0x600DF00Dull;
+    ep->ContextRecord->Pc += 4;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void nx_probe(uint64_t at)
+{
+    static const struct { u32 id; const char *name; } info[] = {
+        { InfoType_AliasRegionAddress, "alias" }, { InfoType_AliasRegionSize, "alias size" },
+        { InfoType_HeapRegionAddress, "heap" }, { InfoType_HeapRegionSize, "heap size" },
+        { InfoType_AslrRegionAddress, "aslr" }, { InfoType_AslrRegionSize, "aslr size" },
+        { InfoType_StackRegionAddress, "stack" }, { InfoType_StackRegionSize, "stack size" },
+        { InfoType_SystemResourceSizeTotal, "system resource" },
+        { InfoType_TotalMemorySize, "total memory" }, { InfoType_UsedMemorySize, "used memory" },
+    };
+    const char *e = getenv("RSC2_NX_PROBE");
+    size_t i;
+    void *src;
+    Result rc;
+    Handle h;
+
+    if (!e || !*e || *e == '0')
+        return;
+    for (i = 0; i < sizeof info / sizeof info[0]; i++) {
+        uint64_t v = 0;
+        rc = svcGetInfo(&v, info[i].id, CUR_PROCESS_HANDLE, 0);
+        fprintf(stderr, "[nx probe] %-16s %#lx%s\n", info[i].name, (unsigned long)v,
+                R_FAILED(rc) ? " (failed)" : "");
+    }
+    fprintf(stderr, "[nx probe] syscall hints: MapPhysicalMemory %d, CreateCodeMemory %d,"
+            " ControlCodeMemory %d, MapProcessMemory %d\n", envIsSyscallHinted(0x2C),
+            envIsSyscallHinted(0x4B), envIsSyscallHinted(0x4C), envIsSyscallHinted(0x74));
+
+    rc = svcMapPhysicalMemory((void *)(uintptr_t)at, NX_PAGE);
+    fprintf(stderr, "[nx probe] svcMapPhysicalMemory at %#lx: 0x%x\n", (unsigned long)at, rc);
+    if (R_SUCCEEDED(rc))
+        svcUnmapPhysicalMemory((void *)(uintptr_t)at, NX_PAGE);
+
+    src = memalign(NX_PAGE, NX_PAGE);
+    rc = svcCreateCodeMemory(&h, src, NX_PAGE);
+    fprintf(stderr, "[nx probe] svcCreateCodeMemory: 0x%x\n", rc);
+    if (R_SUCCEEDED(rc)) {
+        rc = svcControlCodeMemory(h, CodeMapOperation_MapOwner, (void *)(uintptr_t)at, NX_PAGE, Perm_Rw);
+        fprintf(stderr, "[nx probe] code memory owner map at %#lx: 0x%x\n", (unsigned long)at, rc);
+        if (R_SUCCEEDED(rc)) {
+            volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)at;
+            *p = 0x1234;
+            fprintf(stderr, "[nx probe]   written and read back: %#x; set read-only: 0x%x\n", *p,
+                    svcSetMemoryPermission((void *)(uintptr_t)at, NX_PAGE, Perm_R));
+            svcControlCodeMemory(h, CodeMapOperation_UnmapOwner, (void *)(uintptr_t)at, NX_PAGE, 0);
+        }
+        svcCloseHandle(h);
+    }
+
+    rc = svcMapMemory((void *)(uintptr_t)at, src, NX_PAGE);
+    fprintf(stderr, "[nx probe] svcMapMemory at %#lx: 0x%x\n", (unsigned long)at, rc);
+    if (R_SUCCEEDED(rc)) {
+        fprintf(stderr, "[nx probe]   set read-only: 0x%x\n",
+                svcSetMemoryPermission((void *)(uintptr_t)at, NX_PAGE, Perm_R));
+        svcSetMemoryPermission((void *)(uintptr_t)at, NX_PAGE, Perm_Rw);
+        svcUnmapMemory((void *)(uintptr_t)at, src, NX_PAGE);
+    }
+    {
+        uint64_t sa = 0, ss = 0;
+        svcGetInfo(&sa, InfoType_StackRegionAddress, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&ss, InfoType_StackRegionSize, CUR_PROCESS_HANDLE, 0);
+        rc = svcMapMemory((void *)(uintptr_t)(sa + ss / 2), src, NX_PAGE);
+        fprintf(stderr, "[nx probe] svcMapMemory in the stack region: 0x%x\n", rc);
+        if (R_SUCCEEDED(rc))
+            svcUnmapMemory((void *)(uintptr_t)(sa + ss / 2), src, NX_PAGE);
+    }
+    free(src);
+
+    if (*e == '2') {
+        PVOID vh = AddVectoredExceptionHandler(1, probe_veh);
+        uint64_t x0 = 0;
+        fprintf(stderr, "[nx probe] faulting on purpose at %#lx...\n", (unsigned long)at);
+        fflush(stderr);
+        __asm__ volatile("mov x0, %1\n\tldr w0, [x0]\n\tmov %0, x0" : "=r"(x0) : "r"(at) : "x0", "memory");
+        fprintf(stderr, "[nx probe] fault resumed: x0 = %#lx (0x600df00d expected)\n", (unsigned long)x0);
+        RemoveVectoredExceptionHandler(vh);
+    }
+    fflush(stderr);
+}
+
+/* A slot of the stack region, the one place an unprivileged process can
+ * map memory at an address of its choosing (svcMapMemory). The guest space
+ * fits it folded (platform/guest_addr.h): 0x44000000 bytes. */
 static void *span_new(uint64_t len)
 {
-    uint64_t base;
-    if (!s_alias_end) {
-        uint64_t ab = 0, as = 0;
-        svcGetInfo(&ab, InfoType_AliasRegionAddress, CUR_PROCESS_HANDLE, 0);
-        svcGetInfo(&as, InfoType_AliasRegionSize, CUR_PROCESS_HANDLE, 0);
-        /* 4 GB aligned, so guest and host addresses share their low 32 bits
-         * (easier to read in a crash report). */
-        s_alias_next = (ab + 0xFFFFFFFFull) & ~0xFFFFFFFFull;
-        s_alias_end = ab + as;
-        fprintf(stderr, "[nx] alias region %#lx + %#lx; heap %lu MB, %lu MB left for the guest\n",
-                (unsigned long)ab, (unsigned long)as, (unsigned long)(s_heap_size >> 20),
-                (unsigned long)(phys_free() >> 20));
-    }
+    void *base;
+    static int probed;
+
     len = (len + 0x1FFFFFull) & ~0x1FFFFFull;
-    base = s_alias_next;
-    if (s_nspan >= NX_MAX_SPANS || base + len > s_alias_end) {
-        fprintf(stderr, "[nx] out of alias region for a %lu MB reservation\n",
-                (unsigned long)(len >> 20));
+    if (s_nspan >= NX_MAX_SPANS)
+        return NULL;
+    virtmemLock();
+    base = virtmemFindStack(len, 0x10000);
+    if (base && !virtmemAddReservation(base, len))
+        base = NULL;
+    virtmemUnlock();
+    if (!base) {
+        uint64_t sa = 0, ss = 0;
+        svcGetInfo(&sa, InfoType_StackRegionAddress, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&ss, InfoType_StackRegionSize, CUR_PROCESS_HANDLE, 0);
+        fprintf(stderr, "[nx] no room for a %lu MB reservation in the stack region"
+                " (%#lx + %#lx)\n", (unsigned long)(len >> 20), (unsigned long)sa,
+                (unsigned long)ss);
         return NULL;
     }
-    s_alias_next = (base + len + 0xFFFFFFFFull) & ~0xFFFFFFFFull;
-    s_span[s_nspan].lo = base;
-    s_span[s_nspan].hi = base + len;
+    s_span[s_nspan].lo = (uint64_t)(uintptr_t)base;
+    s_span[s_nspan].hi = (uint64_t)(uintptr_t)base + len;
     s_nspan++;
-    return (void *)(uintptr_t)base;
+    fprintf(stderr, "[nx] guest space reserved at %p (%lu MB)\n", base,
+            (unsigned long)(len >> 20));
+    if (!probed++)
+        nx_probe((uint64_t)(uintptr_t)base);
+    return base;
 }
 
 /* Calls fn on each [a, b) piece of [lo, hi) that is mapped (want_mapped) or
@@ -190,27 +239,60 @@ static u32 nx_perm(int prot)
     return Perm_None;
 }
 
+/* Memory mapped into a span: heap memory moved there with svcMapMemory
+ * (the source stays allocated, and inaccessible, while it is). Unmapped
+ * whole, as it was mapped. */
+#define NX_MAX_PIECES 256
+static struct { uint64_t dst, len; void *src; } s_piece[NX_MAX_PIECES];
+
 static int piece_map(uint64_t a, uint64_t b, void *u)
 {
-    Result rc = svcMapPhysicalMemory((void *)(uintptr_t)a, b - a);
+    void *src;
+    Result rc;
+    int i;
     (void)u;
-    if (R_FAILED(rc)) {
-        fprintf(stderr, "[nx] svcMapPhysicalMemory(%#lx, %lu KB) failed: 0x%x"
-                " (%lu MB free)\n", (unsigned long)a, (unsigned long)((b - a) >> 10),
-                rc, (unsigned long)(phys_free() >> 20));
+    for (i = 0; i < NX_MAX_PIECES && s_piece[i].len; i++)
+        ;
+    if (i == NX_MAX_PIECES || !(src = memalign(NX_PAGE, b - a))) {
+        fprintf(stderr, "[nx] out of memory mapping %lu KB at %#lx\n",
+                (unsigned long)((b - a) >> 10), (unsigned long)a);
         return -1;
     }
-    /* Horizon fills new pages with the process's heap fill value; the guest
-     * expects zeroes, as an anonymous mmap gives. */
-    memset((void *)(uintptr_t)a, 0, b - a);
+    rc = svcMapMemory((void *)(uintptr_t)a, src, b - a);
+    if (R_FAILED(rc)) {
+        fprintf(stderr, "[nx] svcMapMemory(%#lx, %lu KB) failed: 0x%x\n",
+                (unsigned long)a, (unsigned long)((b - a) >> 10), rc);
+        free(src);
+        return -1;
+    }
+    s_piece[i].dst = a;
+    s_piece[i].len = b - a;
+    s_piece[i].src = src;
+    memset((void *)(uintptr_t)a, 0, b - a);      /* as an anonymous mmap is */
     return 0;
 }
 
 static int piece_unmap(uint64_t a, uint64_t b, void *u)
 {
+    int i, rc = 0;
     (void)u;
-    svcSetMemoryPermission((void *)(uintptr_t)a, b - a, Perm_Rw);
-    return R_SUCCEEDED(svcUnmapPhysicalMemory((void *)(uintptr_t)a, b - a)) ? 0 : -1;
+    for (i = 0; i < NX_MAX_PIECES; i++) {
+        uint64_t lo = s_piece[i].dst, hi = lo + s_piece[i].len;
+        if (!s_piece[i].len || hi <= a || lo >= b)
+            continue;
+        if (lo < a || hi > b) {             /* part of a mapping: leave it */
+            rc = -1;
+            continue;
+        }
+        svcSetMemoryPermission((void *)(uintptr_t)lo, hi - lo, Perm_Rw);
+        if (R_SUCCEEDED(svcUnmapMemory((void *)(uintptr_t)lo, s_piece[i].src, hi - lo))) {
+            free(s_piece[i].src);
+            s_piece[i].len = 0;
+        } else {
+            rc = -1;
+        }
+    }
+    return rc;
 }
 
 static int piece_perm(uint64_t a, uint64_t b, void *u)

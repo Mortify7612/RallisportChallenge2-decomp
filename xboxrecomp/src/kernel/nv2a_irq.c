@@ -38,6 +38,9 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#if !defined(_WIN32)
+#include "../platform/host_backtrace.h"
+#endif
 #include "../platform/mmio_decode.h"
 
 #define NV2A_BASE        0xFD000000u
@@ -130,7 +133,29 @@ static uint32_t pmc_pending(void)
     return v;
 }
 
+/* RECOMP_NV2A_IRQ_TRACE=<n>: the first n register accesses served here,
+ * with their values, to compare two runs. */
+static int trace_left(void)
+{
+    static int left = -1;
+    if (left < 0) {
+        const char *e = getenv("RECOMP_NV2A_IRQ_TRACE");
+        left = e ? atoi(e) : 0;
+    }
+    return left > 0 ? left-- : 0;
+}
+
+static uint64_t reg_read_model(void *dev, uint32_t off, int size);
+
 static uint64_t reg_read(void *dev, uint32_t off, int size)
+{
+    uint64_t v = reg_read_model(dev, off, size);
+    if (off != 0x600800 && trace_left())      /* not the raster position poll */
+        fprintf(stderr, "  [NV2A-IRQ] read  +0x%06X = 0x%08llX\n", off, (unsigned long long)v);
+    return v;
+}
+
+static uint64_t reg_read_model(void *dev, uint32_t off, int size)
 {
     uint32_t v;
     (void)dev;
@@ -148,6 +173,30 @@ static uint64_t reg_read(void *dev, uint32_t off, int size)
 
 static void reg_write(void *dev, uint32_t off, uint64_t val, int size)
 {
+    if (trace_left()) {
+        fprintf(stderr, "  [NV2A-IRQ] write +0x%06X = 0x%08llX (%d)\n", off, (unsigned long long)val, size);
+#if !defined(_WIN32)
+        if (off == 0x200 && val == 0) {             /* PMC_ENABLE off: who */
+            void *fr[40];
+            backtrace_symbols_fd(fr, backtrace(fr, 40), 2);
+            {   /* and readable text on the guest stack (an assert message) */
+                extern RECOMP_TLS uint32_t g_esp;
+                const char *m = (const char *)xbox_GetMemoryOffset();
+                uint32_t a = g_esp, run = 0;
+                for (; a < g_esp + 0x2000 && a < 0x04000000u; a++) {
+                    char c = m[XBOX_FOLD(a)];
+                    if (c >= 0x20 && c < 0x7F) run++;
+                    else {
+                        if (run >= 6)
+                            fprintf(stderr, "    stack text @%08X: %.*s\n", a - run, (int)run,
+                                    m + XBOX_FOLD(a - run));
+                        run = 0;
+                    }
+                }
+            }
+        }
+#endif
+    }
     uint32_t v = (uint32_t)val;
     (void)dev;
     if (size < 4) {                          /* merge a narrow write */
@@ -252,17 +301,17 @@ void xbox_Nv2aIrqInit(void)
     }
     clock_gettime(CLOCK_MONOTONIC, &s_t0);
     for (i = 0; i < npages; i++)
-        memcpy(s_store[i], (void *)((uintptr_t)off + NV2A_BASE + pages[i]), PAGE);
+        memcpy(s_store[i], (void *)((uintptr_t)off + XBOX_FOLD(NV2A_BASE + pages[i])), PAGE);
     /* On before the pages close: the ack thread checks this to keep its
      * hands off them, and it runs concurrently with this. */
     __atomic_store_n(&s_enabled, 1, __ATOMIC_SEQ_CST);
     for (i = 0; i < npages; i++) {
-        void *at = (void *)((uintptr_t)off + NV2A_BASE + pages[i]);
+        void *at = (void *)((uintptr_t)off + XBOX_FOLD(NV2A_BASE + pages[i]));
         DWORD old;
         if (!VirtualProtect(at, PAGE, PAGE_NOACCESS, &old)) {
             fprintf(stderr, "  NV2A-IRQ: cannot trap page +0x%06X; disabled\n", pages[i]);
             while (--i >= 0)
-                VirtualProtect((void *)((uintptr_t)off + NV2A_BASE + pages[i]),
+                VirtualProtect((void *)((uintptr_t)off + XBOX_FOLD(NV2A_BASE + pages[i])),
                                PAGE, PAGE_READWRITE, &old);
             __atomic_store_n(&s_enabled, 0, __ATOMIC_SEQ_CST);
             return;

@@ -520,7 +520,7 @@ static int fetch_attr(const VertexAttr *a, uint32_t index, float out[4])
     } else {
         if (!a->offset)
             return 0;
-        p = mem + a->offset + (size_t)index * a->stride;
+        p = mem + XBOX_FOLD(a->offset) + (size_t)index * a->stride;
     }
 
     switch (a->type) {
@@ -590,7 +590,7 @@ static void fetch_attr_run(const VertexAttr *a, uint32_t lo, const uint32_t *idx
             goto slow;              /* some vertices fall off the end */
         base = (const uint8_t *)s_gpu.inline_buf + a->offset;
     } else {
-        base = (const uint8_t *)xbox_GetMemoryOffset() + a->offset;
+        base = (const uint8_t *)xbox_GetMemoryOffset() + XBOX_FOLD(a->offset);
     }
     n = a->size < 4 ? a->size : 4;
 #define FETCH_LOOP(body) \
@@ -785,7 +785,7 @@ static void dump_surface_bmp(void)
 
     /* BMP rows run bottom-up. */
     for (y = h; y-- > 0; ) {
-        const uint8_t *row = mem + dma_resolve(offset)
+        const uint8_t *row = mem + XBOX_FOLD(dma_resolve(offset))
                            + (size_t)(cy + y) * pitch;
         for (x = 0; x < w; x++) {
             uint8_t bgr[3];
@@ -840,7 +840,7 @@ static void clear_surface(uint32_t param)
 
     /* On the GPU path the pixels are cleared there (NV097_CLEAR_SURFACE). */
     for (y = 0; y < s_gpu.clip_h && !nv2a_vk_active(); y++) {
-        uint8_t *row = mem + s_gpu.color_base
+        uint8_t *row = mem + XBOX_FOLD(s_gpu.color_base)
                      + (size_t)(s_gpu.clip_y + y) * s_gpu.pitch;
         if (bpp == 4) {
             uint32_t *p = (uint32_t *)row + s_gpu.clip_x;
@@ -1093,7 +1093,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
                         uint32_t px[16]; } cache[4096];
         uint32_t bb = d3d8_format_dxt_block_bytes(fmt);
         uint32_t bx = u >> 2, by = v >> 2, bw = (t->width + 3) >> 2;
-        const uint8_t *blk = mem + base + ((size_t)by * bw + bx) * bb;
+        const uint8_t *blk = mem + XBOX_FOLD(base) + ((size_t)by * bw + bx) * bb;
         uintptr_t key = (uintptr_t)blk;
         size_t slot = ((key / bb) ^ (key >> 16)) & 4095;
         uint64_t raw[2] = {0, 0};
@@ -1102,7 +1102,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
             || cache[slot].raw[0] != raw[0] || cache[slot].raw[1] != raw[1]) {
             uint32_t i;
             for (i = 0; i < 16; i++)
-                d3d8_dxt_decode_texel(mem + base, fmt, bx * 4 + (i & 3),
+                d3d8_dxt_decode_texel(mem + XBOX_FOLD(base), fmt, bx * 4 + (i & 3),
                                       by * 4 + (i >> 2), t->width,
                                       &cache[slot].px[i]);
             cache[slot].key = key;
@@ -1119,10 +1119,10 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
          * casts to each format's own width, which makes that index a texel
          * index for every one of them. */
         fmt = linear_twin(fmt);
-        p = mem + base;
+        p = mem + XBOX_FOLD(base);
         u = swizzle_offset_cached(u, v, t->width, t->height);
     } else {
-        p = mem + base + (size_t)v * t->pitch;
+        p = mem + XBOX_FOLD(base) + (size_t)v * t->pitch;
     }
 
     switch (fmt) {
@@ -1141,7 +1141,7 @@ static int sample_tex(const Texture *t, uint32_t face_offset,
     case 0x0B:                                      /* SZ_I8_A8R8G8B8 */
         if (!t->palette)
             return 0;
-        *argb = ((const uint32_t *)(mem + t->palette))[p[u]];
+        *argb = ((const uint32_t *)(mem + XBOX_FOLD(t->palette)))[p[u]];
         return 1;
 
     /* 32-bit, other channel orders. The name gives the byte order from the
@@ -1335,7 +1335,7 @@ static int surface_begin_batch(const uint8_t *mem)
 
     if (surface_hits_image(base, (s_gpu.clip_y + s_gpu.clip_h) * s_gpu.pitch))
         return 0;
-    s_surface = (uint8_t *)mem + base;
+    s_surface = (uint8_t *)mem + XBOX_FOLD(base);
     return 1;
 }
 
@@ -3597,15 +3597,15 @@ static void raster_batch_program(void)
                                 va += 0xFFFC;
                                 continue;
                             }
-                            if (*(const uint32_t *)(m + va) == want) {
+                            if (*(const uint32_t *)(m + XBOX_FOLD(va)) == want) {
                                 fprintf(stderr, "[DDUMP]   c[15].x bits %08X found at %08X: %g %g %g %g\n",
-                                        want, va, ((const float *)(m + va))[0], ((const float *)(m + va))[1],
-                                        ((const float *)(m + va))[2], ((const float *)(m + va))[3]);
+                                        want, va, ((const float *)(m + XBOX_FOLD(va)))[0], ((const float *)(m + XBOX_FOLD(va)))[1],
+                                        ((const float *)(m + XBOX_FOLD(va)))[2], ((const float *)(m + XBOX_FOLD(va)))[3]);
                                 hits++;
                             }
                         }
                         for (va = 0x80000000u; va < 0x84000000u && hits < 48; va += 4)
-                            if (*(const uint32_t *)(m + va) == want) {
+                            if (*(const uint32_t *)(m + XBOX_FOLD(va)) == want) {
                                 fprintf(stderr, "[DDUMP]   c[15].x bits found at %08X (window)\n", va);
                                 hits++;
                             }
@@ -3979,7 +3979,7 @@ static void draw_primitive(void)
                     if (!at->offset || !at->size)
                         continue;
                     for (k = 0; k < 64; k++)
-                        if (mem[at->offset + k]) nz++;
+                        if (mem[XBOX_FOLD(at->offset) + k]) nz++;
                     fprintf(stderr, "  [GPU]   attr%-2u off 0x%08X type %u"
                                     " size %u stride %-3u  %u/64 bytes set\n",
                             a, at->offset, at->type, at->size, at->stride, nz);
@@ -3993,7 +3993,7 @@ static void draw_primitive(void)
                 uint32_t k;
                 fprintf(stderr, "  [GPU]   bytes @0x%08X:", s_gpu.attr[0].offset);
                 for (k = 0; k < 32; k++)
-                    fprintf(stderr, " %02X", mem[s_gpu.attr[0].offset + k]);
+                    fprintf(stderr, " %02X", mem[XBOX_FOLD(s_gpu.attr[0].offset) + k]);
                 fprintf(stderr, "\n");
                 fprintf(stderr, "  [GPU]   indices:");
                 for (k = 0; k < s_gpu.idx_count && k < 8; k++)
@@ -4530,7 +4530,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         uint32_t va = base ? base + s_sem_offset : dma_resolve(s_sem_offset);
         static unsigned shown;
         if (va >= 0x10000u && !(va & 3u)) {
-            *(volatile uint32_t *)((uintptr_t)va + xbox_GetMemoryOffset()) = param;
+            *(volatile uint32_t *)((uintptr_t)XBOX_FOLD(va) + xbox_GetMemoryOffset()) = param;
             __atomic_thread_fence(__ATOMIC_RELEASE);
         }
         if (shown++ < 4)
@@ -4659,9 +4659,9 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 break;
             }
         }
-        memcpy(mem + at, &stamp, 8);
-        memcpy(mem + at + 8, &count, 4);
-        memset(mem + at + 12, 0, 4);
+        memcpy(mem + XBOX_FOLD(at), &stamp, 8);
+        memcpy(mem + XBOX_FOLD(at) + 8, &count, 4);
+        memset(mem + XBOX_FOLD(at) + 12, 0, 4);
         break;
     }
     case NV097_SET_BLEND_COLOR:
@@ -4834,7 +4834,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 uint8_t *m = (uint8_t *)xbox_GetMemoryOffset();
                 int k;
                 for (k = 0; k < pk_n; k++)
-                    memcpy(m + pk_va[k], &pk_v[k], 4);
+                    memcpy(m + XBOX_FOLD(pk_va[k]), &pk_v[k], 4);
             }
             /* RECOMP_PEEKF=<va>:<count>:<every>: count floats at va every
              * that many presented frames. */
@@ -4857,8 +4857,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 for (k = 0; k < pn; k++) {
                     float f;
                     uint32_t u;
-                    memcpy(&f, m + pv + k * 4, 4);
-                    memcpy(&u, m + pv + k * 4, 4);
+                    memcpy(&f, m + XBOX_FOLD(pv) + k * 4, 4);
+                    memcpy(&u, m + XBOX_FOLD(pv) + k * 4, 4);
                     fprintf(stderr, " %g/%u", f, u);
                 }
                 fputc('\n', stderr);
@@ -5215,7 +5215,7 @@ static void peek_addresses(void)
         float f;
         if (va < 0x1000u || va >= 0x04000000u)
             continue;
-        v = *(const uint32_t *)(mem + va);
+        v = *(const uint32_t *)(mem + XBOX_FOLD(va));
         memcpy(&f, &v, 4);
         fprintf(stderr, "  [PEEK] 0x%08X = %08X  (%g)\n", va, v, f);
     }
@@ -5253,7 +5253,7 @@ static void peek_chain(void)
                                 " pointer -- chain ends\n", step, cur);
                 return;
             }
-            cur = *(const uint32_t *)(mem + cur) + off;
+            cur = *(const uint32_t *)(mem + XBOX_FOLD(cur)) + off;
             fprintf(stderr, "  [CHAIN] step %d: deref +0x%X -> 0x%08X\n",
                     step, off, cur);
         }
@@ -5261,7 +5261,7 @@ static void peek_chain(void)
     }
     if (cur >= 0x1000u && cur + 4 < 0x04000000u)
         fprintf(stderr, "  [CHAIN] final value at 0x%08X = 0x%08X\n",
-                cur, *(const uint32_t *)(mem + cur));
+                cur, *(const uint32_t *)(mem + XBOX_FOLD(cur)));
     fflush(stderr);
 }
 

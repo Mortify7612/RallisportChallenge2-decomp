@@ -444,7 +444,18 @@ void recomp_trace_bb(uint32_t va, uint32_t ebp);
  * uintptr_t cast preserves the overflow bits, landing us 4GB+ past
  * our mapping and causing access violations.
  */
+#if defined(XBOX_FOLD_HIGH)
+/* The top half of the guest space folded into the second quarter, for a
+ * host without 4 GB of address space to place (see platform/guest_addr.h).
+ * A function, so `addr` is evaluated once: hand-written code passes `p++`. */
+static inline uintptr_t xbox_ptr_folded(uint32_t a)
+{
+    return (uintptr_t)(a ^ ((uint32_t)((int32_t)a >> 31) << 30)) + (uintptr_t)g_xbox_mem_offset;
+}
+#define XBOX_PTR(addr) xbox_ptr_folded((uint32_t)(addr))
+#else
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
+#endif
 
 /** Read/write N bytes at a flat Xbox memory address. */
 #define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))

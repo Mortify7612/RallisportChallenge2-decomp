@@ -5,7 +5,11 @@
 code is the same as on the other platforms; what differs is the host layer
 under it, in `xboxrecomp/src/platform/switch/`.
 
-**Status:** it builds. It has not run on a Switch or in an emulator yet.
+**Status:**
+- It builds.
+- In the Ryujinx emulator it boots through memory setup, the kernel, the save data and the disc archives, and copies the Z: cache.
+- It stops where the PC build stops when the fault-based devices are off. See "Emulator" below.
+- It has not run on a real Switch yet.
 
 ## Building (no root needed)
 
@@ -49,19 +53,32 @@ sdmc:/switch/rsc2/rsc2.env     optional settings, NAME=value per line
 ### Guest memory
 
 Every guest address is a host address at a fixed offset, so the guest's
-4 GB is one host range.
+address space has to be one host range.
 
-- **Reservation:** a large anonymous `mmap` (the 4 GB reservation) takes a
-  slot of the process's alias region and maps nothing.
-- **Windows:** RAM, the contiguous window and the device apertures are then
-  mapped at their guest addresses inside it with `svcMapPhysicalMemory`.
-  Its memory is what the heap leaves free, so `__libnx_initheap` shrinks
-  the heap by 224 MB.
-- **Small mappings** come from the heap.
-- **No page aliasing:**
-  - The Xbox RAM mirrors and the 0xF0000000 aperture are not mapped.
-  - RSC2 uses neither. A Linux replay with `RECOMP_MIRRORS=0
-    RECOMP_TILED=0` matches the baseline within run-to-run noise.
+- **Where it goes:** the only place an unprivileged Horizon process can map
+  memory at an address of its choosing is its stack region (`svcMapMemory`
+  moves heap pages there). That region is under 2 GB.
+- **Folding:** the Switch build moves the guest's top half down
+  (`XBOX_FOLD_HIGH`, `platform/guest_addr.h`), so the whole guest space
+  needs only 0x44000000 bytes. In the folded layout:
+  - the contiguous window at 0x80000000 sits at 0x40000000;
+  - the device apertures sit at 0x3D000000–0x3FFFFFFF.
+- **Testing the folding on a PC:** `cmake -DRSC2_FOLD_HIGH=ON` turns it on
+  in any build. A Linux replay with it matches the normal build within
+  run-to-run noise.
+- **Mappings:**
+  - A large anonymous `mmap` (the reservation) takes a slot of the stack
+    region and maps nothing.
+  - RAM, the contiguous window and the device apertures are heap memory
+    moved there.
+  - Small anonymous mappings come from the heap.
+- **No page aliasing:** the Xbox RAM mirrors and the 0xF0000000 aperture are
+  not mapped. RSC2 uses neither: a Linux replay with `RECOMP_MIRRORS=0
+  RECOMP_TILED=0` matches the baseline within run-to-run noise.
+- **Checking a host:** `RSC2_NX_PROBE=1` in `rsc2.env` logs the address
+  regions and which mapping syscalls the process may use.
+  `RSC2_NX_PROBE=2` also faults on purpose to check that a fault can be
+  resumed.
 
 ### Device faults
 
@@ -86,11 +103,37 @@ accesses as faults, as on Linux.
 - **Diagnostics:** the Linux signal-based ones (`kill -QUIT` thread dumps,
   the sampling profiler) are left out.
 
-## To check first on hardware or in an emulator
+## Emulator (Ryujinx)
 
-1. Does `svcMapPhysicalMemory` work for this process? It needs a system
-   resource size. The log prints the alias region and the memory left for
-   the guest, and any failing call with its result code.
-2. Does the fault path resume correctly? The game reaching its title screen
-   with sound means the APU traps work.
-3. Speed of the software renderer on the Switch's CPU.
+To run it on a PC:
+- Ryubing's Ryujinx from Flathub (`io.github.ryubing.Ryujinx`) runs the `.nro`.
+- It needs `prod.keys` from your own console in
+  `~/.var/app/io.github.ryubing.Ryujinx/config/Ryujinx/system/`.
+- The emulated SD card is `.../config/Ryujinx/sdcard/`.
+
+What it can test:
+- **No resumed faults:** Ryujinx does not hand faults to the program's
+  exception handler. A fault on an unmapped address ends the guest.
+- **So the devices must be off:** audio, USB and the GPU timers all work by
+  faulting, so they have to be switched off in `rsc2.env`:
+  `RECOMP_AC97_READY=0`, `RECOMP_USB=0`, `RECOMP_NV2A_IRQ=0`.
+- **How far it gets that way:** the game then boots as far as the PC build
+  does with the same switches. It crashes in DirectSound after the Z: cache
+  copy, because DirectSound was never created.
+
+Getting further in the emulator needs those devices without faults.
+
+What Ryujinx's probe showed:
+- system resource budget 0, so `svcMapPhysicalMemory` fails;
+- `svcMapMemory` works in the stack region;
+- `svcSetMemoryPermission` is refused there (`InvalidCurrentMemory`).
+
+## To check first on hardware
+
+1. **Fault resume:** does the fault path resume correctly? Use
+   `RSC2_NX_PROBE=2`.
+2. **Trap pages:** the device models arm their traps with
+   `svcSetMemoryPermission`, which Ryujinx refuses on stack-region memory.
+   If hardware refuses it too, the trap pages have to be left unmapped
+   instead.
+3. **Speed:** how fast the software renderer is on the Switch's CPU.

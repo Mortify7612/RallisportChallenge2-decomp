@@ -23,6 +23,7 @@
 #define XBOX_MEMORY_LAYOUT_H
 
 #include "platform/xbox_winnt.h"
+#include "platform/guest_addr.h"   /* XBOX_FOLD: guest address -> host offset */
 #include <stdint.h>
 
 #ifdef __cplusplus

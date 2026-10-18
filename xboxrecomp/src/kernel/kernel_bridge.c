@@ -63,10 +63,10 @@ int  xbox_worker_stack_alloc(void);
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 
 /* Memory access - same as recomp_types.h MEM32 but without the #define guard */
-#define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define BRIDGE_MEM32(addr) (*(volatile uint32_t *)((uintptr_t)XBOX_FOLD(addr) + g_xbox_mem_offset))
 
 /* Translate Xbox VA to native pointer (NULL-safe: 0 → NULL) */
-#define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)(va) + g_xbox_mem_offset) : NULL)
+#define XBOX_TO_NATIVE(va) ((va) ? (void*)((uintptr_t)XBOX_FOLD(va) + g_xbox_mem_offset) : NULL)
 
 /* ── Guest buffers the host is about to touch ───────────
  *
@@ -142,8 +142,8 @@ static int bridge_buf_ok(uint32_t va, uint32_t bytes, const char *export_name)
  * it with the expected structures.
  */
 
-#define BRIDGE_MEM16(addr) (*(volatile uint16_t *)((uintptr_t)(addr) + g_xbox_mem_offset))
-#define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)(addr) + g_xbox_mem_offset))
+#define BRIDGE_MEM16(addr) (*(volatile uint16_t *)((uintptr_t)XBOX_FOLD(addr) + g_xbox_mem_offset))
+#define BRIDGE_MEM8(addr)  (*(volatile uint8_t  *)((uintptr_t)XBOX_FOLD(addr) + g_xbox_mem_offset))
 
 /**
  * Get the Xbox VA of data for a kernel DATA export ordinal.
@@ -315,19 +315,19 @@ static void kernel_data_init(void)
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE) = 0;
 
     /* XboxHDKey (ordinal 323) - 16 bytes of zeros (no key) */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset), 0, 16);
+    memset((void*)((uintptr_t)XBOX_FOLD(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset), 0, 16);
 
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
+    memset((void*)((uintptr_t)XBOX_FOLD(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
 
     /* XboxLANKey (ordinals 326, 355) - 16 bytes of zeros */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), 0, 16);
+    memset((void*)((uintptr_t)XBOX_FOLD(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), 0, 16);
 
     /* XboxAlternateSignatureKeys (ordinals 327, 356) - 256 bytes of zeros */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), 0, 256);
+    memset((void*)((uintptr_t)XBOX_FOLD(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), 0, 256);
 
     /* XePublicKeyData (ordinal 357) - 284 bytes of zeros */
-    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY) + g_xbox_mem_offset), 0, 284);
+    memset((void*)((uintptr_t)XBOX_FOLD(XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY) + g_xbox_mem_offset), 0, 284);
 
     /* HAL disk identity strings (ordinals 41/42). The exported symbol is an
      * XBOX_ANSI_STRING whose Buffer must be an Xbox VA the title can deref --
@@ -856,7 +856,7 @@ static void bridge_MmAllocateSystemMemory(void)
         fprintf(stderr, "  [MEM] MmAllocateSystemMemory(%u) -> 0x%08X from 0x%08X\n",
                 size, xbox_va, g_xbox_kernel_caller);
     if (xbox_va)
-        memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+        memset((void *)((uintptr_t)XBOX_FOLD(xbox_va) + g_xbox_mem_offset), 0, size);
     else
         fprintf(stderr, "  [KERNEL] MmAllocateSystemMemory: %u bytes REFUSED\n",
                 size);
@@ -900,7 +900,7 @@ static void bridge_MmAllocateContiguousMemoryEx(void)
          * pool headers and free-list roots are assumed clear, so whatever the
          * backing view happened to contain shows up later as structures that
          * are "allocated" but full of garbage. */
-        memset((void *)((uintptr_t)xbox_va + g_xbox_mem_offset), 0, size);
+        memset((void *)((uintptr_t)XBOX_FOLD(xbox_va) + g_xbox_mem_offset), 0, size);
 
         if (KERNEL_LOG_ON_HALF() || mem_trace_on()) {
             fprintf(stderr, "  [KERNEL] MmAllocateContiguousMemoryEx: size=%u "
@@ -1391,7 +1391,7 @@ static void bridge_ExQueryNonVolatileSetting(void)
     NTSTATUS st = xbox_ExQueryNonVolatileSetting(
         value_index,
         type_va   ? (PULONG)&BRIDGE_MEM32(type_va)   : NULL,
-        value_va  ? (PVOID)((uintptr_t)value_va + g_xbox_mem_offset) : NULL,
+        value_va  ? (PVOID)((uintptr_t)XBOX_FOLD(value_va) + g_xbox_mem_offset) : NULL,
         value_length,
         result_va ? (PULONG)&BRIDGE_MEM32(result_va) : NULL);
 
@@ -7026,7 +7026,7 @@ static void bridge_IoAllocateIrp(void)
     (void)charge_quota;
     va = xbox_HeapAlloc(total, 16);
     if (va)
-        memset((void *)((uintptr_t)va + g_xbox_mem_offset), 0, total);
+        memset((void *)((uintptr_t)XBOX_FOLD(va) + g_xbox_mem_offset), 0, total);
     else
         fprintf(stderr, "  [KERNEL] IoAllocateIrp: %u bytes REFUSED\n", total);
     g_eax = va;
@@ -7658,7 +7658,7 @@ static void bridge_MmDbgAllocateMemory(void)
     }
     va = xbox_HeapAlloc(size, 16);
     if (va)
-        memset((void *)((uintptr_t)va + g_xbox_mem_offset), 0, size);
+        memset((void *)((uintptr_t)XBOX_FOLD(va) + g_xbox_mem_offset), 0, size);
     g_eax = va;
 }
 
@@ -9905,7 +9905,7 @@ void xbox_kernel_bridge_init(void)
     /* The thunk table lives in .rdata which is marked PAGE_READONLY.
      * Temporarily make it writable so we can patch the ordinals. */
     VirtualProtect(
-        (LPVOID)((uintptr_t)g_thunk_table_base + g_xbox_mem_offset),
+        (LPVOID)((uintptr_t)XBOX_FOLD(g_thunk_table_base) + g_xbox_mem_offset),
         g_thunk_table_count * 4,
         PAGE_READWRITE,
         &old_protect
@@ -9983,7 +9983,7 @@ void xbox_kernel_bridge_init(void)
         DWORD scan_protect;
         uint32_t low = g_thunk_table_base - LOOKBEHIND * 4;
 
-        VirtualProtect((LPVOID)((uintptr_t)low + g_xbox_mem_offset),
+        VirtualProtect((LPVOID)((uintptr_t)XBOX_FOLD(low) + g_xbox_mem_offset),
                        LOOKBEHIND * 4, PAGE_READWRITE, &scan_protect);
 
         for (i = 1; i <= LOOKBEHIND; i++) {
@@ -10012,13 +10012,13 @@ void xbox_kernel_bridge_init(void)
                     va, g_slot_ordinals[slot], slot);
         }
 
-        VirtualProtect((LPVOID)((uintptr_t)low + g_xbox_mem_offset),
+        VirtualProtect((LPVOID)((uintptr_t)XBOX_FOLD(low) + g_xbox_mem_offset),
                        LOOKBEHIND * 4, scan_protect, &scan_protect);
     }
 
     /* Restore original protection */
     VirtualProtect(
-        (LPVOID)((uintptr_t)g_thunk_table_base + g_xbox_mem_offset),
+        (LPVOID)((uintptr_t)XBOX_FOLD(g_thunk_table_base) + g_xbox_mem_offset),
         g_thunk_table_count * 4,
         old_protect,
         &old_protect

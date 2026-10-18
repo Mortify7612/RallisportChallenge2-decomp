@@ -24,6 +24,7 @@
 
 #include "apu_state.h"
 #include "fpconv.h"
+#include "../platform/guest_addr.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -105,7 +106,7 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
     if (!d->ram_ptr)
         return;
     for (i = 0; i < s_dsp_ack_count; i++) {
-        uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
+        uint32_t *slot = (uint32_t *)(d->ram_ptr + XBOX_FOLD(s_dsp_ack[i]));
         if (*slot) {
             static int shown[APU_DSP_ACK_MAX];
             if (shown[i]++ < 3)

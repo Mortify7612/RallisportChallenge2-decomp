@@ -77,11 +77,11 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu, va;
     if (xbox_PhysUntag(a, &va))
-        return g_apu_ram_ptr + va;
+        return g_apu_ram_ptr + XBOX_FOLD(va);
     if (a >= g_xbox_image_lo && a < g_xbox_image_hi)
         return g_apu_ram_ptr + a;
     if (a < xbox_ContiguousAllocatedBytes())
-        return g_apu_ram_ptr + 0x80000000u + a;
+        return g_apu_ram_ptr + XBOX_FOLD(0x80000000u + a);
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
 
@@ -151,8 +151,8 @@ static void apu_deliver_irq(MCPXAPUState *d)
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
         return;
-    routine = *(uint32_t *)(g_apu_ram_ptr + kint + 0);
-    context = *(uint32_t *)(g_apu_ram_ptr + kint + 4);
+    routine = *(uint32_t *)(g_apu_ram_ptr + XBOX_FOLD(kint + 0));
+    context = *(uint32_t *)(g_apu_ram_ptr + XBOX_FOLD(kint + 4));
     fn = routine ? recomp_lookup(routine) : NULL;
     if (!fn)
         return;
@@ -170,9 +170,9 @@ static void apu_deliver_irq(MCPXAPUState *d)
     qemu_mutex_unlock(&d->lock);
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = context;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = kint;
-    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + g_esp) = 0xDEADBEEFu;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + XBOX_FOLD(g_esp)) = context;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + XBOX_FOLD(g_esp)) = kint;
+    g_esp -= 4; *(uint32_t *)(g_apu_ram_ptr + XBOX_FOLD(g_esp)) = 0xDEADBEEFu;
     { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
     xbox_worker_stack_free(slot);
     qemu_mutex_lock(&d->lock);

@@ -404,6 +404,16 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
 
+    /* A bare drive is its root: RSC2 creates "z:" before using Z:\. Passed
+     * through unrecognised, that made a directory named "z:" in the working
+     * directory -- and on the Switch, where "z:" reads as a device name,
+     * crashed inside libnx's mkdir. */
+    char drive_root[4];
+    if (xbox_path[0] && xbox_path[1] == ':' && xbox_path[2] == '\0') {
+        snprintf(drive_root, sizeof drive_root, "%c:\\", xbox_path[0]);
+        xbox_path = drive_root;
+    }
+
     if (!s_initialized)
         xbox_path_init(NULL, NULL);
 
@@ -632,6 +642,16 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
 
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
+
+    /* A bare drive is its root: RSC2 creates "z:" before using Z:\. Passed
+     * through unrecognised, that made a directory named "z:" in the working
+     * directory -- and on the Switch, where "z:" reads as a device name,
+     * crashed inside libnx's mkdir. */
+    char drive_root[4];
+    if (xbox_path[0] && xbox_path[1] == ':' && xbox_path[2] == '\0') {
+        snprintf(drive_root, sizeof drive_root, "%c:\\", xbox_path[0]);
+        xbox_path = drive_root;
+    }
 
     if (!s_initialized)
         xbox_path_init(NULL, NULL);

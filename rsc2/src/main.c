@@ -55,6 +55,7 @@
 
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
+#include "platform/guest_addr.h"   /* XBOX_FOLD / XBOX_UNFOLD */
 #include "launcher.h"
 
 #ifndef CONTEXT_PC
@@ -184,7 +185,7 @@ static void print_guest_context(void *rip)
 
     if (g_xbox_mem_offset && g_esp) {
         const uint32_t *sp =
-            (const uint32_t *)((uintptr_t)g_xbox_mem_offset + g_esp);
+            (const uint32_t *)((uintptr_t)g_xbox_mem_offset + XBOX_FOLD(g_esp));
         int shown = 0, i;
         fprintf(stderr, "  guest stack (return addresses, innermost first):\n");
         for (i = 0; i < 256 && shown < 24; i++) {
@@ -279,7 +280,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
 
         /* NV2A interrupt registers (PMC, PTIMER, PCRTC) -> nv2a_irq.c. */
         {
-            uint32_t va = (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+            uint32_t va = XBOX_UNFOLD(fault_addr - (uintptr_t)g_xbox_mem_offset);
             if (xbox_Nv2aIrqOwns(va) && xbox_Nv2aIrqHandleMmio(ep->ContextRecord, va))
                 return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -290,7 +291,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         {
             extern int xbox_OhciOwnsAddress(uint32_t xbox_va);
             extern int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va);
-            uint32_t va = (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+            uint32_t va = XBOX_UNFOLD(fault_addr - (uintptr_t)g_xbox_mem_offset);
             if (xbox_OhciOwnsAddress(va) && xbox_OhciHandleMmio(ep->ContextRecord, va))
                 return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -304,7 +305,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
          * over, so execution resumes instead of unwinding. */
         {
             uint32_t xbox_va =
-                (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+                XBOX_UNFOLD(fault_addr - (uintptr_t)g_xbox_mem_offset);
 
             if (xbox_va >= APU_TRAP_BASE && xbox_va < APU_TRAP_END
                     && apu_hook_handle_mmio(
@@ -324,7 +325,7 @@ static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
         fprintf(stderr, "  Xbox regs: ebx=0x%08X esi=0x%08X edi=0x%08X\n",
             g_ebx, g_esi, g_edi);
         fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
-            (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+            XBOX_UNFOLD(fault_addr - (uintptr_t)g_xbox_mem_offset));
         print_guest_context((void *)CONTEXT_PC(ep->ContextRecord));
         xbox_PeekSample("crash peek");
 
@@ -381,20 +382,20 @@ static void *padwatch_thread(void *unused)
         usleep(500000);
         {
             static uint32_t last_dev, last_sig;
-            uint32_t dev = *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x00375418u);
-            uint32_t sig = dev ? *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + dev + 0x1DC0u) : 0;
-            uint32_t hdr = dev ? *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + dev + 0x1DBCu) : 0;
+            uint32_t dev = *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + XBOX_FOLD(0x00375418u));
+            uint32_t sig = dev ? *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + XBOX_FOLD(dev + 0x1DC0u)) : 0;
+            uint32_t hdr = dev ? *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + XBOX_FOLD(dev + 0x1DBCu)) : 0;
             if (dev != last_dev || sig != last_sig) {
                 fprintf(stderr, "[PADWATCH] d3d device=%08X vblank event %08X hdr=%08X signal=%u\n",
                         dev, dev + 0x1DBCu, hdr, sig);
                 last_dev = dev; last_sig = sig;
             }
         }
-        base = *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + 0x0041D8E8u);
+        base = *(volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + XBOX_FOLD(0x0041D8E8u));
         if (!base || base >= 0x04000000u) continue;
         for (i = 0; i < 4; i++) {
             const volatile uint32_t *p =
-                (const volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + base + i * 0x10Cu);
+                (const volatile uint32_t *)((uintptr_t)g_xbox_mem_offset + XBOX_FOLD(base + i * 0x10Cu));
             uint32_t h = p[0], btn = p[2] & 0xFFFF, cur = p[0xB8 / 4];
             if (h != last[i][0] || btn != last[i][1] || cur != last[i][2]) {
                 fprintf(stderr, "[PADWATCH] slot %u handle=%08X pkt=%u xbtn=%04X "
@@ -656,7 +657,14 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
     /* Step 4: Set game directory for file I/O path translation */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
+#ifdef __SWITCH__
+        /* Absolute: libnx's mkdir crashes on a relative path (it resolves
+         * those itself, and fails to), where open copes. */
+        extern char g_switch_game_dir[];
+        xbox_path_init(g_switch_game_dir, NULL);
+#else
         xbox_path_init(YOUR_GAME_DIR, NULL);
+#endif
     }
 
     /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
@@ -955,6 +963,7 @@ int SDL_main(int argc, char **argv)
 #include <switch/types.h>
 #include <switch/result.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <errno.h>
 
 /* Switch homebrew: hbloader starts rsc2.nro with argv[0] its path on the SD
@@ -973,9 +982,14 @@ Result socketInitialize(const void *config);
 void socketExit(void);
 int nxlinkConnectToHost(bool redir_stdout, bool redir_stderr);
 
+char g_switch_game_dir[600] = "/switch/rsc2/game";
+
 static void switch_setup(int argc, char **argv)
 {
-    char base[512] = "sdmc:/switch/rsc2", p[600];
+    /* Without the "sdmc:" device prefix: the SD card is libnx's default
+     * device, and the POSIX path code (kernel_path.c) takes an absolute path
+     * to start with '/'. */
+    char base[512] = "/switch/rsc2", p[600];
     static const char *const xdg[][2] = {
         { "XDG_CONFIG_HOME", "config" },
         { "XDG_DATA_HOME",   "data"   },
@@ -986,12 +1000,13 @@ static void switch_setup(int argc, char **argv)
 
     if (argc > 0 && argv[0] && strncmp(argv[0], "sdmc:/", 6) == 0) {
         char *slash;
-        snprintf(base, sizeof base, "%s", argv[0]);
+        snprintf(base, sizeof base, "%s", argv[0] + 5);
         slash = strrchr(base, '/');
-        if (slash && slash > base + 5)
+        if (slash && slash > base)
             *slash = 0;
     }
     mkdir(base, 0755);
+    snprintf(g_switch_game_dir, sizeof g_switch_game_dir, "%s/game", base);
     if (chdir(base) != 0)
         fprintf(stderr, "[SWITCH] cannot enter %s: %s\n", base, strerror(errno));
     if (R_SUCCEEDED(socketInitialize(NULL))) {
@@ -1000,8 +1015,14 @@ static void switch_setup(int argc, char **argv)
             socketExit();
     }
     if (!nxlink) {
-        freopen("rsc2.log", "w", stderr);
-        freopen("rsc2.log", "a", stdout);
+        /* The descriptors, not the FILEs: newlib gives each thread its own
+         * stdout/stderr, which write to descriptors 1 and 2. */
+        int lfd = open("rsc2.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (lfd >= 0) {
+            dup2(lfd, 1);
+            dup2(lfd, 2);
+            close(lfd);
+        }
     }
     fprintf(stderr, "[SWITCH] files in %s; game data expected in %s/game\n", base, base);
     setenv("HOME", base, 0);

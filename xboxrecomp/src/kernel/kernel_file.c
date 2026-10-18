@@ -25,6 +25,10 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#if defined(__SWITCH__)
+/* A directory's stand-in descriptor (see xbox_NtCreateFile): no real one. */
+#define NX_DIR_FD 0x3FFF0000
+#endif
 #include <dirent.h>
 #include <fnmatch.h>
 #endif
@@ -897,6 +901,17 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     } else {
         fd = open(host_path, posix_open_flags(DesiredAccess, CreateDisposition), 0644);
     }
+#if defined(__SWITCH__)
+    /* libnx cannot open() a directory, which Linux does read-only. Such a
+     * handle gets a descriptor that is no file (reads fail, as they do on a
+     * directory) and keeps its path, which the directory listing and the
+     * information queries below use. */
+    if (fd < 0) {
+        struct stat dst;
+        if (stat(host_path, &dst) == 0 && S_ISDIR(dst.st_mode))
+            fd = NX_DIR_FD;
+    }
+#endif
 
     if (fd < 0) {
         int e = errno;
@@ -1021,7 +1036,11 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
 
     struct stat st;
     if (FileInformationClass != XboxFilePositionInformation) {
-        if (fstat(fd, &st) != 0)
+        if (fstat(fd, &st) != 0
+#if defined(__SWITCH__)
+                && !(w32_handle_path(FileHandle) && stat(w32_handle_path(FileHandle), &st) == 0)
+#endif
+                )
             return STATUS_UNSUCCESSFUL;
     }
 

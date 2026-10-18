@@ -235,7 +235,7 @@ static void snap_write_to(const char *which, uint32_t snap_va, const char *dirp)
     for (i = 0; i < n; i++) {
         fwrite(&regions[i].va, 4, 1, f);
         fwrite(&regions[i].size, 4, 1, f);
-        fwrite((const void *)((uintptr_t)regions[i].va + xbox_GetMemoryOffset()),
+        fwrite((const void *)((uintptr_t)XBOX_FOLD(regions[i].va) + xbox_GetMemoryOffset()),
                1, regions[i].size, f);
     }
     fclose(f);
@@ -449,9 +449,9 @@ static void tt_hdr(uint32_t kind, uint32_t n, uint32_t extra)
 static void tt_entry(const uint8_t *m, uint32_t rec, uint32_t type)
 {
     struct { uint32_t inst; float dist, w; uint8_t lod, type; uint16_t pad; } e;
-    e.inst = *(const uint32_t *)(m + rec);
-    memcpy(&e.dist, m + rec + 4, 4);
-    memcpy(&e.w, m + rec + 0x14, 4);
+    e.inst = *(const uint32_t *)(m + XBOX_FOLD(rec));
+    memcpy(&e.dist, m + XBOX_FOLD(rec + 4), 4);
+    memcpy(&e.w, m + XBOX_FOLD(rec + 0x14), 4);
     e.lod = m[rec + 8];
     e.type = (uint8_t)type;
     e.pad = (uint16_t)(m[rec + 0x12] | m[rec + 9] << 8);   /* byte 0x12, byte 9 */
@@ -476,7 +476,7 @@ static void tree_trace(uint32_t va)
         fprintf(stderr, "[TREETRACE] mark %d\n", marks);
     }
     if (va == 0x0010F0D0u) {
-        const uint32_t *sp = (const uint32_t *)(m + g_esp);
+        const uint32_t *sp = (const uint32_t *)(m + XBOX_FOLD(g_esp));
         if (sp[0] != 0x002743D1u)            /* only sub_00273E70's call */
             return;
         s_tt_out = sp[6];       /* records: the renderer object's +0x10 */
@@ -485,10 +485,10 @@ static void tree_trace(uint32_t va)
         s_tt_cnt = sp[5];
         s_tt_obj = g_esi;       /* sub_00273E70 keeps the count at esi+0xc */
     } else if (va == 0x00273360u && s_tt_cnt) {
-        uint32_t n = *(const uint32_t *)(m + s_tt_obj + 0xC), i;
+        uint32_t n = *(const uint32_t *)(m + XBOX_FOLD(s_tt_obj + 0xC)), i;
         tt_hdr(3, 0, s_tt_a3);
         tt_hdr(4, 0, s_tt_a4);
-        tt_hdr(1, n > 4096 ? 4096 : n, *(const uint32_t *)(m + s_tt_cnt));
+        tt_hdr(1, n > 4096 ? 4096 : n, *(const uint32_t *)(m + XBOX_FOLD(s_tt_cnt)));
         for (i = 0; i < n && i < 4096; i++)
             tt_entry(m, s_tt_out + 24 * i, 0);
         {
@@ -497,7 +497,7 @@ static void tree_trace(uint32_t va)
             static const uint32_t lists[4] = { 0x22A60u, 0x2125Cu, 0x1B258u, 0x12254u };
             int l;
             for (l = 0; l < 4; l++) {
-                uint32_t base = s_tt_obj + lists[l], c = *(const uint32_t *)(m + base - 4);
+                uint32_t base = s_tt_obj + lists[l], c = *(const uint32_t *)(m + XBOX_FOLD(base - 4));
                 if (c > 4096)
                     c = 0;
                 tt_hdr(5 + (uint32_t)l, c, lists[l]);
@@ -507,19 +507,19 @@ static void tree_trace(uint32_t va)
         }
         s_tt_cnt = 0;
     } else if (va == 0x00273890u) {
-        uint32_t obj = g_eax, nb = *(const uint32_t *)(m + obj + 8), i, total = 0;
+        uint32_t obj = g_eax, nb = *(const uint32_t *)(m + XBOX_FOLD(obj + 8)), i, total = 0;
         for (i = 0; i < nb && i < 256; i++) {
             uint32_t b = obj + 24 * i + 24;
-            uint32_t beg = *(const uint32_t *)(m + b), end = *(const uint32_t *)(m + b + 4);
+            uint32_t beg = *(const uint32_t *)(m + XBOX_FOLD(b)), end = *(const uint32_t *)(m + XBOX_FOLD(b + 4));
             if (beg && end > beg)
                 total += (end - beg) / 12;
         }
         tt_hdr(2, total, obj);
         for (i = 0; i < nb && i < 256; i++) {
             uint32_t b = obj + 24 * i + 24, it;
-            uint32_t beg = *(const uint32_t *)(m + b), end = *(const uint32_t *)(m + b + 4);
+            uint32_t beg = *(const uint32_t *)(m + XBOX_FOLD(b)), end = *(const uint32_t *)(m + XBOX_FOLD(b + 4));
             for (it = beg; beg && it + 12 <= end; it += 12)
-                tt_entry(m, *(const uint32_t *)(m + it), *(const uint32_t *)(m + it + 4));
+                tt_entry(m, *(const uint32_t *)(m + XBOX_FOLD(it)), *(const uint32_t *)(m + XBOX_FOLD(it + 4)));
         }
         fflush(s_tt);
     }
@@ -543,7 +543,7 @@ static void tt_pb_scan(const uint8_t *m, uint32_t a, uint32_t b, uint32_t *draws
 {
     *draws = *jumps = 0;
     while (a + 4 <= b) {
-        uint32_t h = *(const uint32_t *)(m + a), n, meth, k;
+        uint32_t h = *(const uint32_t *)(m + XBOX_FOLD(a)), n, meth, k;
         if ((h & 0xE0000003u) == 0x20000000u || (h & 3u) == 1u || (h & 3u) == 2u || h == 0x00020000u) {
             (*jumps)++;
             a += 4;
@@ -553,7 +553,7 @@ static void tt_pb_scan(const uint8_t *m, uint32_t a, uint32_t b, uint32_t *draws
         meth = h & 0x1FFCu;
         for (k = 0; k < n && a + 8 + 4 * k <= b; k++) {
             uint32_t mm = (h & 0x40000000u) ? meth : meth + 4 * k;
-            if (mm == 0x17FCu && *(const uint32_t *)(m + a + 4 + 4 * k) != 0)
+            if (mm == 0x17FCu && *(const uint32_t *)(m + XBOX_FOLD(a + 4 + 4 * k)) != 0)
                 (*draws)++;
         }
         a += 4 + 4 * n;
@@ -574,14 +574,14 @@ static void tree_trace_range(const uint8_t *m, uint32_t va, int is_exit)
             continue;
         if (!is_exit) {
             if (s_tt_rdep[i] < 4)
-                s_tt_rput[i][s_tt_rdep[i]] = *(const uint32_t *)(m + 0x372F70u);
+                s_tt_rput[i][s_tt_rdep[i]] = *(const uint32_t *)(m + XBOX_FOLD(0x372F70u));
             s_tt_rdep[i]++;
         } else if (s_tt_rdep[i] > 0) {
             uint32_t r[4];
             s_tt_rdep[i]--;
             r[0] = va;
             r[1] = s_tt_rdep[i] < 4 ? s_tt_rput[i][s_tt_rdep[i]] : 0;
-            r[2] = *(const uint32_t *)(m + 0x372F70u);
+            r[2] = *(const uint32_t *)(m + XBOX_FOLD(0x372F70u));
             r[3] = (uint32_t)s_tt_rdep[i];
             tt_hdr(12, 1, va);
             fwrite(r, 4, 4, s_tt);
@@ -596,7 +596,7 @@ static void tree_trace_draw(uint32_t va, int is_exit)
     if (s_tt_on <= 0)
         return;
     m = (const uint8_t *)xbox_GetMemoryOffset();
-    sp = (const uint32_t *)(m + g_esp);
+    sp = (const uint32_t *)(m + XBOX_FOLD(g_esp));
     tree_trace_range(m, va, is_exit);
     if (va == 0x00114C80u && !is_exit) {
         /* kind 13: sub_00114C80's list (ren, count, list, flags), extra =
@@ -609,18 +609,18 @@ static void tree_trace_draw(uint32_t va, int is_exit)
             tt_entry(m, sp[3] + 24 * i, sp[4] & 0xFF);
     }
     if (va == 0x00112530u && !is_exit) {
-        uint32_t ren = sp[1], rec = sp[2], inst = *(const uint32_t *)(m + rec);
-        uint32_t mesh = *(const uint32_t *)(m + inst + 4), fl = *(const uint32_t *)(m + mesh + 4);
+        uint32_t ren = sp[1], rec = sp[2], inst = *(const uint32_t *)(m + XBOX_FOLD(rec));
+        uint32_t mesh = *(const uint32_t *)(m + XBOX_FOLD(inst + 4)), fl = *(const uint32_t *)(m + XBOX_FOLD(mesh + 4));
         float d, t1, t2;
-        memcpy(&d, m + inst + 0x10, 4);
-        memcpy(&t1, m + mesh + 0x2B4, 4);
-        memcpy(&t2, m + mesh + 0x2BC, 4);
+        memcpy(&d, m + XBOX_FOLD(inst + 0x10), 4);
+        memcpy(&t1, m + XBOX_FOLD(mesh + 0x2B4), 4);
+        memcpy(&t2, m + XBOX_FOLD(mesh + 0x2BC), 4);
         if (fl & 0x1000u) {
             s_tt_lod = m[ren + 0x80C8]; s_tt_path = 1;
         } else if (m[mesh + 0x96]) {
             s_tt_lod = m[inst + 0x1D]; s_tt_path = 2;
         } else if (m[ren + 0x80D4]) {
-            s_tt_lod = *(const uint32_t *)(m + mesh + 0x81) - 1; s_tt_path = 3;
+            s_tt_lod = *(const uint32_t *)(m + XBOX_FOLD(mesh + 0x81)) - 1; s_tt_path = 3;
         } else if (t1 > d && m[mesh + 0x2B8]) {
             s_tt_lod = 1; s_tt_path = 4;
         } else if (t2 > d && m[mesh + 0x2C0]) {
@@ -631,10 +631,10 @@ static void tree_trace_draw(uint32_t va, int is_exit)
         s_tt_inst = inst;
         s_tt_mesh = mesh;
         s_tt_dist = d;
-        s_tt_put0 = *(const uint32_t *)(m + 0x372F70u);
+        s_tt_put0 = *(const uint32_t *)(m + XBOX_FOLD(0x372F70u));
     } else if (va == 0x00112530u) {
         struct { uint32_t inst; float dist; uint32_t bytes; uint8_t lod, draws, jumps, flags; } e;
-        uint32_t put = *(const uint32_t *)(m + 0x372F70u), dr = 0, jp = 0;
+        uint32_t put = *(const uint32_t *)(m + XBOX_FOLD(0x372F70u)), dr = 0, jp = 0;
         e.inst = s_tt_inst;
         e.dist = s_tt_dist;
         e.flags = (uint8_t)(s_tt_path << 4);
@@ -655,12 +655,12 @@ static void tree_trace_draw(uint32_t va, int is_exit)
             fwrite(r2, 4, 4, s_tt);
         }
     } else if (va == 0x001101E0u && !is_exit) {
-        uint32_t n = *(const uint32_t *)(m + sp[1] + 0x1F10);
-        s_tt_bput0 = *(const uint32_t *)(m + 0x372F70u);
+        uint32_t n = *(const uint32_t *)(m + XBOX_FOLD(sp[1] + 0x1F10));
+        s_tt_bput0 = *(const uint32_t *)(m + XBOX_FOLD(0x372F70u));
         s_tt_bren = sp[1];      /* the renderer: batch count at +0x1F10 */
         s_tt_bn = n > 1024 ? 0 : n;
     } else if (va == 0x001101E0u) {
-        uint32_t put = *(const uint32_t *)(m + 0x372F70u), dr = 0, jp = 0, n = s_tt_bn, i;
+        uint32_t put = *(const uint32_t *)(m + XBOX_FOLD(0x372F70u)), dr = 0, jp = 0, n = s_tt_bn, i;
         uint32_t ren = s_tt_bren;
         if (put >= s_tt_bput0)
             tt_pb_scan(m, s_tt_bput0, put, &dr, &jp);
@@ -677,7 +677,7 @@ static void tree_trace_draw(uint32_t va, int is_exit)
                 uint32_t a = s_tt_bput0;
                 fprintf(stderr, "[PBDUMP] F%u batch %u items put %08X-%08X\n", nv2a_pb_presented_frames(), n, s_tt_bput0, put);
                 while (a + 4 <= put) {
-                    uint32_t h = *(const uint32_t *)(m + a), c = (h >> 18) & 0x7FFu;
+                    uint32_t h = *(const uint32_t *)(m + XBOX_FOLD(a)), c = (h >> 18) & 0x7FFu;
                     if ((h & 0xE0000003u) == 0x20000000u || (h & 3u) == 1u || (h & 3u) == 2u) {
                         fprintf(stderr, "[PBDUMP]   %08X jump/call %08X\n", a, h);
                         a += 4;
@@ -685,7 +685,7 @@ static void tree_trace_draw(uint32_t va, int is_exit)
                     }
                     if ((h & 0x1FFCu) != 0x1818u || c > 0)
                         fprintf(stderr, "[PBDUMP]   %08X m %04X n %u%s d0 %08X\n", a, h & 0x1FFCu, c,
-                                (h & 0x40000000u) ? " ni" : "", c ? *(const uint32_t *)(m + a + 4) : 0);
+                                (h & 0x40000000u) ? " ni" : "", c ? *(const uint32_t *)(m + XBOX_FOLD(a + 4)) : 0);
                     a += 4 + 4 * c;
                 }
             }
@@ -693,7 +693,7 @@ static void tree_trace_draw(uint32_t va, int is_exit)
         for (i = 0; i < n; i++) {
             struct { uint32_t inst; float dist, w; uint8_t lod, type; uint16_t pad; } e;
             memset(&e, 0, sizeof e);
-            e.inst = *(const uint32_t *)(m + ren + 0x1F14 + 8 * i);
+            e.inst = *(const uint32_t *)(m + XBOX_FOLD(ren + 0x1F14 + 8 * i));
             e.lod = m[ren + 0x1F18 + 8 * i];
             fwrite(&e, sizeof e, 1, s_tt);
         }
@@ -711,20 +711,20 @@ void recomp_trace_enter(const char *name, uint32_t va)
         static int shown;
         const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset();
         if (shown++ < 3) {
-            uint32_t obj = g_eax, n = *(const uint32_t *)(m + obj + 8), i, k;
+            uint32_t obj = g_eax, n = *(const uint32_t *)(m + XBOX_FOLD(obj + 8)), i, k;
             fprintf(stderr, "[BUCKETS] obj %08X n %u\n", obj, n);
             for (i = 0; i < n && i < 12; i++) {
                 uint32_t b = obj + 24 * i + 24;
-                uint32_t beg = *(const uint32_t *)(m + b), end = *(const uint32_t *)(m + b + 4);
+                uint32_t beg = *(const uint32_t *)(m + XBOX_FOLD(b)), end = *(const uint32_t *)(m + XBOX_FOLD(b + 4));
                 fprintf(stderr, "[BUCKETS]  b%u at %08X items %08X..%08X (%u) key %08X\n", i, b, beg, end,
-                        end > beg ? (end - beg) / 12 : 0, *(const uint32_t *)(m + b - 8));
+                        end > beg ? (end - beg) / 12 : 0, *(const uint32_t *)(m + XBOX_FOLD(b - 8)));
                 for (k = 0; beg && k < 3 && beg + k * 12 < end; k++) {
-                    uint32_t it = beg + k * 12, rec = *(const uint32_t *)(m + it);
+                    uint32_t it = beg + k * 12, rec = *(const uint32_t *)(m + XBOX_FOLD(it));
                     float d, w;
-                    memcpy(&d, m + rec + 4, 4);
-                    memcpy(&w, m + rec + 0x14, 4);
+                    memcpy(&d, m + XBOX_FOLD(rec + 4), 4);
+                    memcpy(&w, m + XBOX_FOLD(rec + 0x14), 4);
                     fprintf(stderr, "[BUCKETS]    item %08X rec %08X type %u  rec: inst %08X dist %g weight %g\n",
-                            it, rec, *(const uint32_t *)(m + it + 4), *(const uint32_t *)(m + rec), d, w);
+                            it, rec, *(const uint32_t *)(m + XBOX_FOLD(it + 4)), *(const uint32_t *)(m + XBOX_FOLD(rec)), d, w);
                 }
             }
         }
@@ -752,7 +752,7 @@ void recomp_trace_enter(const char *name, uint32_t va)
     fprintf(stderr, "[TRACE] -> %s (0x%08X)  from=%08X esp=%08X eax=%08X "
             "ecx=%08X esi=%08X edi=%08X ebx=%08X\n",
             name, va,
-            *(const uint32_t *)((uintptr_t)g_esp + xbox_GetMemoryOffset()),
+            *(const uint32_t *)((uintptr_t)XBOX_FOLD(g_esp) + xbox_GetMemoryOffset()),
             g_esp, g_eax, g_ecx, g_esi, g_edi, g_ebx);
 
     /* RECOMP_TRACE_STACK=<n>: the first n values on the guest stack that
@@ -764,7 +764,7 @@ void recomp_trace_enter(const char *name, uint32_t va)
             nstack = e ? atol(e) : 0;
         }
         if (nstack > 0) {
-            const uint32_t *sp = (const uint32_t *)((uintptr_t)g_esp + xbox_GetMemoryOffset());
+            const uint32_t *sp = (const uint32_t *)((uintptr_t)XBOX_FOLD(g_esp) + xbox_GetMemoryOffset());
             int i, shown = 0;
             fprintf(stderr, "         stack:");
             for (i = 1; i < 512 && shown < nstack; i++) {
@@ -790,7 +790,7 @@ void recomp_trace_enter(const char *name, uint32_t va)
         fprintf(stderr, "         args:");
         for (i = 1; i <= n; i++)
             fprintf(stderr, " %d=%08X", i,
-                    *(const uint32_t *)(mem + g_esp + i * 4));
+                    *(const uint32_t *)(mem + XBOX_FOLD(g_esp + i * 4)));
         fprintf(stderr, "\n");
         /* And the object eax points at. A matrix of NaNs says the maths went
          * wrong; whether its inputs were already zero says whether the maths
@@ -800,14 +800,14 @@ void recomp_trace_enter(const char *name, uint32_t va)
          * needs looking at -- the value alone says only that it is wrong. */
         if (getenv("RECOMP_TRACE_DEREF")) {
             for (i = 1; i <= n; i++) {
-                uint32_t a = *(const uint32_t *)(mem + g_esp + i * 4);
+                uint32_t a = *(const uint32_t *)(mem + XBOX_FOLD(g_esp + i * 4));
                 int k;
                 if (a < 0x00010000u || a >= 0x04000000u)
                     continue;
                 fprintf(stderr, "         arg%d -> [%08X]:", i, a);
                 for (k = 0; k < 12; k++)
                     fprintf(stderr, " %08X",
-                            *(const uint32_t *)(mem + a + k * 4));
+                            *(const uint32_t *)(mem + XBOX_FOLD(a + k * 4)));
                 fprintf(stderr, "\n");
             }
         }
@@ -815,7 +815,7 @@ void recomp_trace_enter(const char *name, uint32_t va)
             fprintf(stderr, "         [eax=%08X]:", g_eax);
             for (i = 0; i < 24; i++)
                 fprintf(stderr, " %08X",
-                        *(const uint32_t *)(mem + g_eax + i * 4));
+                        *(const uint32_t *)(mem + XBOX_FOLD(g_eax + i * 4)));
             fprintf(stderr, "\n");
         }
     }
@@ -833,7 +833,7 @@ void recomp_trace_exit(const char *name, uint32_t va)
      * [ebx+0xC], four groups of fifteen settings from offset 0xF8. */
     if (va == 0x0026EF60u && getenv("RECOMP_DUMP_VIEWDIST")) {
         const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
-        uint32_t b = *(const uint32_t *)(mem + g_ebx + 8), e = *(const uint32_t *)(mem + g_ebx + 0xC);
+        uint32_t b = *(const uint32_t *)(mem + XBOX_FOLD(g_ebx + 8)), e = *(const uint32_t *)(mem + XBOX_FOLD(g_ebx + 0xC));
         uint32_t n = e > b ? (e - b) / 0x1E8u : 0, r, g, k;
         fprintf(stderr, "[VIEWDIST] %u records at %08X\n", n, b);
         for (r = 0; r < n && r < 400; r++) {
@@ -841,7 +841,7 @@ void recomp_trace_exit(const char *name, uint32_t va)
                 fprintf(stderr, "[VIEWDIST] r%u g%u", r, g);
                 for (k = 0; k < 15; k++) {
                     float f;
-                    memcpy(&f, mem + b + r * 0x1E8u + 0xF8u + (g * 15u + k) * 4u, 4);
+                    memcpy(&f, mem + XBOX_FOLD(b + r * 0x1E8u + 0xF8u + (g * 15u + k) * 4u), 4);
                     fprintf(stderr, " %g", f);
                 }
                 fputc('\n', stderr);
@@ -905,13 +905,13 @@ void recomp_debug_service(uint32_t service, uint32_t arg_va)
     /* ANSI_STRING { USHORT Length; USHORT MaximumLength; PCHAR Buffer; } */
     if (!arg_va)
         return;
-    length    = *(const uint16_t *)(mem + arg_va);
-    buffer_va = *(const uint32_t *)(mem + arg_va + 4);
+    length    = *(const uint16_t *)(mem + XBOX_FOLD(arg_va));
+    buffer_va = *(const uint32_t *)(mem + XBOX_FOLD(arg_va + 4));
     if (!buffer_va || !length)
         return;
 
-    fprintf(stderr, "[GUEST] %.*s", (int)length, (const char *)(mem + buffer_va));
-    if (length && ((const char *)(mem + buffer_va))[length - 1] != '\n')
+    fprintf(stderr, "[GUEST] %.*s", (int)length, (const char *)(mem + XBOX_FOLD(buffer_va)));
+    if (length && ((const char *)(mem + XBOX_FOLD(buffer_va)))[length - 1] != '\n')
         fputc('\n', stderr);
     fflush(stderr);
 }

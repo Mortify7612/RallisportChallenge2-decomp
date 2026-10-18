@@ -46,6 +46,15 @@ if(ANDROID)
     set(SDL2_DIR "${CMAKE_CURRENT_SOURCE_DIR}/cmake/android" CACHE PATH "" FORCE)
 endif()
 
+# XBOX_FOLD_HIGH (platform/guest_addr.h): the top half of the guest space
+# folded into the second quarter, for a host that cannot reserve 4 GB where
+# it likes -- the Switch. RSC2_FOLD_HIGH=ON tries it on another host. For the
+# generated code and the toolkit alike, so before both.
+option(RSC2_FOLD_HIGH "Fold the guest's high address half (always on the Switch)" OFF)
+if(NINTENDO_SWITCH OR RSC2_FOLD_HIGH)
+    add_compile_definitions(XBOX_FOLD_HIGH=1)
+endif()
+
 # Add xboxrecomp as a subdirectory -- this builds all 6 runtime libraries
 # and provides the 'xboxrecomp' umbrella target to link against.
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)

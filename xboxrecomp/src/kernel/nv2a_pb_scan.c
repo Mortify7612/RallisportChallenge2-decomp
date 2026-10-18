@@ -20,6 +20,7 @@
  * For a method header: count = (w >> 18) & 0x7FF, subchannel = (w >> 13) & 7,
  * method = w & 0x1FFC.
  */
+#include "platform/guest_addr.h"   /* XBOX_FOLD */
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>   /* ptrdiff_t */
@@ -180,7 +181,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
     uint32_t words = 0;
 
     while (va < end_va && words < 0x100000u) {
-        uint32_t w = *(const uint32_t *)(mem + va);
+        uint32_t w = *(const uint32_t *)(mem + XBOX_FOLD(va));
         va += 4;
         words++;
 
@@ -230,7 +231,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                     n = (end_va - va) / 4;
                 g_nv2a_cmd_va = in_call ? s_call_site : va;
                 done = n ? nv2a_pb_exec_bulk(subch, method, noninc,
-                                             (const uint32_t *)(mem + va), n) : 0;
+                                             (const uint32_t *)(mem + XBOX_FOLD(va)), n) : 0;
                 va += done * 4;
                 words += done;
                 i0 = done;
@@ -245,7 +246,7 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                 g_nv2a_cmd_va = in_call ? s_call_site : va;
                 if (s_exec_enabled)
                     nv2a_pb_exec_method(subch, m,
-                                        *(const uint32_t *)(mem + va));
+                                        *(const uint32_t *)(mem + XBOX_FOLD(va)));
                 va += 4;
                 words++;
             }
