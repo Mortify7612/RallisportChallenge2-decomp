@@ -38,6 +38,7 @@
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "xbox_mmio.h"
 #if !defined(_WIN32)
 #include "../platform/host_backtrace.h"
 #endif
@@ -305,16 +306,20 @@ void xbox_Nv2aIrqInit(void)
     /* On before the pages close: the ack thread checks this to keep its
      * hands off them, and it runs concurrently with this. */
     __atomic_store_n(&s_enabled, 1, __ATOMIC_SEQ_CST);
-    for (i = 0; i < npages; i++) {
+    /* Guest code reaches the pages by direct call (xbox_mmio.c); the page
+     * traps are only for host code that writes them through a pointer, and
+     * only with RECOMP_MMIO_TRAPS=1. */
+    for (i = 0; i < npages; i++)
+        xbox_MmioRegister(NV2A_BASE + pages[i], PAGE, NV2A_BASE, NULL, reg_read, reg_write);
+    for (i = 0; xbox_MmioTraps() && i < npages; i++) {
         void *at = (void *)((uintptr_t)off + XBOX_FOLD(NV2A_BASE + pages[i]));
         DWORD old;
         if (!VirtualProtect(at, PAGE, PAGE_NOACCESS, &old)) {
-            fprintf(stderr, "  NV2A-IRQ: cannot trap page +0x%06X; disabled\n", pages[i]);
+            fprintf(stderr, "  NV2A-IRQ: cannot trap page +0x%06X\n", pages[i]);
             while (--i >= 0)
                 VirtualProtect((void *)((uintptr_t)off + XBOX_FOLD(NV2A_BASE + pages[i])),
                                PAGE, PAGE_READWRITE, &old);
-            __atomic_store_n(&s_enabled, 0, __ATOMIC_SEQ_CST);
-            return;
+            break;
         }
     }
     fprintf(stderr, "  NV2A-IRQ: PMC, PTIMER and PCRTC interrupt registers modelled%s\n",

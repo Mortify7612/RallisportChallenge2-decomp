@@ -21,6 +21,8 @@ set(KERNEL_SOURCES
     kernel_bridge.c
     nv2a_irq.c
     xbox_memory_layout.c
+    xbox_mmio.c
+    nv2a_draw.c
     guest_vmem.c
     icall_feedback.c
     recomp_trace.c
@@ -37,9 +39,15 @@ add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 # Vulkan renderer for the pushbuffer executor (nv2a_vk.c, RECOMP_VULKAN=1).
 # Optional: without the Vulkan headers/loader or glslc, nv2a_vk.c builds as
 # stubs and the software rasteriser is the only renderer.
-find_package(Vulkan QUIET)
-find_program(XBOXRECOMP_GLSLC glslc)
-if(Vulkan_FOUND AND XBOXRECOMP_GLSLC)
+# XBOXRECOMP_NO_VULKAN=ON leaves it out where it would build (for trying
+# the GL renderer on a desktop).
+option(XBOXRECOMP_NO_VULKAN "Build without the Vulkan renderer" OFF)
+if(NOT XBOXRECOMP_NO_VULKAN)
+    find_package(Vulkan QUIET)
+    find_program(XBOXRECOMP_GLSLC glslc)
+endif()
+set(XBOXRECOMP_HAVE_GL OFF CACHE INTERNAL "")
+if(Vulkan_FOUND AND XBOXRECOMP_GLSLC AND NOT XBOXRECOMP_NO_VULKAN)
     set(NV2A_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
     set(NV2A_SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/nv2a_shaders)
     file(MAKE_DIRECTORY ${NV2A_SHADER_OUT})
@@ -100,6 +108,44 @@ if(Vulkan_FOUND AND XBOXRECOMP_GLSLC)
     message(STATUS "xboxrecomp: Vulkan renderer enabled (RECOMP_VULKAN=1)")
 else()
     message(STATUS "xboxrecomp: Vulkan renderer disabled (no Vulkan SDK/glslc)")
+    # The OpenGL 4.5 renderer in its place (nv2a_gl.c): the Switch's, and a
+    # desktop's with XBOXRECOMP_GL=ON. Its GLSL is the Vulkan renderer's,
+    # compiled by the driver at run time, so it needs only the sources.
+    if(NINTENDO_SWITCH)
+        set(_gl_default ON)
+    else()
+        set(_gl_default OFF)
+    endif()
+    option(XBOXRECOMP_GL "OpenGL renderer where there is no Vulkan one" ${_gl_default})
+    if(XBOXRECOMP_GL)
+        set(NV2A_SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/shaders)
+        set(NV2A_SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/nv2a_shaders)
+        file(MAKE_DIRECTORY ${NV2A_SHADER_OUT})
+        foreach(src nv2a.vert nv2a.frag nv2a_common.glsl)
+            string(REPLACE "." "_" sym "${src}")
+            add_custom_command(
+                OUTPUT ${NV2A_SHADER_OUT}/${sym}_src.h
+                COMMAND ${CMAKE_COMMAND} -DIN=${NV2A_SHADER_DIR}/${src}
+                        -DOUT=${NV2A_SHADER_OUT}/${sym}_src.h -DNAME=k_${sym}_src
+                        -P ${NV2A_SHADER_DIR}/embed.cmake
+                DEPENDS ${NV2A_SHADER_DIR}/${src} ${NV2A_SHADER_DIR}/embed.cmake
+                COMMENT "embed ${src}")
+        endforeach()
+        target_sources(xbox_kernel PRIVATE nv2a_gl.c
+            ${NV2A_SHADER_OUT}/nv2a_vert_src.h ${NV2A_SHADER_OUT}/nv2a_frag_src.h
+            ${NV2A_SHADER_OUT}/nv2a_common_glsl_src.h)
+        target_include_directories(xbox_kernel PRIVATE ${NV2A_SHADER_OUT})
+        target_compile_definitions(xbox_kernel PRIVATE XBOXRECOMP_HAVE_GL=1)
+        find_package(SDL2 REQUIRED)
+        target_link_libraries(xbox_kernel PRIVATE SDL2::SDL2)
+        # GL/glcorearb.h: the types and enums (the functions come from SDL).
+        find_path(XBOXRECOMP_GLCOREARB_DIR GL/glcorearb.h REQUIRED)
+        target_include_directories(xbox_kernel PRIVATE ${XBOXRECOMP_GLCOREARB_DIR})
+        message(STATUS "xboxrecomp: OpenGL renderer enabled (RECOMP_VULKAN=1)")
+        set(XBOXRECOMP_HAVE_GL ON CACHE INTERNAL "the GL renderer is built (fb_present.c)")
+    else()
+        set(XBOXRECOMP_HAVE_GL OFF CACHE INTERNAL "")
+    endif()
 endif()
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via

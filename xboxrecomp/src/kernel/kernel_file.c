@@ -16,6 +16,7 @@
 
 #define _GNU_SOURCE   /* FNM_CASEFOLD */
 #include "kernel.h"
+#include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -913,9 +914,34 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 #endif
 
+    if (fd < 0 && !(CreateOptions & XBOX_FILE_DIRECTORY_FILE)) {
+        /* Horizon will not open a file a second time while a handle has it
+         * open for writing; Linux and Windows do. The title copies a disc
+         * archive into its Z: cache and opens the copy again before closing
+         * the first handle. Share that handle's file instead. */
+        int e = errno;
+        HANDLE other = w32_handle_find_path(host_path);
+        HANDLE h = other ? w32_handle_share(other) : NULL;
+        if (h) {
+            fprintf(stderr, "  [FILE] %s: open failed (errno %d), sharing the handle already"
+                    " open on it\n", host_path, e);
+            *FileHandle = h;
+            if (IoStatusBlock) {
+                IoStatusBlock->Status = STATUS_SUCCESS;
+                IoStatusBlock->Information = 1;
+            }
+            return STATUS_SUCCESS;
+        }
+        errno = e;
+    }
     if (fd < 0) {
         int e = errno;
         XBOX_TRACE(XBOX_LOG_FILE, "NtCreateFile FAILED: %s (errno=%d)", host_path, e);
+#if defined(__SWITCH__)
+        fprintf(stderr, "  [FILE] open %s failed: errno %d (access %08X disposition %u"
+                " options %08X share %X)\n", host_path, e, (unsigned)DesiredAccess,
+                (unsigned)CreateDisposition, (unsigned)CreateOptions, (unsigned)ShareAccess);
+#endif
         if (IoStatusBlock) {
             IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
             IoStatusBlock->Information = 0;
@@ -947,10 +973,15 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_INVALID_HANDLE;
     }
 
+    long long *vpos = w32_handle_vpos(FileHandle);   /* sharing its descriptor */
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+    else if (vpos)
+        lseek(fd, (off_t)*vpos, SEEK_SET);
 
     ssize_t n = read(fd, Buffer, Length);
+    if (vpos)
+        *vpos = (long long)lseek(fd, 0, SEEK_CUR);
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtReadFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -983,10 +1014,15 @@ NTSTATUS __stdcall xbox_NtWriteFile(
         return STATUS_INVALID_HANDLE;
     }
 
+    long long *vpos = w32_handle_vpos(FileHandle);   /* sharing its descriptor */
     if (ByteOffset && ByteOffset->QuadPart >= 0)
         lseek(fd, (off_t)ByteOffset->QuadPart, SEEK_SET);
+    else if (vpos)
+        lseek(fd, (off_t)*vpos, SEEK_SET);
 
     ssize_t n = write(fd, Buffer, Length);
+    if (vpos)
+        *vpos = (long long)lseek(fd, 0, SEEK_CUR);
     if (n < 0) {
         XBOX_TRACE(XBOX_LOG_FILE, "NtWriteFile(handle=%p) errno=%d", FileHandle, errno);
         IoStatusBlock->Status = STATUS_UNSUCCESSFUL;
@@ -1069,7 +1105,8 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
         }
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
-            off_t pos = lseek(fd, 0, SEEK_CUR);
+            long long *vpos = w32_handle_vpos(FileHandle);
+            off_t pos = vpos ? (off_t)*vpos : lseek(fd, 0, SEEK_CUR);
             if (pos < 0) return STATUS_UNSUCCESSFUL;
             info->CurrentByteOffset.QuadPart = pos;
             IoStatusBlock->Status = STATUS_SUCCESS;
@@ -1111,8 +1148,11 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
     switch (FileInformationClass) {
         case XboxFilePositionInformation: {
             PXBOX_FILE_POSITION_INFORMATION info = (PXBOX_FILE_POSITION_INFORMATION)FileInformation;
+            long long *vpos = w32_handle_vpos(FileHandle);
             if (lseek(fd, (off_t)info->CurrentByteOffset.QuadPart, SEEK_SET) < 0)
                 return STATUS_UNSUCCESSFUL;
+            if (vpos)
+                *vpos = info->CurrentByteOffset.QuadPart;
             IoStatusBlock->Status = STATUS_SUCCESS;
             return STATUS_SUCCESS;
         }
@@ -1178,10 +1218,26 @@ NTSTATUS xbox_RenameOpenFile(HANDLE FileHandle, const xbox_host_char *new_host_p
         return STATUS_INVALID_HANDLE;
     if (!ReplaceIfExists && stat(new_host_path, &st) == 0)
         return STATUS_OBJECT_NAME_COLLISION;
-    if (rename(old, new_host_path) != 0) {
+    /* RECOMP_RENAME_REOPEN=1: always take the reopening path below, to test
+     * it on a host that can rename open files. */
+    static int reopen = -1;
+    if (reopen < 0) {
+        const char *env = getenv("RECOMP_RENAME_REOPEN");
+        reopen = env && strcmp(env, "1") == 0;
+    }
+    if (reopen || rename(old, new_host_path) != 0) {
+        int e = reopen ? EIO : errno;
+        /* Horizon will not rename a file while it is open, and the title
+         * renames its Z: cache copy through the handle it wrote it with. */
+        if (e != ENOENT && w32_handle_rename_open(old, new_host_path) == 0) {
+            /* `old` was the handle's path, freed by now */
+            fprintf(stderr, "  [FILE] renamed to %s by reopening its handles\n",
+                    new_host_path);
+            return STATUS_SUCCESS;
+        }
         fprintf(stderr, "  [FILE] rename %s -> %s failed: %s\n",
-                old, new_host_path, strerror(errno));
-        return errno == ENOENT ? STATUS_OBJECT_PATH_NOT_FOUND : STATUS_UNSUCCESSFUL;
+                old, new_host_path, strerror(e));
+        return e == ENOENT ? STATUS_OBJECT_PATH_NOT_FOUND : STATUS_UNSUCCESSFUL;
     }
     w32_handle_set_path(FileHandle, new_host_path);
     return STATUS_SUCCESS;

@@ -20,6 +20,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <strings.h>
 #include <stdio.h>
 #include <time.h>
@@ -309,6 +310,12 @@ typedef struct w32_object {
     int             fd;
     SIZE_T          map_size;
     char           *file_path;
+    /* Sharing a descriptor with another handle (w32_handle_share): this
+     * handle's own file position, set before and read after each access,
+     * and the handle that owns the descriptor (held open by this one). */
+    int             shared;
+    long long       vpos;
+    struct w32_object *share_of;
 } w32_object;
 
 /* pseudo handles for "current thread"/"current process" */
@@ -430,7 +437,10 @@ static void obj_release(w32_object *o)
     if (InterlockedDecrement(&o->refcount) > 0)
         return;
     if (o->kind == K_FILE) {
-        if (o->fd >= 0) close(o->fd);
+        if (o->share_of)
+            obj_release(o->share_of);
+        else if (o->fd >= 0)
+            close(o->fd);
         free(o->file_path);
     } else if (o->kind == K_FILEMAP) {
         if (o->fd >= 0) close(o->fd);
@@ -457,6 +467,114 @@ int w32_handle_fd(HANDLE h)
 {
     w32_object *o = obj_of(h);
     return (o && o->kind == K_FILE) ? o->fd : -1;
+}
+
+/* A live file handle open on host_path, or NULL. */
+HANDLE w32_handle_find_path(const char *host_path)
+{
+    HANDLE found = NULL;
+    size_t i;
+    pthread_mutex_lock(&s_live_lock);
+    for (i = 0; i < W32_LIVE_SIZE && !found; i++) {
+        w32_object *o = s_live[i];
+        if (o && o != W32_LIVE_DEAD && o->kind == K_FILE && o->fd >= 0 && o->file_path
+                && strcmp(o->file_path, host_path) == 0)
+            found = (HANDLE)o;
+    }
+    pthread_mutex_unlock(&s_live_lock);
+    return found;
+}
+
+/* A second handle on `h`'s open file, for a host whose file system will not
+ * open a file twice while it is open for writing (Horizon), on the same
+ * descriptor (libnx has no dup). The two would share one position, so from
+ * now on each keeps its own (w32_handle_vpos). NULL on failure. */
+HANDLE w32_handle_share(HANDLE h)
+{
+    w32_object *o = obj_of(h), *n;
+    if (!o || o->kind != K_FILE || o->fd < 0)
+        return NULL;
+    if (o->share_of)
+        o = o->share_of;
+    if (!o->shared) {
+        o->vpos = (long long)lseek(o->fd, 0, SEEK_CUR);
+        o->shared = 1;
+    }
+    InterlockedIncrement(&o->refcount);
+    n = obj_of(w32_open_handle(o->fd, o->file_path));
+    n->shared = 1;
+    n->vpos = 0;
+    n->share_of = o;
+    return (HANDLE)n;
+}
+
+/* Rename a file that handles have open, for a host that will not rename an
+ * open file (Horizon: EIO): close every descriptor on it, rename, and open
+ * the new name again in their place at the same positions. 0 on success;
+ * on failure the handles are left as they were (on old_path) and errno says
+ * why. */
+int w32_handle_rename_open(const char *old_path, const char *new_path)
+{
+    enum { MAX_OWN = 16 };
+    w32_object *own[MAX_OWN];
+    off_t pos[MAX_OWN];
+    int n = 0, i, rc, e = 0;
+    size_t k;
+    const char *path;
+    char *old = strdup(old_path), *nw = strdup(new_path);
+
+    if (!old || !nw) {
+        free(old); free(nw);
+        errno = ENOMEM;
+        return -1;
+    }
+    pthread_mutex_lock(&s_live_lock);
+    for (k = 0; k < W32_LIVE_SIZE && n < MAX_OWN; k++) {
+        w32_object *o = s_live[k];
+        if (o && o != W32_LIVE_DEAD && o->kind == K_FILE && !o->share_of && o->fd >= 0
+                && o->file_path && strcmp(o->file_path, old) == 0)
+            own[n++] = o;
+    }
+    for (i = 0; i < n; i++) {
+        pos[i] = lseek(own[i]->fd, 0, SEEK_CUR);
+        close(own[i]->fd);
+    }
+    rc = rename(old, nw);
+    if (rc != 0)
+        e = errno;
+    path = rc == 0 ? nw : old;
+    for (i = 0; i < n; i++) {
+        int fd = open(path, O_RDWR);
+        if (fd < 0)
+            fd = open(path, O_RDONLY);
+        if (fd >= 0 && pos[i] > 0)
+            lseek(fd, pos[i], SEEK_SET);
+        for (k = 0; k < W32_LIVE_SIZE; k++) {
+            w32_object *o = s_live[k];
+            if (o && o != W32_LIVE_DEAD && (o == own[i] || o->share_of == own[i])) {
+                o->fd = fd;
+                if (rc == 0) {
+                    free(o->file_path);
+                    o->file_path = strdup(nw);
+                }
+            }
+        }
+        if (fd < 0)
+            fprintf(stderr, "  [FILE] %s: could not reopen after the rename: %s\n",
+                    path, strerror(errno));
+    }
+    pthread_mutex_unlock(&s_live_lock);
+    free(old); free(nw);
+    if (rc != 0)
+        errno = e;
+    return rc;
+}
+
+/* Its own position, for a handle sharing a descriptor; NULL otherwise. */
+long long *w32_handle_vpos(HANDLE h)
+{
+    w32_object *o = obj_of(h);
+    return o && o->kind == K_FILE && o->shared ? &o->vpos : NULL;
 }
 
 const char *w32_handle_path(HANDLE h)

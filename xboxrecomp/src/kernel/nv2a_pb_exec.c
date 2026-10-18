@@ -4344,12 +4344,15 @@ static double flip_now_s(void)
 
 static void flip_pace(void)
 {
-    static double hz = -1.0, next;
-    double now, period;
-    if (hz < 0.0) {
+    static double env_hz = -2.0, next;
+    double now, period, hz;
+    if (env_hz < -1.0) {
         const char *e = getenv("RECOMP_FLIP_HZ");
-        hz = e ? atof(e) : (nv2a_vk_active() ? 60.0 : 0.0);
+        env_hz = e ? atof(e) : -1.0;
     }
+    /* Not cached: a GPU renderer may come up a few frames in (GL waits for
+     * its window). */
+    hz = env_hz >= 0.0 ? env_hz : (nv2a_vk_active() ? 60.0 : 0.0);
     if (hz <= 0.0)
         return;
     period = 1.0 / hz;

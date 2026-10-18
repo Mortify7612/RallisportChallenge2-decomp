@@ -1,0 +1,1550 @@
+/*
+ * nv2a_gl.c - the NV2A on a host GPU through OpenGL 4.3 core (with
+ * ARB_clip_control).
+ *
+ * The same entry points as the Vulkan renderer (nv2a_vk.h), for hosts
+ * without Vulkan: the Switch's homebrew Mesa (nouveau, through EGL) above
+ * all. A build has one or the other -- XBOXRECOMP_HAVE_GL without
+ * XBOXRECOMP_HAVE_VULKAN compiles this file and leaves nv2a_vk.c empty.
+ *
+ * Shared with the Vulkan renderer: the shaders (shaders/nv2a.vert,
+ * nv2a.frag, nv2a_common.glsl, and title vertex programs translated by
+ * nv2a_vsh_to_glsl around nv2a_draw.c's head and tail), the per-draw
+ * uniform block and its fill (nv2a_draw.c), and the executor's texture
+ * decoder. The GLSL is Vulkan's, made GL's on the way in: no descriptor
+ * sets, and the 2D and cube samplers on texture units 0-3 and 4-7.
+ *
+ * Coordinates need no flipping: GL's lower-left window origin puts NDC
+ * y = -1 on the first row in memory, as Vulkan's upper-left one does, so
+ * surfaces read back row for row; the depth range is set to Vulkan's 0..1
+ * (glClipControl). The one thing that does flip is facing: Vulkan's area
+ * formula has a minus sign GL's lacks, so the front face is inverted.
+ *
+ * Kept simple for a first version: guest RAM is the truth between frames.
+ * A surface is uploaded from it the first time a frame uses it and copied
+ * back to it at the flip, or as soon as a texture overlapping it is
+ * sampled. Internal resolution is the title's; no MSAA, AO or HDR yet.
+ * Visibility queries are counted with GL occlusion queries, read back when
+ * the title asks.
+ *
+ * The context lives on the executor's thread. With a window
+ * (RECOMP_FB_WINDOW), fb_present.c makes it and hands it over
+ * (nv2a_gl_set_window); without one, a hidden window of our own carries it.
+ */
+#if defined(XBOXRECOMP_HAVE_GL) && !defined(XBOXRECOMP_HAVE_VULKAN)
+
+#include "nv2a_vk.h"
+#include "nv2a_draw.h"
+#include "nv2a_combiner.h"
+#include "nv2a_vsh_interp.h"
+#include "xbox_memory_layout.h"
+
+#include <SDL.h>
+#include <GL/glcorearb.h>
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "nv2a_vert_src.h"
+#include "nv2a_frag_src.h"
+#include "nv2a_common_glsl_src.h"
+
+#include "../d3d/d3d8_swizzle.h"      /* xbox_swizzle_masks, swizzle_deposit */
+extern uint32_t nv2a_pb_presented_frames(void);
+
+/* ---- GL entry points, through SDL ------------------------------------- */
+
+#define GL_FNS(X) \
+    X(PFNGLGETSTRINGPROC, glGetString) \
+    X(PFNGLGETINTEGERVPROC, glGetIntegerv) \
+    X(PFNGLENABLEPROC, glEnable) \
+    X(PFNGLDISABLEPROC, glDisable) \
+    X(PFNGLVIEWPORTPROC, glViewport) \
+    X(PFNGLSCISSORPROC, glScissor) \
+    X(PFNGLCLEARCOLORPROC, glClearColor) \
+    X(PFNGLCLEARDEPTHPROC, glClearDepth) \
+    X(PFNGLCLEARSTENCILPROC, glClearStencil) \
+    X(PFNGLCLEARPROC, glClear) \
+    X(PFNGLCOLORMASKPROC, glColorMask) \
+    X(PFNGLDEPTHMASKPROC, glDepthMask) \
+    X(PFNGLDEPTHFUNCPROC, glDepthFunc) \
+    X(PFNGLSTENCILFUNCPROC, glStencilFunc) \
+    X(PFNGLSTENCILOPPROC, glStencilOp) \
+    X(PFNGLSTENCILMASKPROC, glStencilMask) \
+    X(PFNGLBLENDFUNCPROC, glBlendFunc) \
+    X(PFNGLBLENDEQUATIONPROC, glBlendEquation) \
+    X(PFNGLBLENDCOLORPROC, glBlendColor) \
+    X(PFNGLCULLFACEPROC, glCullFace) \
+    X(PFNGLFRONTFACEPROC, glFrontFace) \
+    X(PFNGLPIXELSTOREIPROC, glPixelStorei) \
+    X(PFNGLREADPIXELSPROC, glReadPixels) \
+    X(PFNGLREADBUFFERPROC, glReadBuffer) \
+    X(PFNGLGENTEXTURESPROC, glGenTextures) \
+    X(PFNGLDELETETEXTURESPROC, glDeleteTextures) \
+    X(PFNGLBINDTEXTUREPROC, glBindTexture) \
+    X(PFNGLTEXIMAGE2DPROC, glTexImage2D) \
+    X(PFNGLTEXSUBIMAGE2DPROC, glTexSubImage2D) \
+    X(PFNGLTEXPARAMETERIPROC, glTexParameteri) \
+    X(PFNGLACTIVETEXTUREPROC, glActiveTexture) \
+    X(PFNGLGENFRAMEBUFFERSPROC, glGenFramebuffers) \
+    X(PFNGLBINDFRAMEBUFFERPROC, glBindFramebuffer) \
+    X(PFNGLFRAMEBUFFERTEXTURE2DPROC, glFramebufferTexture2D) \
+    X(PFNGLFRAMEBUFFERRENDERBUFFERPROC, glFramebufferRenderbuffer) \
+    X(PFNGLCHECKFRAMEBUFFERSTATUSPROC, glCheckFramebufferStatus) \
+    X(PFNGLBLITFRAMEBUFFERPROC, glBlitFramebuffer) \
+    X(PFNGLGENRENDERBUFFERSPROC, glGenRenderbuffers) \
+    X(PFNGLBINDRENDERBUFFERPROC, glBindRenderbuffer) \
+    X(PFNGLRENDERBUFFERSTORAGEPROC, glRenderbufferStorage) \
+    X(PFNGLDELETERENDERBUFFERSPROC, glDeleteRenderbuffers) \
+    X(PFNGLGENBUFFERSPROC, glGenBuffers) \
+    X(PFNGLBINDBUFFERPROC, glBindBuffer) \
+    X(PFNGLBUFFERDATAPROC, glBufferData) \
+    X(PFNGLBUFFERSUBDATAPROC, glBufferSubData) \
+    X(PFNGLBINDBUFFERBASEPROC, glBindBufferBase) \
+    X(PFNGLGENVERTEXARRAYSPROC, glGenVertexArrays) \
+    X(PFNGLBINDVERTEXARRAYPROC, glBindVertexArray) \
+    X(PFNGLENABLEVERTEXATTRIBARRAYPROC, glEnableVertexAttribArray) \
+    X(PFNGLDISABLEVERTEXATTRIBARRAYPROC, glDisableVertexAttribArray) \
+    X(PFNGLVERTEXATTRIBPOINTERPROC, glVertexAttribPointer) \
+    X(PFNGLCREATESHADERPROC, glCreateShader) \
+    X(PFNGLSHADERSOURCEPROC, glShaderSource) \
+    X(PFNGLCOMPILESHADERPROC, glCompileShader) \
+    X(PFNGLGETSHADERIVPROC, glGetShaderiv) \
+    X(PFNGLGETSHADERINFOLOGPROC, glGetShaderInfoLog) \
+    X(PFNGLDELETESHADERPROC, glDeleteShader) \
+    X(PFNGLCREATEPROGRAMPROC, glCreateProgram) \
+    X(PFNGLATTACHSHADERPROC, glAttachShader) \
+    X(PFNGLLINKPROGRAMPROC, glLinkProgram) \
+    X(PFNGLGETPROGRAMIVPROC, glGetProgramiv) \
+    X(PFNGLGETPROGRAMINFOLOGPROC, glGetProgramInfoLog) \
+    X(PFNGLUSEPROGRAMPROC, glUseProgram) \
+    X(PFNGLDRAWELEMENTSPROC, glDrawElements) \
+    X(PFNGLGENSAMPLERSPROC, glGenSamplers) \
+    X(PFNGLSAMPLERPARAMETERIPROC, glSamplerParameteri) \
+    X(PFNGLSAMPLERPARAMETERFPROC, glSamplerParameterf) \
+    X(PFNGLBINDSAMPLERPROC, glBindSampler) \
+    X(PFNGLCLIPCONTROLPROC, glClipControl) \
+    X(PFNGLGENQUERIESPROC, glGenQueries) \
+    X(PFNGLBEGINQUERYPROC, glBeginQuery) \
+    X(PFNGLENDQUERYPROC, glEndQuery) \
+    X(PFNGLGETQUERYOBJECTUIVPROC, glGetQueryObjectuiv) \
+    X(PFNGLMAPBUFFERRANGEPROC, glMapBufferRange) \
+    X(PFNGLUNMAPBUFFERPROC, glUnmapBuffer)
+
+#define GL_DECL(t, n) static t p_##n;
+GL_FNS(GL_DECL)
+#undef GL_DECL
+#define GL_NAME(t, n) n
+/* The program's calls go through the pointers: no link-time GL symbols. */
+#define glGetString p_glGetString
+#define glGetIntegerv p_glGetIntegerv
+#define glEnable p_glEnable
+#define glDisable p_glDisable
+#define glViewport p_glViewport
+#define glScissor p_glScissor
+#define glClearColor p_glClearColor
+#define glClearDepth p_glClearDepth
+#define glClearStencil p_glClearStencil
+#define glClear p_glClear
+#define glColorMask p_glColorMask
+#define glDepthMask p_glDepthMask
+#define glDepthFunc p_glDepthFunc
+#define glStencilFunc p_glStencilFunc
+#define glStencilOp p_glStencilOp
+#define glStencilMask p_glStencilMask
+#define glBlendFunc p_glBlendFunc
+#define glBlendEquation p_glBlendEquation
+#define glBlendColor p_glBlendColor
+#define glCullFace p_glCullFace
+#define glFrontFace p_glFrontFace
+#define glPixelStorei p_glPixelStorei
+#define glReadPixels p_glReadPixels
+#define glReadBuffer p_glReadBuffer
+#define glGenTextures p_glGenTextures
+#define glDeleteTextures p_glDeleteTextures
+#define glBindTexture p_glBindTexture
+#define glTexImage2D p_glTexImage2D
+#define glTexSubImage2D p_glTexSubImage2D
+#define glTexParameteri p_glTexParameteri
+#define glActiveTexture p_glActiveTexture
+#define glGenFramebuffers p_glGenFramebuffers
+#define glBindFramebuffer p_glBindFramebuffer
+#define glFramebufferTexture2D p_glFramebufferTexture2D
+#define glFramebufferRenderbuffer p_glFramebufferRenderbuffer
+#define glCheckFramebufferStatus p_glCheckFramebufferStatus
+#define glBlitFramebuffer p_glBlitFramebuffer
+#define glGenRenderbuffers p_glGenRenderbuffers
+#define glBindRenderbuffer p_glBindRenderbuffer
+#define glRenderbufferStorage p_glRenderbufferStorage
+#define glDeleteRenderbuffers p_glDeleteRenderbuffers
+#define glGenBuffers p_glGenBuffers
+#define glBindBuffer p_glBindBuffer
+#define glBufferData p_glBufferData
+#define glBufferSubData p_glBufferSubData
+#define glBindBufferBase p_glBindBufferBase
+#define glGenVertexArrays p_glGenVertexArrays
+#define glBindVertexArray p_glBindVertexArray
+#define glEnableVertexAttribArray p_glEnableVertexAttribArray
+#define glDisableVertexAttribArray p_glDisableVertexAttribArray
+#define glVertexAttribPointer p_glVertexAttribPointer
+#define glCreateShader p_glCreateShader
+#define glShaderSource p_glShaderSource
+#define glCompileShader p_glCompileShader
+#define glGetShaderiv p_glGetShaderiv
+#define glGetShaderInfoLog p_glGetShaderInfoLog
+#define glDeleteShader p_glDeleteShader
+#define glCreateProgram p_glCreateProgram
+#define glAttachShader p_glAttachShader
+#define glLinkProgram p_glLinkProgram
+#define glGetProgramiv p_glGetProgramiv
+#define glGetProgramInfoLog p_glGetProgramInfoLog
+#define glUseProgram p_glUseProgram
+#define glDrawElements p_glDrawElements
+#define glGenSamplers p_glGenSamplers
+#define glSamplerParameteri p_glSamplerParameteri
+#define glSamplerParameterf p_glSamplerParameterf
+#define glBindSampler p_glBindSampler
+#define glClipControl p_glClipControl
+#define glGenQueries p_glGenQueries
+#define glBeginQuery p_glBeginQuery
+#define glEndQuery p_glEndQuery
+#define glGetQueryObjectuiv p_glGetQueryObjectuiv
+#define glMapBufferRange p_glMapBufferRange
+#define glUnmapBuffer p_glUnmapBuffer
+
+static int gl_load(void)
+{
+    int ok = 1;
+#define GL_LOAD(t, n) \
+    if (!(p_##n = (t)SDL_GL_GetProcAddress(#n))) { \
+        fprintf(stderr, "[GL] missing %s\n", #n); ok = 0; }
+    GL_FNS(GL_LOAD)
+#undef GL_LOAD
+    return ok;
+}
+
+/* ---- state ------------------------------------------------------------- */
+
+#define GL_MAX_SURF  32
+#define GL_MAX_ZETA  8
+#define GL_MAX_TEX   2048
+#define GL_MAX_PROG  1024
+#define GL_MAX_SAMP  256
+#define GL_SURF_H    1024           /* rows of a linear surface, as Vulkan's */
+#define GL_MAX_REPORTS 256
+
+typedef struct {
+    uint32_t va, pitch, bpp, w, h, fmt;
+    int swz;
+    uint32_t *swx, *swy;
+    GLuint tex;
+    int dirty;
+    uint32_t rows;                  /* rows the title uses (max clip bottom) */
+    uint32_t up_epoch;              /* the epoch it last came from guest RAM */
+    uint32_t last_use;
+} GSurf;
+
+typedef struct {
+    uint32_t key, w, h;
+    GLuint rb;
+    uint32_t last_use;
+} GZeta;
+
+typedef struct {
+    int used;
+    Nv2aVkTex d;                    /* the key, sampler fields cleared */
+    uint64_t hash;
+    GLuint tex;
+    uint32_t levels, last_use;
+} GTex;
+
+typedef struct {
+    uint32_t hash;                  /* 0: the CPU-vertex program */
+    GLuint prog;
+    int ninputs, failed;
+    uint8_t inputs[16];
+} GProg;
+
+static struct {
+    int state;                      /* 0 not tried, 1 up, -1 off */
+    SDL_Window *win;
+    SDL_GLContext ctx;
+    int own_win, win_w, win_h;
+    GLuint fbo, rfbo, vao, vbo, ibo, ubo, cbo, pbo;
+    GLuint white2d, whitecube;
+    GSurf surf[GL_MAX_SURF];
+    int nsurf;
+    GZeta zeta[GL_MAX_ZETA];
+    int nzeta;
+    GSurf *cur_cs;
+    GZeta *cur_zs;
+    GTex *tex;
+    GProg prog[GL_MAX_PROG];
+    int nprog;
+    struct { uint64_t key; GLuint s; } samp[GL_MAX_SAMP];
+    int nsamp;
+    uint32_t epoch, frame;
+    uint32_t const_serial, const_epoch;
+    int zpass;
+    GLuint queries[64];
+    int nq;
+    uint64_t rep_acc;               /* samples passed since CLEAR_REPORT_VALUE */
+    uint32_t present_va, present_pitch;
+    uint8_t *rb;                    /* readback scratch */
+    size_t rb_size;
+    /* RECOMP_GL_TRACE: per frame, what became of the draws. */
+    uint32_t st_draws, st_cpu, st_notarget, st_noclip, st_clears, st_tex, st_texfail, st_wb;
+} G;
+
+/* RECOMP_GL_STEPS=<n>: log the first n first-time operations as they start
+ * (a driver or emulator that dies mid-way shows where). */
+static void step(const char *what, uint32_t a, uint32_t b)
+{
+    static int left = -1;
+    if (left < 0)
+        left = getenv("RECOMP_GL_STEPS") ? atoi(getenv("RECOMP_GL_STEPS")) : 0;
+    if (left > 0) {
+        left--;
+        fprintf(stderr, "[GL step] %s %08X %08X\n", what, a, b);
+        fflush(stderr);
+    }
+}
+
+static volatile SDL_Window *s_handed_win;
+static volatile SDL_GLContext s_handed_ctx;
+static volatile int s_win_w, s_win_h;
+
+/* fb_present.c's window thread: its window and the context it made (and
+ * released) for us. */
+void nv2a_gl_set_window(void *win, void *ctx, int w, int h)
+{
+    s_win_w = w;
+    s_win_h = h;
+    s_handed_ctx = (SDL_GLContext)ctx;
+    __atomic_store_n(&s_handed_win, (SDL_Window *)win, __ATOMIC_RELEASE);
+}
+
+/* Whether fb_present.c should make a GL window for us. */
+int nv2a_gl_wanted(void)
+{
+    const char *e = getenv("RECOMP_VULKAN");      /* the GPU renderer, whatever API */
+    return e && *e && strcmp(e, "0") != 0;
+}
+
+static uint8_t *guest(uint32_t va)
+{
+    return (uint8_t *)((uintptr_t)XBOX_FOLD(va) + xbox_GetMemoryOffset());
+}
+
+static uint64_t hash_bytes(const uint8_t *p, size_t n)
+{
+    uint64_t h = 0xcbf29ce484222325ull;
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v;
+        memcpy(&v, p + i, 8);
+        h = (h ^ v) * 0x100000001b3ull;
+        h ^= h >> 29;
+    }
+    for (; i < n; i++)
+        h = (h ^ p[i]) * 0x100000001b3ull;
+    return h;
+}
+
+/* ---- shaders ----------------------------------------------------------- */
+
+/* Vulkan GLSL to GL GLSL: no `set = 0, `; the sampler arrays on units 0-3
+ * (2D) and 4-7 (cube) rather than bindings 1 and 2, which would overlap; the
+ * shared include inlined; gl_VertexIndex is gl_VertexID. */
+static char *gl_source(const char *src, const char *defines)
+{
+    size_t n = strlen(src) + strlen(k_nv2a_common_glsl_src) + strlen(defines) + 256;
+    char *out = (char *)malloc(n), *q = out;
+    const char *p = src;
+    if (!out)
+        return NULL;
+    q += sprintf(q, "#version 430 core\n%s", defines);
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        size_t len = eol ? (size_t)(eol - p) + 1 : strlen(p);
+        if (!strncmp(p, "#version", 8) || !strncmp(p, "#extension", 10)) {
+            /* dropped */
+        } else if (!strncmp(p, "#include", 8)) {
+            q += sprintf(q, "%s\n", k_nv2a_common_glsl_src);
+        } else {
+            memcpy(q, p, len);
+            q += len;
+        }
+        p += len;
+    }
+    *q = 0;
+    /* In place: every substitution shortens or keeps the length. */
+    {
+        static const char *const from[] = {
+            "set = 0, binding = 1) uniform sampler2D", "set = 0, binding = 2) uniform samplerCube",
+            "set = 0, ", "gl_VertexIndex",
+        };
+        static const char *const to[] = {
+            "binding = 0) uniform sampler2D", "binding = 4) uniform samplerCube",
+            "", "gl_VertexID",
+        };
+        size_t k;
+        for (k = 0; k < sizeof from / sizeof from[0]; k++) {
+            char *m;
+            size_t fl = strlen(from[k]), tl = strlen(to[k]);
+            while ((m = strstr(out, from[k])) != NULL) {
+                memcpy(m, to[k], tl);
+                memmove(m + tl, m + fl, strlen(m + fl) + 1);
+            }
+        }
+    }
+    return out;
+}
+
+static GLuint compile(GLenum type, const char *src)
+{
+    GLuint s = glCreateShader(type);
+    GLint ok = 0;
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        glGetShaderInfoLog(s, sizeof log, NULL, log);
+        fprintf(stderr, "[GL] %s shader failed:\n%s\n", type == GL_VERTEX_SHADER ? "vertex"
+                : "fragment", log);
+        if (getenv("RECOMP_GL_SHADER_DUMP"))
+            fprintf(stderr, "%s\n", src);
+        glDeleteShader(s);
+        return 0;
+    }
+    return s;
+}
+
+static GLuint link(const char *vs_src, const char *fs_src)
+{
+    GLuint vs = compile(GL_VERTEX_SHADER, vs_src), fs = vs ? compile(GL_FRAGMENT_SHADER, fs_src) : 0;
+    GLuint p;
+    GLint ok = 0;
+    if (!vs || !fs) {
+        if (vs) glDeleteShader(vs);
+        return 0;
+    }
+    p = glCreateProgram();
+    glAttachShader(p, vs);
+    glAttachShader(p, fs);
+    glLinkProgram(p);
+    glDeleteShader(vs);
+    glDeleteShader(fs);
+    glGetProgramiv(p, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        glGetProgramInfoLog(p, sizeof log, NULL, log);
+        fprintf(stderr, "[GL] link failed:\n%s\n", log);
+        return 0;
+    }
+    return p;
+}
+
+static char *s_frag_gl;             /* nv2a.frag for GL, made once */
+
+static GProg *prog_get(uint32_t hash)
+{
+    int i;
+    GProg *p;
+    for (i = 0; i < G.nprog; i++)
+        if (G.prog[i].hash == hash)
+            return &G.prog[i];
+    if (G.nprog == GL_MAX_PROG)
+        return NULL;
+    p = &G.prog[G.nprog++];
+    memset(p, 0, sizeof *p);
+    p->hash = hash;
+    step("program", hash, 0);
+    if (!s_frag_gl)
+        s_frag_gl = gl_source(k_nv2a_frag_src, "");
+    if (hash == 0) {
+        char *vs = gl_source(k_nv2a_vert_src, "");
+        p->prog = vs && s_frag_gl ? link(vs, s_frag_gl) : 0;
+        p->ninputs = 8;
+        free(vs);
+    } else {
+        static char body[256 * 1024];
+        uint32_t inmask = 0, k, j;
+        char *src, *q, *gl;
+        if (!nv2a_vsh_to_glsl(body, sizeof body, &inmask)) {
+            p->failed = 1;
+            return p;
+        }
+        src = (char *)malloc(strlen(nv2a_prog_head) + strlen(nv2a_prog_main)
+                             + strlen(nv2a_prog_tail) + strlen(body) + 2048);
+        if (!src) {
+            p->failed = 1;
+            return p;
+        }
+        q = src + sprintf(src, "%s", nv2a_prog_head);
+        for (k = 0, j = 0; k < 16; k++)
+            if (inmask & (1u << k)) {
+                q += sprintf(q, "layout(location = %u) in vec4 v%u;\n", j, k);
+                p->inputs[j++] = (uint8_t)k;
+            }
+        p->ninputs = (int)j;
+        sprintf(q, "%s%s%s", nv2a_prog_main, body, nv2a_prog_tail);
+        gl = gl_source(src, "");
+        free(src);
+        p->prog = gl && s_frag_gl ? link(gl, s_frag_gl) : 0;
+        free(gl);
+    }
+    if (!p->prog)
+        p->failed = 1;
+    return p;
+}
+
+/* ---- init -------------------------------------------------------------- */
+
+static GLuint white_tex(GLenum target)
+{
+    static const uint32_t px = 0xFFFFFFFFu;
+    GLuint t;
+    int f;
+    glGenTextures(1, &t);
+    glBindTexture(target, t);
+    if (target == GL_TEXTURE_CUBE_MAP)
+        for (f = 0; f < 6; f++)
+            glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, 0, GL_RGBA8, 1, 1, 0, GL_BGRA,
+                         GL_UNSIGNED_BYTE, &px);
+    else
+        glTexImage2D(target, 0, GL_RGBA8, 1, 1, 0, GL_BGRA, GL_UNSIGNED_BYTE, &px);
+    glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, 0);
+    return t;
+}
+
+static int gl_init(void)
+{
+    SDL_Window *win = (SDL_Window *)__atomic_load_n(&s_handed_win, __ATOMIC_ACQUIRE);
+
+    if (win) {
+        G.win = win;
+        G.ctx = (SDL_GLContext)s_handed_ctx;
+    } else {
+        if (!SDL_WasInit(SDL_INIT_VIDEO) && SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+            fprintf(stderr, "[GL] SDL video: %s\n", SDL_GetError());
+            return 0;
+        }
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+        SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+        G.win = SDL_CreateWindow("rsc2 (GL, hidden)", 0, 0, 64, 64,
+                                 SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+        G.ctx = G.win ? SDL_GL_CreateContext(G.win) : NULL;
+        G.own_win = 1;
+        if (!G.ctx) {
+            fprintf(stderr, "[GL] no context: %s\n", SDL_GetError());
+            return 0;
+        }
+    }
+    if (SDL_GL_MakeCurrent(G.win, G.ctx) != 0) {
+        fprintf(stderr, "[GL] make current: %s\n", SDL_GetError());
+        return 0;
+    }
+    SDL_GL_SetSwapInterval(0);           /* the executor paces the flips */
+    if (!gl_load())
+        return 0;
+    fprintf(stderr, "[GL] %s, %s (%s)\n", (const char *)glGetString(GL_VERSION),
+            (const char *)glGetString(GL_RENDERER), G.own_win ? "offscreen" : "window");
+    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    glEnable(GL_PROGRAM_POINT_SIZE);
+    glEnable(GL_SCISSOR_TEST);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glGenFramebuffers(1, &G.fbo);
+    glGenFramebuffers(1, &G.rfbo);
+    glGenVertexArrays(1, &G.vao);
+    glBindVertexArray(G.vao);
+    glGenBuffers(1, &G.vbo);
+    glGenBuffers(1, &G.ibo);
+    glGenBuffers(1, &G.ubo);
+    glGenBuffers(1, &G.cbo);
+    glGenBuffers(1, &G.pbo);
+    glBindBuffer(GL_UNIFORM_BUFFER, G.ubo);
+    glBufferData(GL_UNIFORM_BUFFER, sizeof(Nv2aVkUbo), NULL, GL_STREAM_DRAW);
+    glBindBuffer(GL_UNIFORM_BUFFER, G.cbo);
+    glBufferData(GL_UNIFORM_BUFFER, NV2A_VSH_CONSTANTS * 16, NULL, GL_DYNAMIC_DRAW);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 0, G.ubo);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 3, G.cbo);
+    G.white2d = white_tex(GL_TEXTURE_2D);
+    G.whitecube = white_tex(GL_TEXTURE_CUBE_MAP);
+    G.tex = (GTex *)calloc(GL_MAX_TEX, sizeof(GTex));
+    glGenQueries(64, G.queries);
+    G.epoch = 1;
+    if (!prog_get(0)->prog) {
+        fprintf(stderr, "[GL] the CPU-vertex program did not build; renderer off\n");
+        return 0;
+    }
+    return 1;
+}
+
+int nv2a_vk_active(void)
+{
+    if (G.state == 0) {
+        if (!nv2a_gl_wanted()) {
+            G.state = -1;
+            return 0;
+        }
+        /* The context is the window's: until fb_present.c has made it (its
+         * thread starts at the title's first clear), not yet -- the frames
+         * before go to the software rasteriser. Without a window, our own. */
+        if (getenv("RECOMP_FB_WINDOW") && *getenv("RECOMP_FB_WINDOW") != '0'
+                && !__atomic_load_n(&s_handed_win, __ATOMIC_ACQUIRE))
+            return 0;
+        G.state = gl_init() ? 1 : -1;
+    }
+    return G.state > 0;
+}
+
+/* ---- surfaces ---------------------------------------------------------- */
+
+static GLenum surf_ifmt(uint32_t bpp, uint32_t color_fmt)
+{
+    if (bpp == 4)
+        return GL_RGBA8;
+    if (bpp == 2)
+        return (color_fmt == 1 || color_fmt == 2) ? GL_RGB5_A1 : GL_RGB565;
+    return 0;
+}
+
+static void surf_pixfmt(const GSurf *s, GLenum *fmt, GLenum *type)
+{
+    if (s->bpp == 4) {
+        *fmt = GL_BGRA;
+        *type = GL_UNSIGNED_INT_8_8_8_8_REV;
+    } else if (s->fmt == GL_RGB5_A1) {
+        *fmt = GL_BGRA;
+        *type = GL_UNSIGNED_SHORT_1_5_5_5_REV;
+    } else {
+        *fmt = GL_RGB;
+        *type = GL_UNSIGNED_SHORT_5_6_5;
+    }
+}
+
+/* Between a linear w-wide image and the surface's swizzled guest bytes. */
+static void surf_swizzle(GSurf *s, uint8_t *g, uint8_t *lin, uint32_t rows, int to_guest)
+{
+    uint32_t x, y;
+    if (!s->swx) {
+        uint32_t mx, my;
+        s->swx = (uint32_t *)malloc(sizeof(uint32_t) * s->w);
+        s->swy = (uint32_t *)malloc(sizeof(uint32_t) * s->h);
+        xbox_swizzle_masks(s->w, s->h, &mx, &my);
+        for (x = 0; x < s->w; x++) s->swx[x] = swizzle_deposit(x, mx);
+        for (y = 0; y < s->h; y++) s->swy[y] = swizzle_deposit(y, my);
+    }
+    for (y = 0; y < rows; y++) {
+        uint8_t *row = lin + (size_t)y * s->w * s->bpp;
+        for (x = 0; x < s->w; x++) {
+            uint32_t gi = s->swy[y] | s->swx[x];
+            if (to_guest)
+                memcpy(g + (size_t)gi * s->bpp, row + (size_t)x * s->bpp, s->bpp);
+            else
+                memcpy(row + (size_t)x * s->bpp, g + (size_t)gi * s->bpp, s->bpp);
+        }
+    }
+}
+
+static size_t surf_bytes(const GSurf *s)
+{
+    return s->swz ? (size_t)s->w * s->h * s->bpp : (size_t)s->rows * s->pitch;
+}
+
+static uint8_t *scratch(size_t n)
+{
+    if (n > G.rb_size) {
+        free(G.rb);
+        G.rb = (uint8_t *)malloc(n);
+        G.rb_size = G.rb ? n : 0;
+    }
+    return G.rb;
+}
+
+/* Guest RAM into the surface's texture (the rows the title uses). */
+static void surf_upload(GSurf *s)
+{
+    uint32_t rows = s->swz ? s->h : (s->rows < s->h ? s->rows : s->h), y;
+    uint8_t *lin;
+    GLenum fmt, type;
+    s->up_epoch = G.epoch;
+    if (!rows)
+        return;
+    lin = scratch((size_t)s->w * rows * s->bpp);
+    if (!lin)
+        return;
+    if (s->swz)
+        surf_swizzle(s, guest(s->va), lin, rows, 0);
+    else
+        for (y = 0; y < rows; y++)
+            memcpy(lin + (size_t)y * s->w * s->bpp, guest(s->va) + (size_t)y * s->pitch,
+                   (size_t)s->w * s->bpp);
+    surf_pixfmt(s, &fmt, &type);
+    step("upload", s->va, s->fmt);
+    glBindTexture(GL_TEXTURE_2D, s->tex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)s->w, (GLsizei)rows, fmt, type, lin);
+}
+
+/* The surface's texture into guest RAM. */
+static void surf_writeback(GSurf *s)
+{
+    uint32_t rows = s->swz ? s->h : (s->rows < s->h ? s->rows : s->h), y;
+    uint8_t *lin;
+    GLenum fmt, type;
+    if (!s->dirty || !rows)
+        return;
+    lin = scratch((size_t)s->w * rows * s->bpp);
+    if (!lin)
+        return;
+    surf_pixfmt(s, &fmt, &type);
+    step("write-back", s->va, s->fmt);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, G.rfbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    {
+        /* Through a pixel buffer: the GPU copies into it and it is mapped
+         * here. (Read straight into client memory, Ryujinx's emulated GPU
+         * took the emulator down with an X BadMatch.) */
+        size_t n = (size_t)s->w * rows * s->bpp;
+        const void *m;
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, G.pbo);
+        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)n, NULL, GL_STREAM_READ);
+        glReadPixels(0, 0, (GLsizei)s->w, (GLsizei)rows, fmt, type, NULL);
+        m = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)n, GL_MAP_READ_BIT);
+        if (m)
+            memcpy(lin, m, n);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    }
+    {
+        static int trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_GL_TRACE") != NULL;
+        if (trace && (G.frame % 30) == 0) {
+            size_t k, nz = 0, n = (size_t)s->w * rows * s->bpp;
+            for (k = 0; k < n; k += s->bpp)
+                nz += lin[k] | lin[k + 1] | (s->bpp == 4 ? lin[k + 2] : 0);
+            fprintf(stderr, "[GL] F%u write-back %08X %ux%u: %zu non-black\n",
+                    nv2a_pb_presented_frames(), s->va, s->w, rows, nz);
+        }
+    }
+    if (s->swz)
+        surf_swizzle(s, guest(s->va), lin, rows, 1);
+    else
+        for (y = 0; y < rows; y++)
+            memcpy(guest(s->va) + (size_t)y * s->pitch, lin + (size_t)y * s->w * s->bpp,
+                   (size_t)s->w * s->bpp);
+    s->dirty = 0;
+    /* What is in guest RAM now is what the texture holds. */
+    s->up_epoch = G.epoch;
+}
+
+/* Copy back every dirty surface that overlaps [va, va + bytes). */
+static void writeback_overlap(uint32_t va, uint32_t bytes)
+{
+    int i;
+    for (i = 0; i < G.nsurf; i++) {
+        GSurf *s = &G.surf[i];
+        if (s->dirty && va < s->va + surf_bytes(s) && s->va < va + bytes)
+            surf_writeback(s);
+    }
+}
+
+static GSurf *surf_get(const Nv2aVkState *st)
+{
+    GLenum ifmt = surf_ifmt(st->bpp, st->color_fmt);
+    uint32_t w, rows = st->clip_y + st->clip_h;
+    int swz = st->swz_w != 0, i;
+    GSurf *s = NULL;
+
+    if (!ifmt || !st->color_va || (!st->pitch && !swz))
+        return NULL;
+    w = swz ? st->swz_w : st->pitch / st->bpp;
+    if (!w || w > 4096)
+        return NULL;
+    if (swz)
+        rows = st->swz_h;
+    if (rows > GL_SURF_H)
+        rows = GL_SURF_H;
+    {
+        extern int xbox_VaReadable(uint32_t va);
+        uint32_t bytes = swz ? w * st->swz_h * st->bpp : rows * st->pitch;
+        if (!xbox_VaReadable(st->color_va) || !xbox_VaReadable(st->color_va + bytes - 4))
+            return NULL;
+    }
+    for (i = 0; i < G.nsurf; i++)
+        if (G.surf[i].va == st->color_va && G.surf[i].bpp == st->bpp && G.surf[i].fmt == ifmt
+                && G.surf[i].swz == swz
+                && (swz ? G.surf[i].w == w && G.surf[i].h == st->swz_h
+                        : G.surf[i].pitch == st->pitch)) {
+            s = &G.surf[i];
+            break;
+        }
+    if (!s) {
+        if (G.nsurf == GL_MAX_SURF) {
+            int best = -1;
+            for (i = 0; i < G.nsurf; i++)
+                if (!G.surf[i].dirty && &G.surf[i] != G.cur_cs
+                        && (best < 0 || G.surf[i].last_use < G.surf[best].last_use))
+                    best = i;
+            if (best < 0)
+                return NULL;
+            s = &G.surf[best];
+            glDeleteTextures(1, &s->tex);
+            free(s->swx);
+            free(s->swy);
+        } else {
+            s = &G.surf[G.nsurf++];
+        }
+        memset(s, 0, sizeof *s);
+        step("surface", st->color_va, ifmt);
+        s->va = st->color_va;
+        s->pitch = st->pitch;
+        s->bpp = st->bpp;
+        s->fmt = ifmt;
+        s->swz = swz;
+        s->w = w;
+        s->h = swz ? st->swz_h : GL_SURF_H;
+        glGenTextures(1, &s->tex);
+        glBindTexture(GL_TEXTURE_2D, s->tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, (GLint)ifmt, (GLsizei)s->w, (GLsizei)s->h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    }
+    if (rows > s->rows)
+        s->rows = rows;
+    s->last_use = G.frame;
+    if (!s->dirty && s->up_epoch != G.epoch)
+        surf_upload(s);
+    return s;
+}
+
+static GZeta *zeta_get(uint32_t key, uint32_t w)
+{
+    int i;
+    GZeta *z;
+    if (!key)
+        return NULL;
+    if (w < 640)
+        w = 640;
+    for (i = 0; i < G.nzeta; i++)
+        if (G.zeta[i].key == key && G.zeta[i].w >= w) {
+            G.zeta[i].last_use = G.frame;
+            return &G.zeta[i];
+        }
+    if (G.nzeta == GL_MAX_ZETA) {
+        int best = 0;
+        for (i = 1; i < G.nzeta; i++)
+            if (G.zeta[i].last_use < G.zeta[best].last_use)
+                best = i;
+        z = &G.zeta[best];
+        glDeleteRenderbuffers(1, &z->rb);
+    } else {
+        z = &G.zeta[G.nzeta++];
+    }
+    memset(z, 0, sizeof *z);
+    step("zeta", key, w);
+    z->key = key;
+    z->w = w;
+    z->h = GL_SURF_H;
+    glGenRenderbuffers(1, &z->rb);
+    glBindRenderbuffer(GL_RENDERBUFFER, z->rb);
+    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH32F_STENCIL8, (GLsizei)z->w, (GLsizei)z->h);
+    /* New storage is undefined: start it far and unstencilled. */
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, G.fbo);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, z->rb);
+    glDisable(GL_SCISSOR_TEST);
+    glDepthMask(GL_TRUE);
+    glStencilMask(0xFF);
+    glClearDepth(1.0);
+    glClearStencil(0);
+    glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+    glEnable(GL_SCISSOR_TEST);
+    G.cur_cs = NULL;                /* the framebuffer's attachments moved */
+    G.cur_zs = NULL;
+    z->last_use = G.frame;
+    return z;
+}
+
+/* Bind the draw's surfaces. 0 when there is nothing to draw into. */
+static int begin_target(const Nv2aVkState *st)
+{
+    GSurf *cs = surf_get(st);
+    GZeta *zs = zeta_get(st->zeta_key, cs ? cs->w : 1024);
+    if (!cs && !zs)
+        return 0;
+    if (G.cur_cs == cs && G.cur_zs == zs)
+        return 1;
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, G.fbo);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                           cs ? cs->tex : 0, 0);
+    glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
+                              zs ? zs->rb : 0);
+    if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        static int shown;
+        if (shown++ < 10)
+            fprintf(stderr, "[GL] incomplete target: surf %08X zeta %08X\n",
+                    cs ? cs->va : 0, zs ? zs->key : 0);
+        G.cur_cs = NULL;
+        G.cur_zs = NULL;
+        return 0;
+    }
+    G.cur_cs = cs;
+    G.cur_zs = zs;
+    return 1;
+}
+
+static void target_size(uint32_t *w, uint32_t *h)
+{
+    *w = G.cur_cs ? G.cur_cs->w : G.cur_zs->w;
+    *h = G.cur_cs ? G.cur_cs->h : G.cur_zs->h;
+    if (G.cur_zs && G.cur_zs->w < *w) *w = G.cur_zs->w;
+    if (G.cur_zs && G.cur_zs->h < *h) *h = G.cur_zs->h;
+}
+
+/* The clip rectangle, within the attachments; 0 if empty. */
+static int set_scissor(const Nv2aVkState *st)
+{
+    uint32_t w, h, x0 = st->clip_x, y0 = st->clip_y;
+    uint32_t x1 = st->clip_x + st->clip_w, y1 = st->clip_y + st->clip_h;
+    target_size(&w, &h);
+    if (x1 > w) x1 = w;
+    if (y1 > h) y1 = h;
+    if (x0 >= x1 || y0 >= y1)
+        return 0;
+    glScissor((GLint)x0, (GLint)y0, (GLsizei)(x1 - x0), (GLsizei)(y1 - y0));
+    return 1;
+}
+
+static void mark_drawn(const Nv2aVkState *st)
+{
+    if (G.cur_cs) {
+        uint32_t rows = st->clip_y + st->clip_h;
+        G.cur_cs->dirty = 1;
+        if (rows > G.cur_cs->h)
+            rows = G.cur_cs->h;
+        if (rows > G.cur_cs->rows)
+            G.cur_cs->rows = rows;
+    }
+}
+
+/* ---- textures ---------------------------------------------------------- */
+
+static GLenum wrap_mode(uint32_t m)
+{
+    switch (m) {
+    case 1:  return GL_REPEAT;
+    case 2:  return GL_MIRRORED_REPEAT;
+    default: return GL_CLAMP_TO_EDGE;
+    }
+}
+
+static GLuint sampler(const Nv2aVkTex *t, uint32_t levels)
+{
+    uint32_t mag = (t->filter >> 24) & 0xF, min = (t->filter >> 16) & 0xFF;
+    int mip = min >= 3 && min <= 6 && levels > 1;
+    uint32_t maxl = t->max_lod >> 8 > t->min_level ? (t->max_lod >> 8) - t->min_level : 0;
+    uint64_t key = (mag & 0xF) | (min & 0xF) << 4 | (t->addr_u & 0xF) << 8
+                 | (t->addr_v & 0xF) << 12 | (t->addr_p & 0xF) << 16
+                 | (uint64_t)mip << 20 | (uint64_t)(t->filter & 0x1FFF) << 21
+                 | (uint64_t)(mip ? (maxl < levels ? maxl : levels) : 0) << 34;
+    GLuint s;
+    GLenum minf;
+    int i;
+    for (i = 0; i < G.nsamp; i++)
+        if (G.samp[i].key == key)
+            return G.samp[i].s;
+    if (G.nsamp == GL_MAX_SAMP)
+        return G.samp[0].s;
+    glGenSamplers(1, &s);
+    glSamplerParameteri(s, GL_TEXTURE_MAG_FILTER, mag == 2 ? GL_LINEAR : GL_NEAREST);
+    if (!mip)
+        minf = (min == 2 || min == 4 || min == 6) ? GL_LINEAR : GL_NEAREST;
+    else if (min == 5 || min == 6)
+        minf = (min == 6) ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST_MIPMAP_LINEAR;
+    else
+        minf = (min == 4) ? GL_LINEAR_MIPMAP_NEAREST : GL_NEAREST_MIPMAP_NEAREST;
+    glSamplerParameteri(s, GL_TEXTURE_MIN_FILTER, (GLint)minf);
+    glSamplerParameteri(s, GL_TEXTURE_WRAP_S, (GLint)wrap_mode(t->addr_u));
+    glSamplerParameteri(s, GL_TEXTURE_WRAP_T, (GLint)wrap_mode(t->addr_v));
+    glSamplerParameteri(s, GL_TEXTURE_WRAP_R, (GLint)wrap_mode(t->addr_p));
+    glSamplerParameterf(s, GL_TEXTURE_MIN_LOD, 0.0f);
+    glSamplerParameterf(s, GL_TEXTURE_MAX_LOD, mip ? (float)(maxl < levels ? maxl : levels) : 0.25f);
+    if (mip) {
+        int32_t b = (int32_t)(t->filter << 19) >> 19;
+        glSamplerParameterf(s, GL_TEXTURE_LOD_BIAS, (float)b / 256.0f);
+    }
+    G.samp[G.nsamp].key = key;
+    G.samp[G.nsamp].s = s;
+    G.nsamp++;
+    return s;
+}
+
+static int tex_same(const Nv2aVkTex *a, const Nv2aVkTex *b)
+{
+    return a->offset == b->offset && a->width == b->width && a->height == b->height
+        && a->pitch == b->pitch && a->color == b->color && a->levels == b->levels
+        && a->min_level == b->min_level && a->palette == b->palette && a->cube == b->cube
+        && a->size_from_format == b->size_from_format;
+}
+
+/* A decoded, uploaded texture for stage state t; 0 when it cannot be had. */
+static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
+{
+    Nv2aVkTex d = *t;
+    uint32_t bytes, faces, levels, lv, f, w0, h0, slot, n, *buf;
+    uint64_t h;
+    GTex *e = NULL;
+
+    d.filter = d.addr_u = d.addr_v = d.addr_p = 0;
+    d.max_lod = 0;
+    G.st_tex++;
+    if (!d.valid || !d.width || !d.height || d.width > 4096 || d.height > 4096) {
+        G.st_texfail++;
+        return 0;
+    }
+    bytes = nv2a_pb_tex_bytes(&d);
+    if (!bytes) {
+        G.st_texfail++;
+        return 0;
+    }
+    /* Drawn by the GPU this frame: guest RAM has to have it first. */
+    writeback_overlap(d.offset, bytes);
+    h = hash_bytes(guest(d.offset), bytes);
+    if (d.palette)
+        h ^= hash_bytes(guest(d.palette), 1024) * 31;
+    slot = (d.offset * 2654435761u) & (GL_MAX_TEX - 1);
+    for (n = 0; n < GL_MAX_TEX; n++) {
+        GTex *c = &G.tex[(slot + n) & (GL_MAX_TEX - 1)];
+        if (!c->used) {
+            e = c;
+            break;
+        }
+        if (tex_same(&c->d, &d)) {
+            if (c->hash == h) {
+                c->last_use = G.frame;
+                *levels_out = c->levels;
+                return c->tex;
+            }
+            e = c;
+            break;
+        }
+    }
+    if (!e) {
+        /* Full: the least recently used in this neighbourhood. */
+        uint32_t k;
+        e = &G.tex[slot];
+        for (k = 1; k < 16; k++) {
+            GTex *c = &G.tex[(slot + k) & (GL_MAX_TEX - 1)];
+            if (c->last_use < e->last_use)
+                e = c;
+        }
+    }
+    faces = d.cube ? 6 : 1;
+    levels = d.size_from_format && d.levels > d.min_level ? d.levels - d.min_level : 1;
+    if (levels > 13)
+        levels = 13;
+    w0 = d.size_from_format ? (d.width >> d.min_level) : d.width;
+    h0 = d.size_from_format ? (d.height >> d.min_level) : d.height;
+    if (!w0) w0 = 1;
+    if (!h0) h0 = 1;
+    buf = (uint32_t *)scratch((size_t)w0 * h0 * 4);
+    if (!buf)
+        return 0;
+    step("texture", d.offset, d.color | w0 << 16);
+    if (e->used && e->tex)
+        glDeleteTextures(1, &e->tex);
+    glGenTextures(1, &e->tex);
+    {
+        GLenum target = d.cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
+        glBindTexture(target, e->tex);
+        glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, (GLint)levels - 1);
+        for (f = 0; f < faces; f++)
+            for (lv = 0; lv < levels; lv++) {
+                uint32_t lw = w0 >> lv ? w0 >> lv : 1, lh = h0 >> lv ? h0 >> lv : 1;
+                nv2a_pb_tex_decode(&d, f, d.min_level + lv, lw, lh, buf);
+                glTexImage2D(d.cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f : GL_TEXTURE_2D,
+                             (GLint)lv, GL_RGBA8, (GLsizei)lw, (GLsizei)lh, 0, GL_BGRA,
+                             GL_UNSIGNED_INT_8_8_8_8_REV, buf);
+            }
+    }
+    e->used = 1;
+    e->d = d;
+    e->hash = h;
+    e->levels = levels;
+    e->last_use = G.frame;
+    *levels_out = levels;
+    return e->tex;
+}
+
+/* ---- draws ------------------------------------------------------------- */
+
+static GLenum blend_factor(uint32_t f)
+{
+    switch (f) {
+    case 0x0000: return GL_ZERO;
+    case 0x0001: return GL_ONE;
+    case 0x0300: return GL_SRC_COLOR;
+    case 0x0301: return GL_ONE_MINUS_SRC_COLOR;
+    case 0x0302: return GL_SRC_ALPHA;
+    case 0x0303: return GL_ONE_MINUS_SRC_ALPHA;
+    case 0x0304: return GL_DST_ALPHA;
+    case 0x0305: return GL_ONE_MINUS_DST_ALPHA;
+    case 0x0306: return GL_DST_COLOR;
+    case 0x0307: return GL_ONE_MINUS_DST_COLOR;
+    case 0x0308: return GL_SRC_ALPHA_SATURATE;
+    case 0x8001: return GL_CONSTANT_COLOR;
+    case 0x8002: return GL_ONE_MINUS_CONSTANT_COLOR;
+    case 0x8003: return GL_CONSTANT_ALPHA;
+    case 0x8004: return GL_ONE_MINUS_CONSTANT_ALPHA;
+    default:     return GL_ONE;
+    }
+}
+
+static GLenum blend_eq(uint32_t e)
+{
+    switch (e) {
+    case 0x800A: return GL_FUNC_SUBTRACT;
+    case 0x800B: return GL_FUNC_REVERSE_SUBTRACT;
+    case 0x8007: return GL_MIN;
+    case 0x8008: return GL_MAX;
+    default:     return GL_FUNC_ADD;
+    }
+}
+
+static GLenum compare_fn(uint32_t f)
+{
+    if (f >= 0x200 && f <= 0x207)
+        return GL_NEVER + (f - 0x200);       /* NEVER..ALWAYS, in GL's order too */
+    return GL_ALWAYS;
+}
+
+static GLenum stencil_op(uint32_t op)
+{
+    switch (op) {
+    case 0x1E00: case 1: return GL_KEEP;
+    case 0x0000: case 2: return GL_ZERO;
+    case 0x1E01: case 3: return GL_REPLACE;
+    case 0x1E02: case 4: return GL_INCR;
+    case 0x1E03: case 5: return GL_DECR;
+    case 0x150A: case 6: return GL_INVERT;
+    case 0x8507: case 7: return GL_INCR_WRAP;
+    case 0x8508: case 8: return GL_DECR_WRAP;
+    default:             return GL_KEEP;
+    }
+}
+
+/* LESS <-> GREATER, LEQUAL <-> GEQUAL: the reversed w-buffer's tests. */
+static uint32_t depth_func_rev(uint32_t f)
+{
+    switch (f) {
+    case 0x201: return 0x204;
+    case 0x203: return 0x206;
+    case 0x204: return 0x201;
+    case 0x206: return 0x203;
+    default:    return f;
+    }
+}
+
+static int fb_widescreen(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_WIDESCREEN");
+        on = e && *e && strcmp(e, "0") != 0;
+    }
+    return on;
+}
+
+float nv2a_vk_view_aspect(void)
+{
+    static float force = -1.0f;
+    float a = 16.0f / 9.0f;
+    if (force < 0.0f) {
+        const char *e = getenv("RECOMP_VIEW_ASPECT");
+        force = e ? (float)atof(e) : 0.0f;
+    }
+    if (fb_widescreen() && force > a)
+        return force;
+    return a;
+}
+
+static void set_state(const Nv2aVkState *st)
+{
+    int depth_mode = st->wbuffer ? 2 : 0;     /* float depth: the reversed w-buffer */
+    float bc[4];
+
+    if (st->blend_enable && !(st->blend_sfactor == 1 && st->blend_dfactor == 0)) {
+        glEnable(GL_BLEND);
+        glBlendFunc(blend_factor(st->blend_sfactor), blend_factor(st->blend_dfactor));
+        glBlendEquation(blend_eq(st->blend_equation));
+        nv2a_rc_unpack(st->blend_color, bc);
+        glBlendColor(bc[0], bc[1], bc[2], bc[3]);
+    } else {
+        glDisable(GL_BLEND);
+    }
+    glColorMask((st->color_mask & 0x00010000u) != 0, (st->color_mask & 0x00000100u) != 0,
+                (st->color_mask & 0x00000001u) != 0, (st->color_mask & 0x01000000u) != 0);
+    if (st->cull_enable) {
+        glEnable(GL_CULL_FACE);
+        glCullFace(st->cull_face == 0x0404 ? GL_FRONT
+                   : st->cull_face == 0x0408 ? GL_FRONT_AND_BACK : GL_BACK);
+    } else {
+        glDisable(GL_CULL_FACE);
+    }
+    /* Inverted from the title's: Vulkan's facing area carries a minus sign
+     * GL's does not (y down), and the coordinates here are Vulkan's. */
+    glFrontFace(st->front_face == 0x0901 ? GL_CW : GL_CCW);
+    if (G.cur_zs && st->depth_test) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(compare_fn(depth_mode == 2 ? depth_func_rev(st->depth_func) : st->depth_func));
+        glDepthMask(st->depth_mask ? GL_TRUE : GL_FALSE);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+    }
+    if (G.cur_zs && st->st_test) {
+        glEnable(GL_STENCIL_TEST);
+        glStencilFunc(compare_fn(st->st_func), (GLint)(st->st_ref & 0xFF), st->st_mask & 0xFF);
+        glStencilOp(stencil_op(st->st_fail), stencil_op(st->st_zfail), stencil_op(st->st_zpass));
+        glStencilMask(st->st_write ? (st->st_wmask & 0xFF) : 0);
+    } else {
+        glDisable(GL_STENCIL_TEST);
+        glStencilMask(0xFF);
+    }
+}
+
+static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t stride,
+                       uint32_t nv, const uint32_t *idx, uint32_t nidx)
+{
+    Nv2aVkUbo ub;
+    int i, stage_on[4];
+    uint32_t w, h, levels;
+    GLuint tex2d[4], texcube[4], samp[4];
+
+    /* Textures first: one may be a surface drawn earlier this frame, which
+     * is copied back before it is decoded. */
+    for (i = 0; i < 4; i++) {
+        GLuint t = 0;
+        stage_on[i] = 0;
+        tex2d[i] = G.white2d;
+        texcube[i] = G.whitecube;
+        samp[i] = 0;
+        if (nv2a_draw_stage_samples(st, i) && (t = tex_get(&st->tex[i], &levels)) != 0) {
+            stage_on[i] = 1;
+            if (st->tex[i].cube)
+                texcube[i] = t;
+            else
+                tex2d[i] = t;
+            samp[i] = sampler(&st->tex[i], levels);
+        }
+    }
+    G.st_draws++;
+    if (p->hash == 0)
+        G.st_cpu++;
+    {
+        static int trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_GL_TRACE") ? atoi(getenv("RECOMP_GL_TRACE")) : 0;
+        if (trace >= 2 && (G.frame % 30) == 0 && G.st_draws <= 4) {
+            const float *f = (const float *)v;
+            fprintf(stderr, "[GL]   draw prog %08X in %d nv %u nidx %u topo %u surf %08X zeta %08X"
+                    " clip %u,%u %ux%u cm %08X blend %u %X %X depth %u %X mask %u st %u cull %u %X"
+                    " at %u %X %X rc %u tex0 %08X fmt %02X %ux%u sff %d | v0 %g %g %g %g\n",
+                    p->hash, p->ninputs, nv, nidx, st->topology, st->color_va, st->zeta_key,
+                    st->clip_x, st->clip_y, st->clip_w, st->clip_h, st->color_mask, st->blend_enable,
+                    st->blend_sfactor, st->blend_dfactor, st->depth_test, st->depth_func,
+                    st->depth_mask, st->st_test, st->cull_enable, st->cull_face, st->alpha_test,
+                    st->alpha_func, st->alpha_ref, st->use_rc, st->tex[0].offset, st->tex[0].color,
+                    st->tex[0].width, st->tex[0].height, st->tex[0].size_from_format,
+                    f[0], f[1], f[2], f[3]);
+        }
+    }
+    if (!begin_target(st)) {
+        G.st_notarget++;
+        return 1;
+    }
+    target_size(&w, &h);
+    glViewport(0, 0, (GLsizei)w, (GLsizei)h);
+    if (!set_scissor(st)) {
+        G.st_noclip++;
+        return 1;
+    }
+    {
+        const GSurf *c = G.cur_cs;
+        nv2a_draw_ubo_fill(&ub, st, stage_on, w, h, st->wbuffer ? 2 : 0, 1.0f, 1.0f,
+                           c && !c->swz && c->bpp == 4 && c->w == 640 && G.cur_zs && c->rows <= 480
+                           ? nv2a_draw_wide_factor(nv2a_vk_view_aspect()) : 1.0f);
+    }
+    glBindBuffer(GL_UNIFORM_BUFFER, G.ubo);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof ub, &ub);
+    if (G.const_epoch != G.epoch || G.const_serial != nv2a_vsh_const_serial()) {
+        glBindBuffer(GL_UNIFORM_BUFFER, G.cbo);
+        glBufferSubData(GL_UNIFORM_BUFFER, 0, NV2A_VSH_CONSTANTS * 16, nv2a_vsh_constants());
+        G.const_epoch = G.epoch;
+        G.const_serial = nv2a_vsh_const_serial();
+    }
+    for (i = 0; i < 4; i++) {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D, tex2d[i]);
+        glBindSampler((GLuint)i, samp[i]);
+        glActiveTexture(GL_TEXTURE4 + i);
+        glBindTexture(GL_TEXTURE_CUBE_MAP, texcube[i]);
+        glBindSampler((GLuint)(4 + i), samp[i]);
+    }
+    glUseProgram(p->prog);
+    glBindVertexArray(G.vao);
+    glBindBuffer(GL_ARRAY_BUFFER, G.vbo);
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nv * stride, v, GL_STREAM_DRAW);
+    for (i = 0; i < 16; i++) {
+        if (i < p->ninputs) {
+            glEnableVertexAttribArray((GLuint)i);
+            glVertexAttribPointer((GLuint)i, 4, GL_FLOAT, GL_FALSE, (GLsizei)stride,
+                                  (const void *)(uintptr_t)(i * 16));
+        } else {
+            glDisableVertexAttribArray((GLuint)i);
+        }
+    }
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, G.ibo);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)nidx * 4, idx, GL_STREAM_DRAW);
+    set_state(st);
+    if (G.zpass && G.nq < 64)
+        glBeginQuery(GL_SAMPLES_PASSED, G.queries[G.nq]);
+    step("draw", p->hash, st->color_va);
+    glDrawElements(st->topology == 2 ? GL_POINTS : st->topology == 1 ? GL_LINES : GL_TRIANGLES,
+                   (GLsizei)nidx, GL_UNSIGNED_INT, NULL);
+    if (G.zpass && G.nq < 64) {
+        glEndQuery(GL_SAMPLES_PASSED);
+        G.nq++;
+    }
+    mark_drawn(st);
+    return 1;
+}
+
+void nv2a_vk_draw(const Nv2aVkState *st, const Nv2aVshOutput *v, uint32_t nv,
+                  const uint32_t *idx, uint32_t nidx)
+{
+    GProg *p;
+    if (!nidx || !nv || !nv2a_vk_active())
+        return;
+    p = prog_get(0);
+    if (p && p->prog)
+        (void)draw_common(st, p, v, sizeof *v, nv, idx, nidx);
+}
+
+int nv2a_vk_program(uint32_t hash, uint8_t inputs[16])
+{
+    GProg *p;
+    static int cpu = -1;
+    if (cpu < 0)
+        cpu = getenv("RECOMP_VK_CPU_VSH") != NULL;
+    if (cpu || !hash || !nv2a_vk_active())
+        return -1;
+    p = prog_get(hash);
+    if (!p || p->failed)
+        return -1;
+    memcpy(inputs, p->inputs, 16);
+    return p->ninputs;
+}
+
+int nv2a_vk_draw_program(const Nv2aVkState *st, uint32_t hash, const float *vin,
+                         uint32_t nv, const uint32_t *idx, uint32_t nidx)
+{
+    GProg *p;
+    if (!nidx || !nv || !nv2a_vk_active())
+        return 1;
+    p = prog_get(hash);
+    if (!p || p->failed)
+        return 0;
+    return draw_common(st, p, vin, (uint32_t)p->ninputs * 16, nv, idx, nidx);
+}
+
+void nv2a_vk_clear(const Nv2aVkState *st, uint32_t flags, uint32_t argb, uint32_t zs)
+{
+    GLbitfield bits = 0;
+    if (!nv2a_vk_active() || !begin_target(st) || !set_scissor(st))
+        return;
+    G.st_clears++;
+    if ((flags & 0xF0) && G.cur_cs) {
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor((float)((argb >> 16) & 0xFF) / 255.0f, (float)((argb >> 8) & 0xFF) / 255.0f,
+                     (float)(argb & 0xFF) / 255.0f, (float)(argb >> 24) / 255.0f);
+        bits |= GL_COLOR_BUFFER_BIT;
+    }
+    if ((flags & 0x03) && G.cur_zs) {
+        float zmax = st->zeta_fmt == 1 ? 65535.0f : 16777215.0f;
+        float raw = st->zeta_fmt == 1 ? (float)(zs & 0xFFFF) : (float)(zs >> 8);
+        const float wrev_c = 1.0f / 1024.0f;
+        if (flags & 0x01) {
+            glDepthMask(GL_TRUE);
+            glClearDepth(st->wbuffer ? (raw > wrev_c ? wrev_c / raw : 1.0f) : raw / zmax);
+            bits |= GL_DEPTH_BUFFER_BIT;
+        }
+        if (flags & 0x02) {
+            glStencilMask(0xFF);
+            glClearStencil((GLint)(zs & 0xFF));
+            bits |= GL_STENCIL_BUFFER_BIT;
+        }
+    }
+    if (!bits)
+        return;
+    step("clear", st->color_va, bits);
+    glClear(bits);
+    if (bits & GL_COLOR_BUFFER_BIT)
+        mark_drawn(st);
+}
+
+/* ---- sync, visibility, presentation ------------------------------------ */
+
+void nv2a_vk_flush(void)
+{
+    int i;
+    if (G.state <= 0)
+        return;
+    for (i = 0; i < G.nsurf; i++) {
+        G.st_wb += G.surf[i].dirty != 0;
+        surf_writeback(&G.surf[i]);
+    }
+    {
+        static int trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_GL_TRACE") != NULL;
+        if (trace && (G.frame % 30) == 0) {
+            fprintf(stderr, "[GL] F%u draws %u (cpu %u) no-target %u no-clip %u clears %u"
+                    " tex %u failed %u written back %u present %08X surfs %d:",
+                    nv2a_pb_presented_frames(), G.st_draws, G.st_cpu, G.st_notarget,
+                    G.st_noclip, G.st_clears, G.st_tex, G.st_texfail, G.st_wb, G.present_va,
+                    G.nsurf);
+            for (i = 0; i < G.nsurf; i++)
+                fprintf(stderr, " %08X/%u/%u%s", G.surf[i].va, G.surf[i].pitch, G.surf[i].bpp,
+                        G.surf[i].swz ? "s" : "");
+            fputc('\n', stderr);
+        }
+        G.st_draws = G.st_cpu = G.st_notarget = G.st_noclip = G.st_clears = 0;
+        G.st_tex = G.st_texfail = G.st_wb = 0;
+    }
+    G.epoch++;
+    G.frame++;
+    G.cur_cs = NULL;
+    G.cur_zs = NULL;
+}
+
+static void queries_collect(void)
+{
+    int i;
+    for (i = 0; i < G.nq; i++) {
+        GLuint n = 0;
+        glGetQueryObjectuiv(G.queries[i], GL_QUERY_RESULT, &n);
+        G.rep_acc += n;
+    }
+    G.nq = 0;
+}
+
+void nv2a_vk_zpass(int enable)
+{
+    if (G.state <= 0)
+        return;
+    if (!enable)
+        queries_collect();
+    G.zpass = enable;
+}
+
+void nv2a_vk_report_clear(void)
+{
+    if (G.state <= 0)
+        return;
+    queries_collect();
+    G.rep_acc = 0;
+}
+
+void nv2a_vk_report_get(uint32_t va, uint64_t stamp)
+{
+    uint32_t count, done = 0;
+    uint8_t *g;
+    if (G.state <= 0)
+        return;
+    queries_collect();
+    count = (uint32_t)G.rep_acc;
+    g = guest(va);
+    memcpy(g, &stamp, 8);
+    memcpy(g + 8, &count, 4);
+    memcpy(g + 12, &done, 4);
+}
+
+void nv2a_vk_present(uint32_t va, uint32_t pitch)
+{
+    G.present_va = va;
+    G.present_pitch = pitch;
+}
+
+void nv2a_vk_present_queued(void)
+{
+    GSurf *s = NULL;
+    int i, ww = s_win_w, wh = s_win_h, dw, dh, ox, oy;
+    uint32_t sw, sh;
+    float aspect;
+
+    if (G.state <= 0 || G.own_win || !G.present_va)
+        return;
+    for (i = 0; i < G.nsurf; i++)
+        if (G.surf[i].va == G.present_va && !G.surf[i].swz && G.surf[i].bpp == 4)
+            s = &G.surf[i];
+    if (!s || ww <= 0 || wh <= 0)
+        return;
+    sw = s->w;
+    sh = s->rows ? s->rows : 480;
+    aspect = (fb_widescreen() && sw * 3 == sh * 4) ? nv2a_vk_view_aspect() : (float)sw / (float)sh;
+    if ((float)ww / (float)wh > aspect) {
+        dh = wh;
+        dw = (int)((float)wh * aspect + 0.5f);
+    } else {
+        dw = ww;
+        dh = (int)((float)ww / aspect + 0.5f);
+    }
+    ox = (ww - dw) / 2;
+    oy = (wh - dh) / 2;
+    /* The surface was just copied back from (or uploaded to) its texture,
+     * which holds the frame: row 0 is the top, so the blit turns it over. */
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, G.rfbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glViewport(0, 0, ww, wh);
+    glClearColor(0, 0, 0, 1);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glBlitFramebuffer(0, 0, (GLint)sw, (GLint)sh, ox, oy + dh, ox + dw, oy,
+                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glEnable(GL_SCISSOR_TEST);
+    SDL_GL_SwapWindow(G.win);
+    G.cur_cs = NULL;                       /* the draw framebuffer binding moved */
+    G.cur_zs = NULL;
+}
+
+/* ---- the rest of nv2a_vk.h --------------------------------------------- */
+
+void *nv2a_vk_instance_handle(void) { return NULL; }
+int   nv2a_vk_device_names(char (*names)[256], int max) { (void)names; (void)max; return 0; }
+void  nv2a_vk_set_surface(uint64_t surface) { (void)surface; }
+void  nv2a_vk_set_window_size(int w, int h) { s_win_w = w; s_win_h = h; }
+int   nv2a_vk_attach_hwnd(void *hinstance, void *hwnd) { (void)hinstance; (void)hwnd; return 0; }
+int   nv2a_vk_create_android_surface(void *anw, uint64_t *surface) { (void)anw; (void)surface; return 0; }
+void  nv2a_vk_set_wayland(void *d, void *s) { (void)d; (void)s; }
+void  nv2a_vk_set_gamma(const uint8_t *r, const uint8_t *g, const uint8_t *b) { (void)r; (void)g; (void)b; }
+void  nv2a_vk_overlay_toggle(void) { }
+/* nv2a_vk.c's own stubs for these are never linked in a GL build: nothing
+ * else pulls that object in. */
+int   nv2a_gamma_ramp(uint8_t out[3][256]) { (void)out; return 0; }
+void  xbox_FlightDumpRequest(void) { }
+
+#endif /* XBOXRECOMP_HAVE_GL && !XBOXRECOMP_HAVE_VULKAN */

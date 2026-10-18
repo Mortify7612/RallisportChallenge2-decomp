@@ -17,3 +17,7 @@ else()
     find_package(Threads REQUIRED)
     target_link_libraries(xbox_video PUBLIC SDL2::SDL2 Threads::Threads)
 endif()
+# The OpenGL renderer (kernel/nv2a_gl.c) presents in a GL window made here.
+if(XBOXRECOMP_HAVE_GL)
+    target_compile_definitions(xbox_video PRIVATE XBOXRECOMP_HAVE_GL=1)
+endif()

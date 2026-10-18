@@ -893,7 +893,11 @@ static void *fb_vk_loop(SDL_Window *win)
         fb_events(win, &resized);
         if (resized) {
             int dw, dh;
+#if defined(XBOXRECOMP_HAVE_GL)
+            SDL_GL_GetDrawableSize(win, &dw, &dh);
+#else
             SDL_Vulkan_GetDrawableSize(win, &dw, &dh);
+#endif
             nv2a_vk_set_window_size(dw, dh);
             touchpad_set_view(dw, dh);
         }
@@ -965,6 +969,44 @@ static void *fb_thread(void *unused)
         SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "1");
     }
     xbox_InputSdlInit();
+#if defined(XBOXRECOMP_HAVE_GL)
+    {
+        /* The OpenGL renderer (kernel/nv2a_gl.c) draws on the executor's
+         * thread: a GL window and context made here, released, and handed
+         * over; this thread keeps the window's events. */
+        extern int nv2a_gl_wanted(void);
+        extern void nv2a_gl_set_window(void *win, void *ctx, int w, int h);
+        if (nv2a_gl_wanted()) {
+            SDL_GLContext ctx = NULL;
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+            win = SDL_CreateWindow(s_title, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                   fb_wide() ? 1280 : (int)s_fb_width * 2, fb_wide() ? 720 : (int)s_fb_height * 2,
+                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI
+                                   | SDL_WINDOW_OPENGL | fb_start_flags());
+            if (win)
+                ctx = SDL_GL_CreateContext(win);
+            if (ctx) {
+                int dw, dh;
+                SDL_GL_MakeCurrent(win, NULL);
+                SDL_GL_GetDrawableSize(win, &dw, &dh);
+                touchpad_set_view(dw, dh);
+                s_rgb = (uint32_t *)calloc((size_t)s_fb_width * s_fb_height, 4);
+                nv2a_gl_set_window(win, ctx, dw, dh);
+                fprintf(stderr, "  [FBWIN] window open, presented by OpenGL (%dx%d, SDL %s)\n",
+                        dw, dh, SDL_GetCurrentVideoDriver());
+                s_vk_sdl = 1;
+                return fb_vk_loop(win);
+            }
+            fprintf(stderr, "  [FBWIN] OpenGL context failed (%s) -- SDL renderer\n",
+                    SDL_GetError());
+            if (win)
+                SDL_DestroyWindow(win);
+        }
+    }
+#endif
     {
         const char *vp = getenv("RECOMP_VK_PRESENT");
         void *vkinst = (vp && strcmp(vp, "0") == 0) ? NULL : nv2a_vk_instance_handle();

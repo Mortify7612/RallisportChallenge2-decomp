@@ -51,6 +51,7 @@
 #include <sys/sysinfo.h>
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <sys/iosupport.h>
 
 #define NX_PAGE 0x1000ull
 
@@ -550,6 +551,66 @@ int sysinfo(struct sysinfo *info)
 }
 
 /* ---------------------------------------------------------------------- */
+/* The log                                                                 */
+/* ---------------------------------------------------------------------- */
+
+/* stdout and stderr into a file on the SD card, buffered. Unbuffered, every
+ * write was its own trip to the file system service -- about 60 ms a line on
+ * a console -- and the boot's few thousand log lines took minutes. Every
+ * thread's streams end on descriptors 1 and 2, so the device behind those is
+ * replaced: a write copies into a large stdio buffer, and a thread writes it
+ * out twice a second (and nx_log_flush does at once). */
+static FILE *s_log;
+static pthread_mutex_t s_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static ssize_t log_write(struct _reent *r, void *fd, const char *ptr, size_t len)
+{
+    (void)r; (void)fd;
+    pthread_mutex_lock(&s_log_lock);
+    fwrite(ptr, 1, len, s_log);
+    pthread_mutex_unlock(&s_log_lock);
+    return (ssize_t)len;
+}
+
+void nx_log_flush(void)
+{
+    if (!s_log)
+        return;
+    pthread_mutex_lock(&s_log_lock);
+    fflush(s_log);
+    pthread_mutex_unlock(&s_log_lock);
+}
+
+static void *log_flusher(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        usleep(500 * 1000);
+        nx_log_flush();
+    }
+    return NULL;
+}
+
+static const devoptab_t s_log_dev = {
+    .name = "rsc2log",
+    .write_r = log_write,
+};
+
+int nx_log_open(const char *path)
+{
+    pthread_t t;
+    s_log = fopen(path, "wb");
+    if (!s_log)
+        return 0;
+    setvbuf(s_log, NULL, _IOFBF, 256 * 1024);
+    devoptab_list[STD_OUT] = &s_log_dev;
+    devoptab_list[STD_ERR] = &s_log_dev;
+    if (pthread_create(&t, NULL, log_flusher, NULL) == 0)
+        pthread_detach(t);
+    return 1;
+}
+
+/* ---------------------------------------------------------------------- */
 /* Symbols and backtraces                                                  */
 /* ---------------------------------------------------------------------- */
 
@@ -693,6 +754,7 @@ uint32_t nx_exc_dispatch(uint32_t desc, NxExcCtx *k, NxExcFrame *f)
     fprintf(stderr, "  sp  %016lx  lr rsc2.elf+%#lx\n", (unsigned long)ctx.Sp,
             (unsigned long)(ctx.X[30] - (uintptr_t)__start__));
     fflush(stderr);
+    nx_log_flush();
     return 0xF801;      /* not handled: the kernel ends the process (crash report) */
 }
 

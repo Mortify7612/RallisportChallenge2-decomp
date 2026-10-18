@@ -127,6 +127,10 @@ BOOL  DuplicateHandle(HANDLE srcProc, HANDLE src, HANDLE dstProc,
 HANDLE      w32_open_handle(int fd, const char *host_path);
 int         w32_handle_fd(HANDLE h);
 const char *w32_handle_path(HANDLE h);
+HANDLE      w32_handle_find_path(const char *host_path);
+HANDLE      w32_handle_share(HANDLE h);
+long long  *w32_handle_vpos(HANDLE h);
+int         w32_handle_rename_open(const char *old_path, const char *new_path);
 /* After a rename: the path the handle now names. FALSE if h is not a file. */
 BOOL        w32_handle_set_path(HANDLE h, const char *host_path);
 

@@ -9,6 +9,7 @@
 #include "ohci.h"
 #include "../platform/mmio_decode.h"
 #include "../kernel/xbox_memory_layout.h"
+#include "../kernel/xbox_mmio.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
 
@@ -1299,33 +1300,26 @@ void xbox_OhciInit(void)
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 
-#ifdef MMIO_FAULT_HOST
-    /* The registers have to fault to be answered. The MCPX aperture is mapped
-     * as plain committed memory, so both blocks are made inaccessible here and
-     * the title's VEH routes the faults back to xbox_OhciHandleMmio.
-     *
-     * A failed protect switches the model off rather than leaving it half on:
-     * a controller whose registers read as zero out of RAM is exactly the
-     * situation this exists to end, and it would look identical. */
+    /* Guest code reaches the registers by direct call (kernel/xbox_mmio.c).
+     * RECOMP_MMIO_TRAPS=1 also traps the pages, for host code that touches
+     * them through a pointer; routed back to xbox_OhciHandleMmio. */
     {
+        int i;
+        for (i = 0; i < 2; i++)
+            xbox_MmioRegister(s_hc[i].base, XBOX_OHCI_SIZE, s_hc[i].base, &s_hc[i],
+                              ohci_read, ohci_write);
+    }
+#ifdef MMIO_FAULT_HOST
+    if (xbox_MmioTraps()) {
         ptrdiff_t off = xbox_GetMemoryOffset();
         int i;
 
-        if (!off) {
-            s_enabled = 0;
-            fprintf(stderr, "  OHCI: guest memory not mapped yet; disabled\n");
-            return;
-        }
-        for (i = 0; i < 2; i++) {
+        for (i = 0; off && i < 2; i++) {
             DWORD old_protect;
             LPVOID at = (LPVOID)((uintptr_t)off + XBOX_FOLD(s_hc[i].base));
-            if (!VirtualProtect(at, XBOX_OHCI_SIZE, PAGE_NOACCESS,
-                                &old_protect)) {
-                s_enabled = 0;
-                fprintf(stderr, "  OHCI: cannot trap 0x%08X (error %lu); "
-                                "disabled\n", s_hc[i].base, GetLastError());
-                return;
-            }
+            if (!VirtualProtect(at, XBOX_OHCI_SIZE, PAGE_NOACCESS, &old_protect))
+                fprintf(stderr, "  OHCI: cannot trap 0x%08X (error %lu)\n",
+                        s_hc[i].base, GetLastError());
         }
     }
 #endif
@@ -1335,13 +1329,11 @@ void xbox_OhciInit(void)
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
-#ifdef MMIO_FAULT_HOST
     {
         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
             CloseHandle(th);
     }
-#endif
 }
 
 static OhciController *hc_for(uint32_t va)

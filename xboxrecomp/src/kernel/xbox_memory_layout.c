@@ -18,6 +18,7 @@
 #include "../platform/host_backtrace.h"   /* backtrace(), also on Android */
 #endif
 #include "xbox_memory_layout.h"
+#include "xbox_mmio.h"
 #include "kernel.h"
 #include "guest_vmem.h"
 #include "../platform/mmio_decode.h"
@@ -449,6 +450,14 @@ static LONG CALLBACK ac97_write_veh(PEXCEPTION_POINTERS ep)
 /* Arm the trap. Called once the MCPX aperture exists, and only alongside the
  * rest of RECOMP_AC97_READY: a title that never gets as far as resetting a
  * channel has nothing to gain from it, and the page fault costs something. */
+/* The direct path's half of the trap (xbox_mmio.c): the store, then what
+ * the controller does with it. Reads stay plain memory. */
+static void ac97_direct_write(void *page, uint32_t off, uint64_t v, int size)
+{
+    memcpy((char *)page + off, &v, (size_t)size);
+    ac97_clear_reset_bits();
+}
+
 static void ac97_arm_write_trap(void)
 {
     DWORD old;
@@ -456,6 +465,14 @@ static void ac97_arm_write_trap(void)
     if (!g_mcpx_memory || g_ac97_page)
         return;
     g_ac97_page = (char *)g_mcpx_memory + AC97_NABM_OFFSET;
+    xbox_MmioRegister(XBOX_MCPX_BASE + AC97_NABM_OFFSET, AC97_TRAP_BYTES,
+                      XBOX_MCPX_BASE + AC97_NABM_OFFSET, g_ac97_page, NULL, ac97_direct_write);
+    if (!xbox_MmioTraps()) {
+        fprintf(stderr, "  AC97: bus-master writes modelled at 0x%08X"
+                        " (channel reset completes on write)\n",
+                XBOX_MCPX_BASE + AC97_NABM_OFFSET);
+        return;
+    }
     /* First, so it runs before the game target's own crash reporter, which
      * would otherwise print the write as an access violation. */
     g_ac97_veh = AddVectoredExceptionHandler(1, ac97_write_veh);
@@ -2772,9 +2789,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                  * memory keeps what the title writes. */
                 enum { APU_TRAP_BYTES = 0x00030000 };
                 DWORD old_protect;
-                if (VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
-                                   PAGE_NOACCESS, &old_protect))
-                    g_apu_mmio_trapped = 1;
+                /* Modelled: guest code reaches the registers by direct call
+                 * once main.c registers the APU (xbox_mmio.c); the page trap
+                 * is only for RECOMP_MMIO_TRAPS=1. */
+                g_apu_mmio_trapped = 1;
+                if (xbox_MmioTraps())
+                    VirtualProtect((char *)g_mcpx_memory, APU_TRAP_BYTES,
+                                   PAGE_NOACCESS, &old_protect);
                 if (g_apu_mmio_trapped)
                     fprintf(stderr, "  APU: 0x%08X..0x%08X trapped for MMIO"
                                     " (GP/EP DSP memory left as RAM)\n",
@@ -2990,7 +3011,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * whether a title uses it -- see RECOMP_MIRRORS above. */
         const char *tiled_env = getenv("RECOMP_TILED");
         int tiled_on = !(tiled_env && strcmp(tiled_env, "0") == 0);
-#if defined(__SWITCH__)
+#if defined(XBOX_FOLD_HIGH)
+        tiled_on = 0;               /* XBOX_FOLD lands it on the contiguous window */
+#elif defined(__SWITCH__)
         tiled_on = 0;               /* an alias; see RECOMP_MIRRORS */
 #endif
         if (tiled_size > XBOX_CONTIG_SIZE)
@@ -3037,6 +3060,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                     " (aliases the contiguous window)\n",
                     (unsigned)(g_memory_size / (1024 * 1024)),
                     XBOX_TILED_BASE);
+        } else if (XBOX_FOLD(XBOX_TILED_BASE) == XBOX_FOLD(XBOX_CONTIG_BASE)) {
+            fprintf(stderr, "  Tiled aperture: folded onto the contiguous window\n");
         } else {
             fprintf(stderr, "  WARNING: tiled aperture at 0x%08X failed"
                     " (error %lu); rendering writes will fault\n",

@@ -22,6 +22,7 @@ import sys
 # at startup, so a by-value import would freeze the fallback layout.
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
+from .mem_stores import route_mem_stores
 from .disasm import Disassembler
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
@@ -2895,7 +2896,7 @@ class BatchTranslator:
         if output_file is None:
             output_file = os.path.join(self.output_dir, "recompiled.c")
 
-        output_text = "\n".join(c_chunks)
+        output_text = route_mem_stores("\n".join(c_chunks))
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(output_text)
 
@@ -3152,7 +3153,7 @@ class BatchTranslator:
                 "",
             ]
             for addr, name, code in chunk:
-                c_lines.append(code)
+                c_lines.append(route_mem_stores(code))
 
             write_if_changed(c_path, "\n".join(c_lines))
             generated_files.append(c_path)

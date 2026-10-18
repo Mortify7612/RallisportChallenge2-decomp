@@ -450,27 +450,91 @@ void recomp_trace_bb(uint32_t va, uint32_t ebp);
  * A function, so `addr` is evaluated once: hand-written code passes `p++`. */
 static inline uintptr_t xbox_ptr_folded(uint32_t a)
 {
-    return (uintptr_t)(a ^ ((uint32_t)((int32_t)a >> 31) << 30)) + (uintptr_t)g_xbox_mem_offset;
+    uint32_t o = (a ^ ((uint32_t)((int32_t)a >> 31) << 30))
+               + ((uint32_t)(a - 0xF0000000u < 0x04000000u) << 28);   /* tiled onto contiguous */
+    return (uintptr_t)o + (uintptr_t)g_xbox_mem_offset;
 }
 #define XBOX_PTR(addr) xbox_ptr_folded((uint32_t)(addr))
 #else
 #define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
 #endif
 
-/** Read/write N bytes at a flat Xbox memory address. */
-#define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
-#define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
-#define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
+/*
+ * Guest memory access. Reads are MEMn(addr), stores MEMn_W(addr, value) --
+ * the lifter writes every store in that form -- so both pass through here,
+ * and an access at or above 0xFD000000 (the NV2A and the MCPX devices) goes
+ * to the device models (xbox_mmio_read / xbox_mmio_write, src/kernel/
+ * xbox_mmio.c) instead of memory: a register store reaches its model as it
+ * happens, with no page fault to catch and decode. Below that line it is a
+ * plain load or store after one compare.
+ */
+#define XBOX_MMIO_BASE 0xFD000000u
+uint64_t xbox_mmio_read(uint32_t va, int size);
+void xbox_mmio_write(uint32_t va, uint64_t value, int size);
+#define RECOMP_IS_MMIO(a) __builtin_expect((a) >= XBOX_MMIO_BASE, 0)
+
+static inline uint8_t recomp_rd8(uint32_t a)
+{ return RECOMP_IS_MMIO(a) ? (uint8_t)xbox_mmio_read(a, 1) : *(volatile uint8_t *)XBOX_PTR(a); }
+static inline uint16_t recomp_rd16(uint32_t a)
+{ return RECOMP_IS_MMIO(a) ? (uint16_t)xbox_mmio_read(a, 2) : *(volatile uint16_t *)XBOX_PTR(a); }
+static inline uint32_t recomp_rd32(uint32_t a)
+{ return RECOMP_IS_MMIO(a) ? (uint32_t)xbox_mmio_read(a, 4) : *(volatile uint32_t *)XBOX_PTR(a); }
+static inline uint64_t recomp_rd64(uint32_t a)
+{ return RECOMP_IS_MMIO(a) ? xbox_mmio_read(a, 8) : *(volatile uint64_t *)XBOX_PTR(a); }
+static inline float recomp_rdf(uint32_t a)
+{
+    if (RECOMP_IS_MMIO(a)) { uint32_t b = (uint32_t)xbox_mmio_read(a, 4); float f; memcpy(&f, &b, 4); return f; }
+    return *(volatile float *)XBOX_PTR(a);
+}
+static inline double recomp_rdd(uint32_t a)
+{
+    if (RECOMP_IS_MMIO(a)) { uint64_t b = xbox_mmio_read(a, 8); double d; memcpy(&d, &b, 8); return d; }
+    return *(volatile double *)XBOX_PTR(a);
+}
+static inline void recomp_wr8(uint32_t a, uint8_t v)
+{ if (RECOMP_IS_MMIO(a)) xbox_mmio_write(a, v, 1); else *(volatile uint8_t *)XBOX_PTR(a) = v; }
+static inline void recomp_wr16(uint32_t a, uint16_t v)
+{ if (RECOMP_IS_MMIO(a)) xbox_mmio_write(a, v, 2); else *(volatile uint16_t *)XBOX_PTR(a) = v; }
+static inline void recomp_wr32(uint32_t a, uint32_t v)
+{ if (RECOMP_IS_MMIO(a)) xbox_mmio_write(a, v, 4); else *(volatile uint32_t *)XBOX_PTR(a) = v; }
+static inline void recomp_wr64(uint32_t a, uint64_t v)
+{ if (RECOMP_IS_MMIO(a)) xbox_mmio_write(a, v, 8); else *(volatile uint64_t *)XBOX_PTR(a) = v; }
+static inline void recomp_wrf(uint32_t a, float v)
+{
+    if (RECOMP_IS_MMIO(a)) { uint32_t b; memcpy(&b, &v, 4); xbox_mmio_write(a, b, 4); }
+    else *(volatile float *)XBOX_PTR(a) = v;
+}
+static inline void recomp_wrd(uint32_t a, double v)
+{
+    if (RECOMP_IS_MMIO(a)) { uint64_t b; memcpy(&b, &v, 8); xbox_mmio_write(a, b, 8); }
+    else *(volatile double *)XBOX_PTR(a) = v;
+}
+
+/** Read N bytes at a flat Xbox memory address. */
+#define MEM8(addr)   recomp_rd8((uint32_t)(addr))
+#define MEM16(addr)  recomp_rd16((uint32_t)(addr))
+#define MEM32(addr)  recomp_rd32((uint32_t)(addr))
 
 /** Signed memory reads. */
-#define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
-#define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))
-#define SMEM32(addr) (*(volatile int32_t  *)XBOX_PTR(addr))
-#define SMEM64(addr) (*(volatile int64_t  *)XBOX_PTR(addr))
+#define SMEM8(addr)  ((int8_t)recomp_rd8((uint32_t)(addr)))
+#define SMEM16(addr) ((int16_t)recomp_rd16((uint32_t)(addr)))
+#define SMEM32(addr) ((int32_t)recomp_rd32((uint32_t)(addr)))
+#define SMEM64(addr) ((int64_t)recomp_rd64((uint32_t)(addr)))
 
 /** Float/double memory access. */
-#define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
-#define MEMD(addr)   (*(volatile double   *)XBOX_PTR(addr))
+#define MEMF(addr)   recomp_rdf((uint32_t)(addr))
+#define MEMD(addr)   recomp_rdd((uint32_t)(addr))
+
+/** Stores. Variadic so a value with a top-level comma stays one argument. */
+#define MEM8_W(addr, ...)   recomp_wr8((uint32_t)(addr), (uint8_t)(__VA_ARGS__))
+#define MEM16_W(addr, ...)  recomp_wr16((uint32_t)(addr), (uint16_t)(__VA_ARGS__))
+#define MEM32_W(addr, ...)  recomp_wr32((uint32_t)(addr), (uint32_t)(__VA_ARGS__))
+#define SMEM8_W(addr, ...)  recomp_wr8((uint32_t)(addr), (uint8_t)(int8_t)(__VA_ARGS__))
+#define SMEM16_W(addr, ...) recomp_wr16((uint32_t)(addr), (uint16_t)(int16_t)(__VA_ARGS__))
+#define SMEM32_W(addr, ...) recomp_wr32((uint32_t)(addr), (uint32_t)(int32_t)(__VA_ARGS__))
+#define SMEM64_W(addr, ...) recomp_wr64((uint32_t)(addr), (uint64_t)(int64_t)(__VA_ARGS__))
+#define MEMF_W(addr, ...)   recomp_wrf((uint32_t)(addr), (float)(__VA_ARGS__))
+#define MEMD_W(addr, ...)   recomp_wrd((uint32_t)(addr), (double)(__VA_ARGS__))
 
 /* ================================================================
  * SSE / XMM register state
@@ -538,8 +602,8 @@ static inline RecompXmm XMM_MEM(uint32_t addr) {
 }
 
 static inline void XMM_STORE(uint32_t addr, RecompXmm v) {
-    MEM32(addr)      = v.u[0]; MEM32(addr + 4)  = v.u[1];
-    MEM32(addr + 8)  = v.u[2]; MEM32(addr + 12) = v.u[3];
+    MEM32_W(addr, v.u[0]);     MEM32_W(addr + 4, v.u[1]);
+    MEM32_W(addr + 8, v.u[2]); MEM32_W(addr + 12, v.u[3]);
 }
 
 /* movlps/movhps move 8 bytes into or out of one half, leaving the
@@ -557,8 +621,8 @@ static inline void recomp_xmm_load_half(RecompXmm *dst, uint32_t addr,
 
 static inline void recomp_xmm_store_half(uint32_t addr, RecompXmm src,
                                          int high) {
-    MEM32(addr)     = src.u[high * 2];
-    MEM32(addr + 4) = src.u[high * 2 + 1];
+    MEM32_W(addr, src.u[high * 2]);
+    MEM32_W(addr + 4, src.u[high * 2 + 1]);
 }
 
 /** movlhps: dst high = src low. */
@@ -839,7 +903,7 @@ static inline uint16_t ROR16(uint16_t val, int n) {
 #define PUSH32(sp, val) do { \
     uint32_t _pv = (uint32_t)(val); \
     (sp) -= 4; \
-    MEM32(sp) = _pv; \
+    MEM32_W(sp, _pv); \
 } while(0)
 
 /**

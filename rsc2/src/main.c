@@ -56,6 +56,7 @@
 /* xboxrecomp runtime headers */
 #include <xbox/xboxrecomp.h>
 #include "platform/guest_addr.h"   /* XBOX_FOLD / XBOX_UNFOLD */
+#include "kernel/xbox_mmio.h"
 #include "launcher.h"
 
 #ifndef CONTEXT_PC
@@ -263,6 +264,18 @@ extern bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 /* The trapped span, matching what MemoryLayoutInit unmaps: the APU's own
  * 512 KB, not the whole MCPX aperture. AC'97 above it stays plain memory,
  * which is what the codec-ready bit needs. */
+/* The APU model behind the direct MMIO path (xbox_mmio.c). */
+extern uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
+extern void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
+static uint64_t apu_mmio_rd(void *d, uint32_t off, int size)
+{
+    return mcpx_apu_mmio_read((MCPXAPUState *)d, off, (unsigned)size);
+}
+static void apu_mmio_wr(void *d, uint32_t off, uint64_t v, int size)
+{
+    mcpx_apu_mmio_write((MCPXAPUState *)d, off, v, (unsigned)size);
+}
+
 #define APU_TRAP_BASE 0xFE800000u
 #define APU_TRAP_END  0xFE880000u
 
@@ -638,6 +651,11 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
         g_apu_state = mcpx_apu_init_standalone((uint8_t *)xbox_GetMemoryBase());
         fprintf(stderr, "[BOOT] emulated APU %s\n",
                 g_apu_state ? "up" : "FAILED to initialise");
+        /* Its registers and voice processor, by direct call from guest code
+         * (xbox_mmio.c); the DSP memories above stay plain memory. */
+        if (g_apu_state)
+            xbox_MmioRegister(APU_TRAP_BASE, 0x00030000u, APU_TRAP_BASE, g_apu_state,
+                              apu_mmio_rd, apu_mmio_wr);
     }
 
     /* Step 3: Initialize Xbox kernel */
@@ -970,7 +988,7 @@ int SDL_main(int argc, char **argv)
  * card, and everything lives next to it, sdmc:/switch/rsc2/ by default:
  *
  *   game/      the player's copy of the game (default.xbe, Media, ...)
- *   rsc2.env   settings, as on Android
+ *   rsc2.env   settings, as on Android; NAME=value arguments override them
  *   rsc2.log   stderr and stdout, unless started with `nxlink -s`, which
  *              streams them to the PC instead
  *   config/ data/ cache/   what $XDG_*_HOME point at on Linux
@@ -1015,14 +1033,10 @@ static void switch_setup(int argc, char **argv)
             socketExit();
     }
     if (!nxlink) {
-        /* The descriptors, not the FILEs: newlib gives each thread its own
-         * stdout/stderr, which write to descriptors 1 and 2. */
-        int lfd = open("rsc2.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (lfd >= 0) {
-            dup2(lfd, 1);
-            dup2(lfd, 2);
-            close(lfd);
-        }
+        /* Every thread's stdout/stderr, buffered (platform/switch/nx_host.c:
+         * unbuffered SD writes cost about 60 ms a line). */
+        extern int nx_log_open(const char *path);
+        nx_log_open("rsc2.log");
     }
     fprintf(stderr, "[SWITCH] files in %s; game data expected in %s/game\n", base, base);
     setenv("HOME", base, 0);
@@ -1032,12 +1046,29 @@ static void switch_setup(int argc, char **argv)
         setenv(xdg[i][0], p, 0);
     }
     read_env_file("SWITCH");
-    /* No launcher; full screen at the game's 16:9 (the screen's shape). The
-     * software rasteriser draws until there is a GPU renderer. */
+    /* NAME=value arguments (nxlink --args, rsc2/switch/send.sh) are
+     * settings for this run, over rsc2.env's. */
+    for (i = 1; i < (size_t)argc; i++) {
+        const char *eq = argv[i] ? strchr(argv[i], '=') : NULL;
+        char name[128];
+        if (!eq || eq == argv[i] || (size_t)(eq - argv[i]) >= sizeof name)
+            continue;
+        snprintf(name, sizeof name, "%.*s", (int)(eq - argv[i]), argv[i]);
+        setenv(name, eq + 1, 1);
+        fprintf(stderr, "[SWITCH] argument: %s\n", argv[i]);
+    }
+    {
+        /* Applet mode is too small (platform/switch/nx_memcheck.c). */
+        extern int nx_memory_check(void);
+        if (!nx_memory_check())
+            exit(0);
+    }
+    /* No launcher; full screen at the game's 16:9 (the screen's shape).
+     * RECOMP_VULKAN (on by default) means the GPU renderer, here the OpenGL
+     * one (nv2a_gl.c); =0 in rsc2.env falls back to the software one. */
     setenv("RSC2_LAUNCHER", "0", 0);
     setenv("RECOMP_FULLSCREEN", "1", 0);
     setenv("RECOMP_WIDESCREEN", "1", 0);
-    setenv("RECOMP_VULKAN", "0", 0);
 }
 #endif
 

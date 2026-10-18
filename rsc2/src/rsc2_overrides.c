@@ -94,7 +94,7 @@ void sub_000A0DC0(void)
     zcode here;
 
 #define NEXTBYTE() (MEM8(in++))
-#define COPYBYTE() (MEM8(out++) = MEM8(from++))
+#define COPYBYTE() MEM8_W(out++, MEM8(from++))
 
     do {
         if (bits < 15) {
@@ -106,7 +106,7 @@ dolen:
         op = here.bits; hold >>= op; bits -= op;
         op = here.op;
         if (op == 0) {                          /* literal */
-            MEM8(out++) = (uint8_t)here.val;
+            MEM8_W(out++, (uint8_t)here.val);
         } else if (op & 16) {                   /* length base */
             len = here.val;
             op &= 15;                           /* number of extra bits */
@@ -136,8 +136,8 @@ dodist:
                 if (dist > op) {                /* copy from the window */
                     op = dist - op;
                     if (op > whave) {
-                        MEM32(strm + ZS_MSG) = ZMSG_TOO_FAR;
-                        MEM32(state + IS_MODE) = ZMODE_BAD;
+                        MEM32_W(strm + ZS_MSG, ZMSG_TOO_FAR);
+                        MEM32_W(state + IS_MODE, ZMODE_BAD);
                         break;
                     }
                     from = window;
@@ -181,19 +181,19 @@ dodist:
                 here = zcode_at(dcode, here.val + (hold & ((1u << op) - 1)));
                 goto dodist;
             } else {
-                MEM32(strm + ZS_MSG) = ZMSG_BAD_DIST;
-                MEM32(state + IS_MODE) = ZMODE_BAD;
+                MEM32_W(strm + ZS_MSG, ZMSG_BAD_DIST);
+                MEM32_W(state + IS_MODE, ZMODE_BAD);
                 break;
             }
         } else if ((op & 64) == 0) {            /* second-level length code */
             here = zcode_at(lcode, here.val + (hold & ((1u << op) - 1)));
             goto dolen;
         } else if (op & 32) {                   /* end of block */
-            MEM32(state + IS_MODE) = ZMODE_TYPE;
+            MEM32_W(state + IS_MODE, ZMODE_TYPE);
             break;
         } else {
-            MEM32(strm + ZS_MSG) = ZMSG_BAD_LITLEN;
-            MEM32(state + IS_MODE) = ZMODE_BAD;
+            MEM32_W(strm + ZS_MSG, ZMSG_BAD_LITLEN);
+            MEM32_W(state + IS_MODE, ZMODE_BAD);
             break;
         }
     } while (in < last && out < end);
@@ -208,12 +208,12 @@ dodist:
     bits -= len << 3;
     hold &= (1u << bits) - 1;
 
-    MEM32(strm + ZS_NEXT_IN)   = in;
-    MEM32(strm + ZS_NEXT_OUT)  = out;
-    MEM32(strm + ZS_AVAIL_IN)  = in < last ? 5 + (last - in) : 5 - (in - last);
-    MEM32(strm + ZS_AVAIL_OUT) = out < end ? 257 + (end - out) : 257 - (out - end);
-    MEM32(state + IS_HOLD) = hold;
-    MEM32(state + IS_BITS) = bits;
+    MEM32_W(strm + ZS_NEXT_IN, in);
+    MEM32_W(strm + ZS_NEXT_OUT, out);
+    MEM32_W(strm + ZS_AVAIL_IN, in < last ? 5 + (last - in) : 5 - (in - last));
+    MEM32_W(strm + ZS_AVAIL_OUT, out < end ? 257 + (end - out) : 257 - (out - end));
+    MEM32_W(state + IS_HOLD, hold);
+    MEM32_W(state + IS_BITS, bits);
 
     g_esp += 4; /* ret (cdecl) */
 }
@@ -242,7 +242,7 @@ void sub_0030FD2A(void)
 
     if (xnaddr)
         for (i = 0; i < XNADDR_SIZE; i++)
-            MEM8(xnaddr + i) = 0;
+            MEM8_W(xnaddr + i, 0);
     g_eax = XNET_GET_XNADDR_NONE;
     g_esp += 8; /* ret 4 */
 }
@@ -363,7 +363,7 @@ static void fiber_restore(const HostFiber *f)
 {
     g_eax = f->eax; g_ecx = f->ecx; g_edx = f->edx; g_ebx = f->ebx;
     g_esp = f->esp; g_ebp = f->ebp; g_esi = f->esi; g_edi = f->edi;
-    g_seh_ebp = f->seh_ebp; MEM32(XBOX_FS_BASE) = f->fs0;
+    g_seh_ebp = f->seh_ebp; MEM32_W(XBOX_FS_BASE, f->fs0);
 }
 
 /* First activation: pop what CreateFiber put on the fiber's stack -- SEH
@@ -375,7 +375,7 @@ static void fiber_run(HostFiber *f)
     uint32_t s = MEM32(f->va + FIBER_SAVED_ESP), ret;
     recomp_func_t fn;
 
-    MEM32(XBOX_FS_BASE) = MEM32(s);
+    MEM32_W(XBOX_FS_BASE, MEM32(s));
     g_ebx = MEM32(s + 4);  g_edi = MEM32(s + 8);
     g_esi = MEM32(s + 12); g_ebp = MEM32(s + 16); g_seh_ebp = g_ebp;
     ret = MEM32(s + 20);
@@ -441,8 +441,8 @@ void sub_00082E25(void)
     t = fiber_get(target);
     c->started = 1;                  /* it is running: it is this context */
 
-    MEM32(cur + FIBER_SAVED_ESP) = g_esp;
-    MEM32(tdata + FIBER_SLOT_OFF) = target;
+    MEM32_W(cur + FIBER_SAVED_ESP, g_esp);
+    MEM32_W(tdata + FIBER_SLOT_OFF, target);
 
     g_esp += 8;                      /* what this call's ret 4 leaves on resume */
     fiber_save(c);
@@ -575,8 +575,8 @@ loc_0037E5C0: ;
     ecx = MEM32(edx + 8);
     PUSH32(esp, edi);
     edi = MEM32(esp + 0x14);
-    MEM32(edi) = ecx;
-    MEM8(edx + 0xA2) = MEM8(edx + 0xA2) & 0xEF;
+    MEM32_W(edi, ecx);
+    MEM8_W(edx + 0xA2, MEM8(edx + 0xA2) & 0xEF);
     _fa = (uint32_t)(MEM8(edx + 0xA2)) & 0xFFu; _fas = (int32_t)(int8_t)(_fa); /* and result */
     ecx = MEM32(edx + 0xA3);
     ecx = MEM32(ecx + 8);
@@ -592,10 +592,10 @@ loc_0037E5C0: ;
     if (!g_df && esi < 0xFD000000u && edi < 0xFD000000u && (uint64_t)esi + _n <= 0xFD000000u && (uint64_t)edi + _n <= 0xFD000000u) {
       uint8_t *_d = (uint8_t*)XBOX_PTR(edi), *_s = (uint8_t*)XBOX_PTR(esi);
       if ((uint64_t)edi + _n <= esi || (uint64_t)esi + _n <= edi) memcpy(_d, _s, (size_t)_n);
-      else { uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*4u) = MEM32(esi + _i*4u); }
+      else { uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM32_W(edi + _i*4u, MEM32(esi + _i*4u)); }
       esi += ecx * 4u; edi += ecx * 4u; }
     else { uint32_t _i; int32_t _st = RECOMP_DF_STEP(4);
-      for (_i = 0; _i < ecx; _i++) MEM32(edi + _i*_st) = MEM32(esi + _i*_st);
+      for (_i = 0; _i < ecx; _i++) MEM32_W(edi + _i*_st, MEM32(esi + _i*_st));
       esi += ecx * _st; edi += ecx * _st; }
     ecx = 0; } /* rep movsd */
     ecx = edx;
@@ -605,10 +605,10 @@ loc_0037E5C0: ;
     if (!g_df && esi < 0xFD000000u && edi < 0xFD000000u && (uint64_t)esi + _n <= 0xFD000000u && (uint64_t)edi + _n <= 0xFD000000u) {
       uint8_t *_d = (uint8_t*)XBOX_PTR(edi), *_s = (uint8_t*)XBOX_PTR(esi);
       if ((uint64_t)edi + _n <= esi || (uint64_t)esi + _n <= edi) memcpy(_d, _s, (size_t)_n);
-      else { uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM8(edi + _i*1u) = MEM8(esi + _i*1u); }
+      else { uint32_t _i; for (_i = 0; _i < ecx; _i++) MEM8_W(edi + _i*1u, MEM8(esi + _i*1u)); }
       esi += ecx * 1u; edi += ecx * 1u; }
     else { uint32_t _i; int32_t _st = RECOMP_DF_STEP(1);
-      for (_i = 0; _i < ecx; _i++) MEM8(edi + _i*_st) = MEM8(esi + _i*_st);
+      for (_i = 0; _i < ecx; _i++) MEM8_W(edi + _i*_st, MEM8(esi + _i*_st));
       esi += ecx * _st; edi += ecx * _st; }
     ecx = 0; } /* rep movsb */
     esi = ebx;
@@ -723,7 +723,7 @@ void sub_0037E590(void)
         if (MEM8(0x488710)) {
             float a = nv2a_vk_view_aspect();
             if (a > 16.0f / 9.0f)
-                MEMF(0x3DFE94) = a;
+                MEMF_W(0x3DFE94, a);
         }
     }
     if (!mode || !pstate)
@@ -786,13 +786,13 @@ void sub_0037E590(void)
             memcpy(last[port], x->s, XI_STATE_BYTES);
             have[port] = 1;
         }
-        MEM32(pstate) = packet[port];
+        MEM32_W(pstate, packet[port]);
         for (i = 4; i < XI_STATE_BYTES; i++)
-            MEM8(pstate + (uint32_t)i) = x->s[i];
+            MEM8_W(pstate + (uint32_t)i, x->s[i]);
         g_eax = x->ret;
     } else {
         for (i = 4; i < XI_STATE_BYTES; i++)
-            MEM8(pstate + (uint32_t)i) = 0;
+            MEM8_W(pstate + (uint32_t)i, 0);
     }
 }
 
@@ -852,13 +852,13 @@ void sub_0036C636(void)
         for (i = 0; i < 256; i++)
             ramp[c][i] = MEM8(edx + c * 0x100 + i);
     nv2a_vk_set_gamma(ramp[0], ramp[1], ramp[2]);
-    MEM8(regs + 0x6813C8) = 0;
+    MEM8_W(regs + 0x6813C8, 0);
     for (i = 0; i < 256; i++) {
         if (!(i & 7))
             (void)MEM32(regs + 0x3240);     /* the original's read-back */
-        MEM8(regs + 0x6813C9) = ramp[0][i];
-        MEM8(regs + 0x6813C9) = ramp[1][i];
-        MEM8(regs + 0x6813C9) = ramp[2][i];
+        MEM8_W(regs + 0x6813C9, ramp[0][i]);
+        MEM8_W(regs + 0x6813C9, ramp[1][i]);
+        MEM8_W(regs + 0x6813C9, ramp[2][i]);
     }
     /* Registers as the original's loop leaves them. */
     ecx = regs;
@@ -905,14 +905,14 @@ void sub_00365590(void)
             break;
     if (i < 0xC0) {
         for (i = 0; i < 0xC0; i++)
-            MEM32(dst + i * 4) = MEM32(ramp + i * 4);
-        MEM32(blk + 0x7E4u) = slot;
+            MEM32_W(dst + i * 4, MEM32(ramp + i * 4));
+        MEM32_W(blk + 0x7E4u, slot);
         if (flags & 2) {
             eax = blk;
             edx = dst;
             PUSH32(esp, 0x003655F7u); RECOMP_ABI_CALL(0x0036C636u, sub_0036C636);
         } else {
-            MEM32(blk + 0x7DCu + slot * 4) = 1;
+            MEM32_W(blk + 0x7DCu + slot * 4, 1);
         }
     }
     eax = blk;

@@ -402,8 +402,14 @@ void xbox_kernel_init(void)
     InitializeCriticalSection(&g_log_cs);
     g_log_cs_init = TRUE;
 
-    /* Try to open log file, fall back to stderr */
+    /* Try to open log file, fall back to stderr. Not on the Switch: its
+     * per-line flush to the SD card cost about 60 ms a line there; stderr
+     * is buffered into rsc2.log (platform/switch/nx_host.c). */
+#if defined(__SWITCH__)
+    g_log_file = NULL;
+#else
     g_log_file = fopen("xbox_kernel.log", "w");
+#endif
 
     /* Set log level from environment variable if present */
     const char* log_env = getenv("XBOX_LOG_LEVEL");
