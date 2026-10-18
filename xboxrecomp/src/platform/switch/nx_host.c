@@ -596,6 +596,18 @@ static const devoptab_t s_log_dev = {
     .write_r = log_write,
 };
 
+/* CPU time the calling thread has used, in microseconds (ticks at 19.2 MHz;
+ * InfoType_ThreadTickCount on 13.0.0+, the older id before). */
+uint64_t nx_thread_cpu_us(void)
+{
+    u64 t = 0;
+    if (R_FAILED(svcGetInfo(&t, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, (u64)-1))
+            && R_FAILED(svcGetInfo(&t, InfoType_ThreadTickCountDeprecated, CUR_THREAD_HANDLE,
+                                   (u64)-1)))
+        return 0;
+    return t * 10 / 192;
+}
+
 /* Thread placement (win32_compat.c, "Thread placement"): priority 59
  * (libnx's for pthreads; 60 for a guest thread under RECOMP_GUEST_PRIO=lower),
  * allowed on the application's cores 0-2 with its preferred core in turn. */

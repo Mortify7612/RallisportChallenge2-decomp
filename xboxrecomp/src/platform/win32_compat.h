@@ -134,6 +134,8 @@ int         w32_handle_rename_open(const char *old_path, const char *new_path);
 /* The calling thread runs guest code from now on: placed below the host
  * threads (win32_compat.c, "Thread placement"). */
 void        w32_thread_is_guest(void);
+/* CPU time the calling thread has used, in microseconds. */
+uint64_t    w32_thread_cpu_us(void);
 /* After a rename: the path the handle now names. FALSE if h is not a file. */
 BOOL        w32_handle_set_path(HANDLE h, const char *host_path);
 

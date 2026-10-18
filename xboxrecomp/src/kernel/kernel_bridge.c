@@ -9644,6 +9644,10 @@ static struct stall_rec {
     volatile uint32_t ordinal, esp, ret, inside, stack_top, calls;
     volatile uint16_t recent[8];        /* the last ordinals, oldest first */
     volatile uint32_t *esp_now;         /* the thread's g_esp, live */
+    volatile uint64_t cpu_us;           /* its CPU time, sampled (xbox_thread_tick) */
+    volatile uint32_t polls;            /* device-register polls, in 64s */
+    uint64_t rep_cpu;                   /* at the last xbox_thread_perf_report */
+    uint32_t rep_calls, rep_polls;
 } s_stall[STALL_THREADS];
 static volatile LONG s_stall_n;
 static RECOMP_TLS struct stall_rec *t_stall;
@@ -9732,6 +9736,43 @@ static DWORD WINAPI stall_watch(LPVOID arg)
     return 0;
 }
 
+/* A guest thread's CPU time, sampled now and then: every 64th kernel call,
+ * and from xbox_mmio_read's poll yield (a thread waiting for the hardware
+ * makes no kernel calls). */
+void xbox_thread_tick(int poll)
+{
+    if (!t_stall)
+        return;
+    if (poll)
+        t_stall->polls++;
+#if !defined(_WIN32)
+    t_stall->cpu_us = w32_thread_cpu_us();
+#endif
+}
+
+/* RECOMP_PERF (on by default on the Switch): every few seconds, each busy
+ * guest thread's share of a CPU, kernel calls and register polls since the
+ * last report. Called from the pushbuffer thread (nv2a_gl.c). */
+void xbox_thread_perf_report(double secs)
+{
+    LONG n = s_stall_n, i;
+    if (secs <= 0)
+        return;
+    for (i = 0; i < n && i < STALL_THREADS; i++) {
+        struct stall_rec *r = &s_stall[i];
+        uint64_t cpu = r->cpu_us;
+        uint32_t calls = r->calls, polls = r->polls;
+        double pct = (double)(cpu - r->rep_cpu) / (secs * 1e4);
+        if (pct >= 2.0 || calls - r->rep_calls > 1000)
+            fprintf(stderr, "[PERF]   guest thread %ld: %3.0f%% cpu, %u calls/s, %u polls/s,"
+                    " last ordinal %u\n", (long)i, pct, (unsigned)((calls - r->rep_calls) / secs),
+                    (unsigned)((double)(uint32_t)(polls - r->rep_polls) * 64.0 / secs), r->ordinal);
+        r->rep_cpu = cpu;
+        r->rep_calls = calls;
+        r->rep_polls = polls;
+    }
+}
+
 static void stall_note(int slot)
 {
     static volatile LONG started;
@@ -9765,6 +9806,8 @@ static void stall_note(int slot)
         t_stall->ret = g_esp ? BRIDGE_MEM32(g_esp) : 0;
         t_stall->recent[t_stall->calls % 8] = (uint16_t)t_stall->ordinal;
         t_stall->calls++;
+        if ((t_stall->calls & 63) == 0)
+            xbox_thread_tick(0);
         t_stall->inside = 1;
     }
 }

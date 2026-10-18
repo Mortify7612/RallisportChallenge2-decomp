@@ -987,6 +987,20 @@ static void w32_thread_place(int guest)
 #endif
 }
 
+/* CPU time the calling thread has used, in microseconds. */
+uint64_t w32_thread_cpu_us(void)
+{
+#if defined(__SWITCH__)
+    extern uint64_t nx_thread_cpu_us(void);
+    return nx_thread_cpu_us();
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+#endif
+}
+
 /* The calling thread runs guest code from now on. */
 void w32_thread_is_guest(void)
 {

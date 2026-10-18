@@ -91,8 +91,11 @@ uint64_t xbox_mmio_read(uint32_t va, int size)
     static __thread unsigned reads;
     int i = find(va);
     uint64_t v = 0;
-    if (++reads % XBOX_MMIO_YIELD_EVERY == 0)
+    if (++reads % XBOX_MMIO_YIELD_EVERY == 0) {
+        extern void xbox_thread_tick(int poll);
+        xbox_thread_tick(1);
         sched_yield();
+    }
     if (i >= 0 && s_mmio[i].rd)
         return s_mmio[i].rd(s_mmio[i].dev, va - s_mmio[i].off_base, size);
     memcpy(&v, plain(va), (size_t)size);
