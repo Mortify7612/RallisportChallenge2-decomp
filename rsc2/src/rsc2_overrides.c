@@ -400,12 +400,47 @@ static VOID CALLBACK fiber_entry(LPVOID p)
 #elif RSC2_HOST_CORO
 static void fiber_entry(void *p)
 {
+    if (getenv("RSC2_FIBER_TRACE"))
+        fprintf(stderr, "[FIBER] host coroutine entered for 0x%08X\n", ((HostFiber *)p)->va);
     fiber_run((HostFiber *)p);
 }
 #else
 static void fiber_entry(unsigned lo, unsigned hi)
 {
     fiber_run((HostFiber *)(((uintptr_t)hi << 32) | lo));
+}
+#endif
+
+#if RSC2_HOST_CORO && !defined(_WIN32)
+/* RSC2_FIBER_TRACE: before the first real switch, prove the host coroutine
+ * works here at all -- in, print, back -- on a small static stack and on an
+ * 8 MB one from mmap like the fibers'. */
+static void *s_ct_back, *s_ct_sp;
+static void coro_test_fn(void *arg)
+{
+    fprintf(stderr, "[FIBER] test coroutine %s: running (sp near %p)\n",
+            (const char *)arg, (void *)&arg);
+    coro_switch(&s_ct_sp, s_ct_back);
+    fprintf(stderr, "[FIBER] test coroutine resumed after its end\n");
+    abort();
+}
+static void coro_selftest(void)
+{
+    static unsigned char small[256 * 1024] __attribute__((aligned(16)));
+    void *big;
+    fprintf(stderr, "[FIBER] test 1: static %zu KB stack at %p\n", sizeof small / 1024,
+            (void *)small);
+    s_ct_sp = coro_init(small, sizeof small, coro_test_fn, (void *)"1");
+    coro_switch(&s_ct_back, s_ct_sp);
+    fprintf(stderr, "[FIBER] test 1 came back\n");
+    big = mmap(NULL, FIBER_HOST_STACK, PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    fprintf(stderr, "[FIBER] test 2: mmap'd stack at %p\n", big);
+    if (big != MAP_FAILED) {
+        s_ct_sp = coro_init(big, FIBER_HOST_STACK, coro_test_fn, (void *)"2");
+        coro_switch(&s_ct_back, s_ct_sp);
+        fprintf(stderr, "[FIBER] test 2 came back\n");
+    }
 }
 #endif
 
@@ -463,6 +498,13 @@ void sub_00082E25(void)
 #else
     if (!t->started) {
         uintptr_t p = (uintptr_t)t;
+#if RSC2_HOST_CORO
+        {
+            static int tested;
+            if (!tested++ && getenv("RSC2_FIBER_TRACE"))
+                coro_selftest();
+        }
+#endif
         t->stack = mmap(NULL, FIBER_HOST_STACK, PROT_READ | PROT_WRITE,
                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (t->stack == MAP_FAILED) {
@@ -492,6 +534,8 @@ void sub_00082E25(void)
          * come back from its record once swapcontext lands in it. */
     }
 #if RSC2_HOST_CORO
+    if (getenv("RSC2_FIBER_TRACE"))
+        fprintf(stderr, "[FIBER] host switch to sp %p (stack %p)\n", t->sp, t->stack);
     coro_switch(&c->sp, t->sp);
 #else
     swapcontext(&c->uc, &t->uc);

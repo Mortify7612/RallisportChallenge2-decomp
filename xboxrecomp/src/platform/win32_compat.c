@@ -927,6 +927,104 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+/* Thread placement: which priority and cores a thread runs at.
+ *
+ * A title waits for the hardware by polling memory -- a fence the
+ * pushbuffer executor writes, a register a device model changes -- and the
+ * Xbox kernel time-slices, so on the console the poller is preempted and the
+ * writer runs. Horizon does not time-slice threads of one priority, and
+ * neither does Linux under SCHED_FIFO: a poller keeps its core, and a writer
+ * waiting for that core waits forever. What helps is other cores, which pick
+ * up a waiting thread, and not ranking a poller above the threads it waits
+ * for.
+ *
+ * Switch (platform/switch/nx_host.c): libnx starts every pthread at
+ * priority 59 on the process's default core, and the main thread -- which
+ * becomes the title's main thread -- runs at 44, above them all, so a poll
+ * there starved everything. Every thread is placed at 59, allowed on all
+ * three application cores with its preferred one in turn.
+ *
+ * RECOMP_GUEST_PRIO=lower puts guest threads (w32_thread_is_guest) one step
+ * below the host threads instead. That stops a guest poll from holding off a
+ * host writer, but a host thread that polls with a yield (the NV2A busy-bit
+ * acknowledger) then holds off the guest threads.
+ *
+ * Linux: only under SCHED_FIFO (a model of the Switch: taskset -c 0-2 chrt
+ * -f 10 ./rsc2), threads at the process's starting priority, guest ones one
+ * below with RECOMP_GUEST_PRIO=lower. Otherwise nothing changes. */
+#if defined(__SWITCH__)
+extern void nx_thread_place(int guest);
+#endif
+static int s_fifo_base;     /* SCHED_FIFO priority at start; 0 if not FIFO */
+
+__attribute__((constructor)) static void w32_sched_note(void)
+{
+#if defined(__linux__) && !defined(__ANDROID__)
+    struct sched_param sp;
+    if (sched_getscheduler(0) == SCHED_FIFO && sched_getparam(0, &sp) == 0)
+        s_fifo_base = sp.sched_priority;
+#endif
+}
+
+static void w32_thread_place(int guest)
+{
+    static int lower = -1;
+    if (lower < 0) {
+        const char *e = getenv("RECOMP_GUEST_PRIO");
+        lower = e && strcmp(e, "lower") == 0;
+    }
+    guest = guest && lower;
+#if defined(__SWITCH__)
+    nx_thread_place(guest);
+#elif defined(__linux__) && !defined(__ANDROID__)
+    if (s_fifo_base > 1) {
+        struct sched_param sp;
+        sp.sched_priority = guest ? s_fifo_base - 1 : s_fifo_base;
+        pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+    }
+#else
+    (void)guest;
+#endif
+}
+
+/* The calling thread runs guest code from now on. */
+void w32_thread_is_guest(void)
+{
+    w32_thread_place(1);
+}
+
+#if defined(W32_WRAP_PTHREAD)
+/* -Wl,--wrap=pthread_create: every thread starts at the host placement,
+ * whoever created it (a guest thread's children inherit its lower priority
+ * on Linux). */
+struct w32_wrap_start { void *(*fn)(void *); void *arg; };
+
+static void *w32_wrap_entry(void *p)
+{
+    struct w32_wrap_start a = *(struct w32_wrap_start *)p;
+    free(p);
+    w32_thread_place(0);
+    return a.fn(a.arg);
+}
+
+int __real_pthread_create(pthread_t *t, const pthread_attr_t *attr,
+                          void *(*fn)(void *), void *arg);
+int __wrap_pthread_create(pthread_t *t, const pthread_attr_t *attr,
+                          void *(*fn)(void *), void *arg)
+{
+    struct w32_wrap_start *a = (struct w32_wrap_start *)malloc(sizeof *a);
+    int rc;
+    if (!a)
+        return __real_pthread_create(t, attr, fn, arg);
+    a->fn = fn;
+    a->arg = arg;
+    rc = __real_pthread_create(t, attr, w32_wrap_entry, a);
+    if (rc != 0)
+        free(a);
+    return rc;
+}
+#endif
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;

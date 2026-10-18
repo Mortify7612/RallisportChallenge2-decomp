@@ -48,15 +48,22 @@ __asm__(
     "    add  sp, sp, #176\n"
     "    ret\n"
     ".size coro_switch, .-coro_switch\n"
-    /* First activation lands here with fn in x19 and its argument in x20. */
+    /* First activation lands here with fn in x19 and its argument in x20.
+     * A real (hidden) symbol, not a bare label: C takes its address, and
+     * devkitA64 does that through the GOT, which for a local label got the
+     * address of the block's first instruction -- coro_switch -- so every
+     * new coroutine "returned" into coro_switch and spun there for good. */
     ".p2align 4\n"
+    ".globl coro_start\n"
+    ".hidden coro_start\n"
+    ".type coro_start, %function\n"
     "coro_start:\n"
     "    mov  x0, x20\n"
     "    mov  x29, #0\n"
     "    blr  x19\n"
     "    brk  #0\n");
 
-extern char coro_start[];
+extern char coro_start[] __attribute__((visibility("hidden")));
 
 void *coro_init(void *stack, size_t size, void (*fn)(void *), void *arg)
 {
@@ -96,15 +103,19 @@ __asm__(
     "    ret\n"
     ".size coro_switch, .-coro_switch\n"
     /* First activation: fn in r12, its argument in rbx; rsp is 16-aligned
-     * here, so the call below enters fn as any call would. */
+     * here, so the call below enters fn as any call would. A hidden global,
+     * as on AArch64. */
     ".p2align 4\n"
+    ".globl coro_start\n"
+    ".hidden coro_start\n"
+    ".type coro_start, @function\n"
     "coro_start:\n"
     "    movq  %rbx, %rdi\n"
     "    xorl  %ebp, %ebp\n"
     "    call  *%r12\n"
     "    ud2\n");
 
-extern char coro_start[];
+extern char coro_start[] __attribute__((visibility("hidden")));
 
 void *coro_init(void *stack, size_t size, void (*fn)(void *), void *arg)
 {

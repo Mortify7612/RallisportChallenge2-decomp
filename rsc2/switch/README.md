@@ -6,11 +6,10 @@ code is the same as on the other platforms; what differs is the host layer
 under it, in `xboxrecomp/src/platform/switch/`.
 
 **Status:**
-- It runs on a real Switch (Atmosphère, title-override mode) with the
-  software renderer: it boots, copies the Z: cache and reaches the menus,
-  at 1–3 fps.
-- The OpenGL renderer (`kernel/nv2a_gl.c`) works on Linux and has not been
-  tried on hardware yet.
+- It runs on a real Switch (Atmosphère, title-override mode). With the
+  OpenGL renderer it gets through the intros and menus to car selection at
+  about 7 fps, and loads a race at about 2 fps. The software renderer
+  manages 1–3 fps.
 - In the Ryujinx emulator it boots and plays the intro movies with the
   software renderer. See "Emulator" below.
 
@@ -120,12 +119,35 @@ into when it copies a disc archive into its Z: cache:
   positions (`w32_handle_rename_open`; `RECOMP_RENAME_REOPEN=1` forces this
   path on Linux for testing).
 
+### Threads
+
+Horizon does not time-slice threads of equal priority, and the title
+busy-waits for the GPU (and its device models) constantly. libnx starts
+every pthread at priority 59 on the default core while the main thread --
+the title's -- keeps 44, so a wait on it starved every host thread. Every
+thread is now placed explicitly (win32_compat.c, "Thread placement"): one
+priority, allowed on cores 0–2. Device-register polls yield every 64 reads.
+`taskset -c 0-2 chrt -f 10 ./rsc2` models this on Linux (one CPU shows
+every busy-wait).
+
+### Diagnostics
+
+- **Stall watchdog** (`RECOMP_STALL_DUMP=<s>`, 10 by default here): when
+  no frame is shown for that long, each guest thread's last kernel calls,
+  live guest stack and the host exception count are printed, twice. It
+  stands in for `kill -QUIT` thread dumps.
+- `RSC2_FIBER_TRACE=1` traces fiber switches and first runs a coroutine
+  self-test.
+
 ### Other gaps
 
 - **Missing headers:** newlib lacks `sys/mman.h`, `dlfcn.h`, `execinfo.h`,
   `sys/sysinfo.h` and `sys/syscall.h`; `platform/switch/include/` supplies
   them.
-- **Fibers:** they use `host_coro.c`, as on Android.
+- **Fibers:** they use `host_coro.c`, as on Android. Its `coro_start`
+  must be a hidden global symbol: as a bare label, devkitA64 took its
+  address through the GOT, got `coro_switch` instead, and every new fiber
+  spun there forever.
 - **Diagnostics:** the Linux signal-based ones (`kill -QUIT` thread dumps,
   the sampling profiler) are left out.
 
@@ -152,6 +174,5 @@ What Ryujinx's probe showed (real hardware agrees):
 
 ## Next
 
-1. **OpenGL renderer on hardware:** `send.sh <ip> RECOMP_VULKAN=1`.
-2. **GPU-resident surfaces:** keep render targets on the GPU instead of
-   reading them back every frame, for speed and for Ryujinx.
+1. **Speed:** keep render targets on the GPU instead of reading them back
+   every frame (also what Ryujinx needs), then profile the CPU side.

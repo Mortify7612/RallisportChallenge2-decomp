@@ -131,6 +131,9 @@ HANDLE      w32_handle_find_path(const char *host_path);
 HANDLE      w32_handle_share(HANDLE h);
 long long  *w32_handle_vpos(HANDLE h);
 int         w32_handle_rename_open(const char *old_path, const char *new_path);
+/* The calling thread runs guest code from now on: placed below the host
+ * threads (win32_compat.c, "Thread placement"). */
+void        w32_thread_is_guest(void);
 /* After a rename: the path the handle now names. FALSE if h is not a file. */
 BOOL        w32_handle_set_path(HANDLE h, const char *host_path);
 

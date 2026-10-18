@@ -596,6 +596,19 @@ static const devoptab_t s_log_dev = {
     .write_r = log_write,
 };
 
+/* Thread placement (win32_compat.c, "Thread placement"): priority 59
+ * (libnx's for pthreads; 60 for a guest thread under RECOMP_GUEST_PRIO=lower),
+ * allowed on the application's cores 0-2 with its preferred core in turn. */
+void nx_thread_place(int guest)
+{
+    static volatile int next;
+    int core = __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED) % 3;
+    Result rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 0x7);
+    Result rp = svcSetThreadPriority(CUR_THREAD_HANDLE, guest ? 0x3C : 0x3B);
+    if (R_FAILED(rc) || R_FAILED(rp))
+        fprintf(stderr, "[nx] thread placement: core mask 0x%x, priority 0x%x\n", rc, rp);
+}
+
 int nx_log_open(const char *path)
 {
     pthread_t t;
@@ -686,6 +699,20 @@ _Static_assert(sizeof(NxExcFrame) == 22 * 8 + 32 * 16, "NxExcFrame layout");
 static uint8_t s_exc_stack[0x10000] __attribute__((aligned(16)));
 __attribute__((visibility("hidden"))) void *nx_exc_stack_top = s_exc_stack + sizeof(s_exc_stack);
 
+/* For the stall watchdog (kernel_bridge.c): how many exceptions came
+ * through here, and the last one. A fault that a handler "resumes" without
+ * fixing comes straight back, silently, forever. */
+static volatile uint64_t s_exc_n, s_exc_pc, s_exc_far;
+static volatile uint32_t s_exc_esr;
+
+void nx_exc_stats(uint64_t *n, uint64_t *pc_off, uint64_t *far, uint32_t *esr)
+{
+    *n = s_exc_n;
+    *pc_off = s_exc_pc ? s_exc_pc - (uintptr_t)__start__ : 0;
+    *far = s_exc_far;
+    *esr = s_exc_esr;
+}
+
 __attribute__((visibility("hidden"), used))
 uint32_t nx_exc_dispatch(uint32_t desc, NxExcCtx *k, NxExcFrame *f)
 {
@@ -694,6 +721,11 @@ uint32_t nx_exc_dispatch(uint32_t desc, NxExcCtx *k, NxExcFrame *f)
     EXCEPTION_POINTERS ep;
     uint32_t ec = k->esr >> 26;
     int i;
+
+    s_exc_n++;
+    s_exc_pc = k->pc;
+    s_exc_far = k->far;
+    s_exc_esr = k->esr;
 
     for (i = 0; i < 9; i++)
         ctx.X[i] = k->x[i];

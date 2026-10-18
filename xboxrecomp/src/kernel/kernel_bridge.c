@@ -9609,6 +9609,13 @@ static int guest_cpu_enabled(void)
  * guest instruction. */
 void guest_cpu_join(void)
 {
+    static RECOMP_TLS int placed;
+    if (!placed) {
+        placed = 1;
+#if !defined(_WIN32)
+        w32_thread_is_guest();      /* below the host threads */
+#endif
+    }
     t_guest_thread = 1;
     if (guest_cpu_enabled() && !t_guest_held) {
         EnterCriticalSection(&g_guest_cpu);
@@ -9625,11 +9632,149 @@ void guest_cpu_part(void)
     t_guest_thread = 0;
 }
 
+/* Stall watchdog: RECOMP_STALL_DUMP=<seconds> (default 10 on the Switch,
+ * off elsewhere). When no frame has been shown for that long (three times
+ * that before the first one), every guest thread's last kernel call is printed once -- the ordinal, whether it is
+ * still inside it, its guest stack pointer and the return addresses found on
+ * its stack and its last eight calls -- which names where each one is
+ * waiting; a second dump as long again later shows who moved. It stands in for
+ * `kill -QUIT` thread dumps on a host without signals. */
+#define STALL_THREADS 64
+static struct stall_rec {
+    volatile uint32_t ordinal, esp, ret, inside, stack_top, calls;
+    volatile uint16_t recent[8];        /* the last ordinals, oldest first */
+    volatile uint32_t *esp_now;         /* the thread's g_esp, live */
+} s_stall[STALL_THREADS];
+static volatile LONG s_stall_n;
+static RECOMP_TLS struct stall_rec *t_stall;
+static RECOMP_TLS int t_stall_none;
+
+extern uint32_t nv2a_pb_flip_count(void);
+
+static void stall_dump(uint32_t flips, int secs)
+{
+    LONG n = s_stall_n, i;
+    fprintf(stderr, "[STALL] no frame for %d s (stuck at flip %u); %ld guest threads:\n",
+            secs, flips, (long)n);
+#if defined(__SWITCH__)
+    {
+        extern void nx_exc_stats(uint64_t *n, uint64_t *pc_off, uint64_t *far, uint32_t *esr);
+        uint64_t en, pc, far;
+        uint32_t esr;
+        nx_exc_stats(&en, &pc, &far, &esr);
+        fprintf(stderr, "  host exceptions: %llu; last pc rsc2.elf+%#llx far %#llx esr %#x\n",
+                (unsigned long long)en, (unsigned long long)pc, (unsigned long long)far, esr);
+    }
+#endif
+    for (i = 0; i < n && i < STALL_THREADS; i++) {
+        struct stall_rec *r = &s_stall[i];
+        uint32_t esp = r->esp, a, end, found = 0;
+        char line[512];
+        int len = snprintf(line, sizeof line, "  thread %ld: %s ordinal %u, ret 0x%08X,"
+                           " esp 0x%08X, %u calls; stack:", (long)i,
+                           r->inside ? "IN" : "after", r->ordinal, r->ret, esp, r->calls);
+        end = r->stack_top && r->stack_top > esp ? r->stack_top : esp + 0x4000;
+        if (end - esp > 0x4000)
+            end = esp + 0x4000;
+        /* Values that look like return addresses into the XBE image. */
+        for (a = esp; esp && a < end && found < 24 && len < (int)sizeof line - 12; a += 4) {
+            uint32_t v = BRIDGE_MEM32(a);
+            if (v >= 0x00011000u && v < 0x00600000u) {
+                len += snprintf(line + len, sizeof line - (size_t)len, " %X", v);
+                found++;
+            }
+        }
+        if (r->esp_now && *r->esp_now != esp) {
+            /* Where it is now, if it has moved since its last call (a fiber,
+             * or guest code that makes no calls). */
+            uint32_t now = *r->esp_now, n2 = 0;
+            fprintf(stderr, "%s\n    now: esp 0x%08X, stack:", line, now);
+            for (a = now; now && a < now + 0x4000 && n2 < 24; a += 4) {
+                uint32_t v = BRIDGE_MEM32(a);
+                if (v >= 0x00011000u && v < 0x00600000u) {
+                    fprintf(stderr, " %X", v);
+                    n2++;
+                }
+            }
+            fprintf(stderr, "\n    recent:");
+        } else {
+            fprintf(stderr, "%s\n    recent:", line);
+        }
+        for (a = 0; a < 8; a++) {
+            uint32_t k = (r->calls + a) % 8;
+            fprintf(stderr, " %u", (unsigned)r->recent[k]);
+        }
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+}
+
+static DWORD WINAPI stall_watch(LPVOID arg)
+{
+    int secs = (int)(intptr_t)arg, idle = 0, dumped = 0;
+    uint32_t last = nv2a_pb_flip_count();
+    for (;;) {
+        uint32_t f;
+        Sleep(1000);
+        f = nv2a_pb_flip_count();
+        if (f != last) {
+            last = f;
+            idle = dumped = 0;
+            continue;
+        }
+        /* Before the first frame, give loading three times as long. A
+         * second dump after as long again shows who is still moving. */
+        if (++idle >= (f > 0 ? secs : 3 * secs) * (dumped + 1) && dumped < 2) {
+            stall_dump(f, idle);
+            dumped++;
+        }
+    }
+    return 0;
+}
+
+static void stall_note(int slot)
+{
+    static volatile LONG started;
+    if (!t_stall && !t_stall_none) {
+        LONG i = InterlockedIncrement(&s_stall_n) - 1;
+        if (i < STALL_THREADS) {
+            t_stall = &s_stall[i];
+            t_stall->stack_top = g_thread_stack_top;
+            t_stall->esp_now = &g_esp;
+        } else {
+            t_stall_none = 1;
+        }
+    }
+    if (!started && InterlockedExchange(&started, 1) == 0) {
+        const char *e = getenv("RECOMP_STALL_DUMP");
+#if defined(__SWITCH__)
+        int secs = e ? atoi(e) : 10;
+#else
+        int secs = e ? atoi(e) : 0;
+#endif
+        if (secs > 0) {
+            HANDLE h = CreateThread(NULL, 0, stall_watch, (LPVOID)(intptr_t)secs, 0, NULL);
+            if (h)
+                CloseHandle(h);
+        }
+    }
+    if (t_stall) {
+        t_stall->ordinal = slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE
+                         ? g_slot_ordinals[slot] : 0;
+        t_stall->esp = g_esp;
+        t_stall->ret = g_esp ? BRIDGE_MEM32(g_esp) : 0;
+        t_stall->recent[t_stall->calls % 8] = (uint16_t)t_stall->ordinal;
+        t_stall->calls++;
+        t_stall->inside = 1;
+    }
+}
+
 /* A guest thread lets go of the guest CPU for the length of every kernel
  * call. */
 static void kernel_thunk_dispatch(void)
 {
     int held = t_guest_held;
+    stall_note(g_kernel_dispatch_slot);
     if (held) {                        /* let other guest threads run meanwhile */
         t_guest_held = 0;
         LeaveCriticalSection(&g_guest_cpu);
@@ -9637,6 +9782,8 @@ static void kernel_thunk_dispatch(void)
     t_dispatch_depth++;
     kernel_thunk_dispatch_body();
     t_dispatch_depth--;
+    if (t_stall && t_dispatch_depth == 0)
+        t_stall->inside = 0;
     /* Back to guest code: take the CPU again. Only at the outermost call --
      * a guest callback a bridge runs (an APC) returns into the bridge, not to
      * the thread's own code -- and only if the thread still exists as one. */

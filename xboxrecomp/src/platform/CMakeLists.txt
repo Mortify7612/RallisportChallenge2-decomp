@@ -35,6 +35,12 @@ else()
         target_sources(platform PRIVATE switch/nx_host.c switch/nx_memcheck.c)
         target_include_directories(platform SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/switch/include)
     endif()
+    if(NOT ANDROID AND NOT APPLE)
+        # Every pthread_create in the program goes through w32_compat's
+        # wrapper, which places the new thread (w32_thread_place).
+        target_compile_definitions(platform PRIVATE W32_WRAP_PTHREAD=1)
+        target_link_options(platform INTERFACE -Wl,--wrap=pthread_create)
+    endif()
     find_package(Threads REQUIRED)
     # libm: _clearfp/_controlfp sit on <fenv.h>.
     target_link_libraries(platform PUBLIC Threads::Threads m)

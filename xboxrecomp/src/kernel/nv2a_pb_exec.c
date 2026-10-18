@@ -5268,6 +5268,12 @@ static void peek_chain(void)
     fflush(stderr);
 }
 
+/* Flips so far, for the stall watchdog (kernel_bridge.c). */
+uint32_t nv2a_pb_flip_count(void)
+{
+    return s_gpu.flips;
+}
+
 void nv2a_pb_exec_report(void)
 {
     peek_addresses();

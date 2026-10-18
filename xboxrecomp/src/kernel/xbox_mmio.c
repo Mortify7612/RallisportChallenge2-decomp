@@ -19,6 +19,7 @@
 #include "xbox_memory_layout.h"
 #include "xbox_mmio.h"
 
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -75,10 +76,23 @@ static void *plain(uint32_t va)
     return (uint8_t *)xbox_GetMemoryOffset() + XBOX_FOLD(va);
 }
 
+/* A title waits for the hardware by reading a register until a bit changes,
+ * and here the bit is changed by another host thread (the NV2A busy-bit
+ * acknowledger, a device model's worker). With time slicing that thread runs
+ * sooner or later; on a host without it for threads of equal priority -- the
+ * Switch, or Linux under SCHED_FIFO on one CPU -- the poll keeps the core and
+ * the bit never changes. So a thread that keeps reading registers lets the
+ * others run every so often. Ordinary register traffic is short bursts and
+ * barely pays for it. */
+#define XBOX_MMIO_YIELD_EVERY 64
+
 uint64_t xbox_mmio_read(uint32_t va, int size)
 {
+    static __thread unsigned reads;
     int i = find(va);
     uint64_t v = 0;
+    if (++reads % XBOX_MMIO_YIELD_EVERY == 0)
+        sched_yield();
     if (i >= 0 && s_mmio[i].rd)
         return s_mmio[i].rd(s_mmio[i].dev, va - s_mmio[i].off_base, size);
     memcpy(&v, plain(va), (size_t)size);
