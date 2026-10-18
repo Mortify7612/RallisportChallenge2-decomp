@@ -406,6 +406,7 @@ static void *padwatch_thread(void *unused)
     return NULL;
 }
 
+#if !defined(__SWITCH__)
 /* `kill -QUIT <pid>`: every thread prints its native backtrace to stderr.
  *
  * The answer to "where is it stuck" without a debugger. gdb cannot stand in
@@ -459,6 +460,9 @@ static void install_thread_dump(void)
     sa.sa_handler = all_threads_bt_handler;
     sigaction(SIGQUIT, &sa, NULL);
 }
+#else
+static void install_thread_dump(void) {}     /* no signals on the Switch */
+#endif
 #endif
 
 /* The command line, for the launcher's --launcher / --no-launcher. */
@@ -775,6 +779,28 @@ static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
     return TRUE;
 }
 
+#if defined(__ANDROID__) || defined(__SWITCH__)
+/* rsc2.env in the working directory: NAME=value per line, the environment a
+ * desktop user would set on the command line (RECOMP_FPS_OVERLAY=1, a
+ * replay, stats). Lines starting with # are skipped. */
+static void read_env_file(const char *tag)
+{
+    FILE *f = fopen("rsc2.env", "r");
+    char line[1024];
+    while (f && fgets(line, sizeof line, f)) {
+        char *eq = strchr(line, '='), *end = line + strcspn(line, "\r\n");
+        *end = 0;
+        if (line[0] == '#' || !eq || eq == line)
+            continue;
+        *eq = 0;
+        setenv(line, eq + 1, 1);
+        fprintf(stderr, "[%s] rsc2.env: %s=%s\n", tag, line, eq + 1);
+    }
+    if (f)
+        fclose(f);
+}
+#endif
+
 #ifdef __ANDROID__
 #define SDL_MAIN_HANDLED        /* SDL_main is defined by name below */
 #include <SDL.h>
@@ -891,24 +917,7 @@ static void android_setup(void)
     }
     mkdir("game", 0755);
     fprintf(stderr, "[ANDROID] files in %s; game data expected in %s/game\n", base, base);
-    /* rsc2.env: NAME=value per line, the environment a desktop user would
-     * set on the command line (RECOMP_FPS_OVERLAY=1, a replay, stats).
-     * Lines starting with # are skipped. */
-    {
-        FILE *f = fopen("rsc2.env", "r");
-        char line[1024];
-        while (f && fgets(line, sizeof line, f)) {
-            char *eq = strchr(line, '='), *end = line + strcspn(line, "\r\n");
-            *end = 0;
-            if (line[0] == '#' || !eq || eq == line)
-                continue;
-            *eq = 0;
-            setenv(line, eq + 1, 1);
-            fprintf(stderr, "[ANDROID] rsc2.env: %s=%s\n", line, eq + 1);
-        }
-        if (f)
-            fclose(f);
-    }
+    read_env_file("ANDROID");
     /* Landscape only. SDL sets the activity's orientation itself when the
      * window is created (overriding the manifest) and, for a resizable
      * window without this hint, follows the phone's rotation setting. */
@@ -942,12 +951,84 @@ int SDL_main(int argc, char **argv)
 }
 #endif
 
+#ifdef __SWITCH__
+#include <switch/types.h>
+#include <switch/result.h>
+#include <sys/stat.h>
+#include <errno.h>
+
+/* Switch homebrew: hbloader starts rsc2.nro with argv[0] its path on the SD
+ * card, and everything lives next to it, sdmc:/switch/rsc2/ by default:
+ *
+ *   game/      the player's copy of the game (default.xbe, Media, ...)
+ *   rsc2.env   settings, as on Android
+ *   rsc2.log   stderr and stdout, unless started with `nxlink -s`, which
+ *              streams them to the PC instead
+ *   config/ data/ cache/   what $XDG_*_HOME point at on Linux
+ */
+/* libnx's socket.h and nxlink.h pull in most of <switch.h>, whose names
+ * collide with the Win32 vocabulary here; these three are all it needs.
+ * A null config is socketInitializeDefault(). */
+Result socketInitialize(const void *config);
+void socketExit(void);
+int nxlinkConnectToHost(bool redir_stdout, bool redir_stderr);
+
+static void switch_setup(int argc, char **argv)
+{
+    char base[512] = "sdmc:/switch/rsc2", p[600];
+    static const char *const xdg[][2] = {
+        { "XDG_CONFIG_HOME", "config" },
+        { "XDG_DATA_HOME",   "data"   },
+        { "XDG_CACHE_HOME",  "cache"  },
+    };
+    int nxlink = 0;
+    size_t i;
+
+    if (argc > 0 && argv[0] && strncmp(argv[0], "sdmc:/", 6) == 0) {
+        char *slash;
+        snprintf(base, sizeof base, "%s", argv[0]);
+        slash = strrchr(base, '/');
+        if (slash && slash > base + 5)
+            *slash = 0;
+    }
+    mkdir(base, 0755);
+    if (chdir(base) != 0)
+        fprintf(stderr, "[SWITCH] cannot enter %s: %s\n", base, strerror(errno));
+    if (R_SUCCEEDED(socketInitialize(NULL))) {
+        nxlink = nxlinkConnectToHost(true, true) >= 0;
+        if (!nxlink)
+            socketExit();
+    }
+    if (!nxlink) {
+        freopen("rsc2.log", "w", stderr);
+        freopen("rsc2.log", "a", stdout);
+    }
+    fprintf(stderr, "[SWITCH] files in %s; game data expected in %s/game\n", base, base);
+    setenv("HOME", base, 0);
+    for (i = 0; i < sizeof xdg / sizeof xdg[0]; i++) {
+        snprintf(p, sizeof p, "%s/%s", base, xdg[i][1]);
+        mkdir(p, 0755);
+        setenv(xdg[i][0], p, 0);
+    }
+    read_env_file("SWITCH");
+    /* No launcher; full screen at the game's 16:9 (the screen's shape). The
+     * software rasteriser draws until there is a GPU renderer. */
+    setenv("RSC2_LAUNCHER", "0", 0);
+    setenv("RECOMP_FULLSCREEN", "1", 0);
+    setenv("RECOMP_WIDESCREEN", "1", 0);
+    setenv("RECOMP_VULKAN", "0", 0);
+}
+#endif
+
 #ifndef __ANDROID__
 /* Console entry point (for debugging -- lets you see printf output) */
 int main(int argc, char **argv)
 {
     s_argc = argc;
     s_argv = argv;
+#ifdef __SWITCH__
+    switch_setup(argc, argv);
+#endif
 #ifdef _WIN32
     return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
 #else

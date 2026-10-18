@@ -38,6 +38,9 @@
 #else
 #include <sys/sysinfo.h>
 #endif
+#if defined(__SWITCH__)
+time_t timegm(struct tm *tm);           /* newlib has none: switch/nx_host.c */
+#endif
 
 /* ===================================================================== */
 /* Last-error (thread-local)                                             */
@@ -1746,11 +1749,14 @@ HANDLE CreateFileMappingA(HANDLE file, LPSECURITY_ATTRIBUTES sa, DWORD protect,
 
     int fd = anon_map_fd(name);
     if (fd < 0) { SetLastError(ERROR_NOT_ENOUGH_MEMORY); return NULL; }
+    /* The Switch's memfd is not a file: its one view sizes it. */
+#if !defined(__SWITCH__)
     if (ftruncate(fd, (off_t)size) != 0) {
         close(fd);
         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
+#endif
 
     w32_object *o = obj_alloc(K_FILEMAP);
     o->fd       = fd;
@@ -2040,10 +2046,12 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
     /* TODO: on Windows this does not return; SEH dispatch unimplemented. */
 }
 
-#if defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))
+#if (defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))) || defined(__SWITCH__)
+#if defined(__linux__)
 #include <ucontext.h>
 #if defined(__aarch64__)
 #include <asm/sigcontext.h>
+#endif
 #endif
 
 /* Vectored exception handlers over sigaction.
@@ -2063,7 +2071,25 @@ static PVECTORED_EXCEPTION_HANDLER s_veh[VEH_MAX];
 static int s_veh_count;
 static int s_veh_installed;
 
-#if defined(__x86_64__)
+/* Runs the handlers in order; 1 when one resumes execution (its CONTEXT
+ * edits are then to be written back). Also the Switch's exception entry's
+ * way in (switch/nx_host.c). */
+int w32_veh_run(EXCEPTION_POINTERS *ep)
+{
+    int i;
+    for (i = 0; i < s_veh_count; i++)
+        if (s_veh[i] && s_veh[i](ep) == EXCEPTION_CONTINUE_EXECUTION)
+            return 1;
+    return 0;
+}
+
+#if defined(__SWITCH__)
+/* Nothing to install: the exception entry is linked in (switch/nx_host.c). */
+static void veh_install(void)
+{
+    s_veh_installed = 1;
+}
+#elif defined(__x86_64__)
 static const int s_veh_gregs[16] = {
     REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
     REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15,
@@ -2147,6 +2173,7 @@ static void veh_store(const CONTEXT *ctx, ucontext_t *uc)
 }
 #endif
 
+#if defined(__linux__)
 static DWORD veh_code(int sig, int si_code)
 {
     switch (sig) {
@@ -2176,7 +2203,7 @@ static void veh_signal(int sig, siginfo_t *si, void *ucv)
     EXCEPTION_RECORD rec;
     CONTEXT ctx;
     EXCEPTION_POINTERS ep;
-    int i, write, saved_errno = errno;
+    int write, saved_errno = errno;
 
     write = veh_load(&ctx, uc);
     memset(&rec, 0, sizeof(rec));
@@ -2191,12 +2218,10 @@ static void veh_signal(int sig, siginfo_t *si, void *ucv)
     ep.ExceptionRecord = &rec;
     ep.ContextRecord = &ctx;
 
-    for (i = 0; i < s_veh_count; i++) {
-        if (s_veh[i] && s_veh[i](&ep) == EXCEPTION_CONTINUE_EXECUTION) {
-            veh_store(&ctx, uc);
-            errno = saved_errno;
-            return;
-        }
+    if (w32_veh_run(&ep)) {
+        veh_store(&ctx, uc);
+        errno = saved_errno;
+        return;
     }
 
     /* Nobody took it: re-fault under what was there before -- the default
@@ -2236,6 +2261,8 @@ static void veh_install(void)
         sigaction(sigs[k], &sa, sigs[k] < 32 ? &s_veh_prev[sigs[k]] : NULL);
     s_veh_installed = 1;
 }
+
+#endif /* __linux__ */
 
 PVOID AddVectoredExceptionHandler(ULONG First, PVECTORED_EXCEPTION_HANDLER Handler)
 {

@@ -2893,10 +2893,13 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         uint64_t tiled_hi = tiled_lo + xbox_TiledApertureSize();
 
         /* RECOMP_MIRRORS=0 leaves the mirrors unmapped, so an access through
-         * one faults: whether a title needs them at all (a host that cannot
-         * alias pages, the Switch, has none). */
+         * one faults: whether a title needs them at all. A host that cannot
+         * alias pages (the Switch) has none, whatever it says. */
         const char *mirrors_env = getenv("RECOMP_MIRRORS");
         int n_mirrors = mirrors_env && strcmp(mirrors_env, "0") == 0 ? 0 : XBOX_NUM_MIRRORS;
+#if defined(__SWITCH__)
+        n_mirrors = 0;
+#endif
 
         for (int m = 0; m < n_mirrors; m++) {
             uintptr_t mirror_base = (uintptr_t)g_memory_base +
@@ -2979,6 +2982,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          * whether a title uses it -- see RECOMP_MIRRORS above. */
         const char *tiled_env = getenv("RECOMP_TILED");
         int tiled_on = !(tiled_env && strcmp(tiled_env, "0") == 0);
+#if defined(__SWITCH__)
+        tiled_on = 0;               /* an alias; see RECOMP_MIRRORS */
+#endif
         if (tiled_size > XBOX_CONTIG_SIZE)
             tiled_size = XBOX_CONTIG_SIZE;
         if (g_contig_mapping && tiled_on)

@@ -29,6 +29,12 @@ else()
         ${XBOXRECOMP_SRC_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}
     )
+    if(NINTENDO_SWITCH)
+        # Switch homebrew (libnx): memory mapping, the fault path and the
+        # POSIX headers newlib lacks (sys/mman.h, dlfcn.h, ...).
+        target_sources(platform PRIVATE switch/nx_host.c)
+        target_include_directories(platform SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/switch/include)
+    endif()
     find_package(Threads REQUIRED)
     # libm: _clearfp/_controlfp sit on <fenv.h>.
     target_link_libraries(platform PUBLIC Threads::Threads m)

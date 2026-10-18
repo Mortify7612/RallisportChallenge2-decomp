@@ -169,8 +169,8 @@ typedef struct _CONTEXT {
 } CONTEXT, *PCONTEXT;
 #define CONTEXT_PC(c) ((c)->Rip)
 #define CONTEXT_SP(c) ((c)->Rsp)
-#elif defined(__linux__) && defined(__aarch64__)
-/* AArch64 (Linux and Android): the general registers, and the SIMD&FP
+#elif (defined(__linux__) && defined(__aarch64__)) || defined(__SWITCH__)
+/* AArch64 (Linux, Android and the Switch): the general registers, and the SIMD&FP
  * registers so the MMIO decoder in mmio_decode.h can service a float load or
  * store. Pstate carries NZCV. No Win64 names to keep: nothing outside the
  * decoders reads registers by name, and they go through CONTEXT_PC/SP. */

@@ -154,6 +154,14 @@ if(WIN32)
         # function's symbol, i.e. to the guest function that faulted.
         dbghelp
     )
+elseif(NINTENDO_SWITCH)
+    # Switch homebrew: one static module (no -rdynamic, no libdl); crash
+    # addresses are module offsets, for addr2line on rsc2.elf.
+    set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
+        COMPILE_OPTIONS "-fno-strict-aliasing;-fwrapv;-w")
+    nx_generate_nacp(OUTPUT rsc2.nacp NAME "RalliSport Challenge 2"
+                     AUTHOR "rsc2 recompilation" VERSION "0.6.0")
+    nx_create_nro(${PROJECT_NAME} NACP rsc2.nacp)
 else()
     # The OpenGL/SDL2 backend comes in through the xboxrecomp targets.
     # -rdynamic puts every sub_XXXXXXXX in the dynamic symbol table, which is

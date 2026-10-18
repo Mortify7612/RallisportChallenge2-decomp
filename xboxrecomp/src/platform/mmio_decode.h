@@ -28,10 +28,12 @@
 
 #include <stdint.h>
 
-/* Hosts with a fault path: Win32, and Linux/Android on x86-64 or AArch64,
- * where the sigaction VEH in win32_compat.c fills a CONTEXT from the signal
- * frame. Device models test MMIO_FAULT_HOST before trapping their pages. */
-#if defined(_WIN32) || (defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__)))
+/* Hosts with a fault path: Win32, Linux/Android on x86-64 or AArch64, where
+ * the sigaction VEH in win32_compat.c fills a CONTEXT from the signal frame,
+ * and the Switch, where the exception entry in switch/nx_host.c does. Device
+ * models test MMIO_FAULT_HOST before trapping their pages. */
+#if defined(_WIN32) || (defined(__linux__) && (defined(__x86_64__) || defined(__aarch64__))) \
+    || defined(__SWITCH__)
 #define MMIO_FAULT_HOST 1
 #endif
 

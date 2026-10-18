@@ -115,7 +115,7 @@ if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
-elseif(ANDROID)
+elseif(ANDROID OR NINTENDO_SWITCH)
     # The Xbox crypto (kernel_crypto.c) is software; nothing needs OpenSSL.
     target_link_libraries(xbox_kernel PUBLIC platform)
 else()

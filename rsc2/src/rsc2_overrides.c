@@ -279,8 +279,8 @@ void sub_0030FD2A(void)
 #else
 #include <pthread.h>
 #include <sys/mman.h>
-#if defined(__ANDROID__) && !defined(RSC2_HOST_CORO)
-#define RSC2_HOST_CORO 1
+#if (defined(__ANDROID__) || defined(__SWITCH__)) && !defined(RSC2_HOST_CORO)
+#define RSC2_HOST_CORO 1            /* no ucontext in bionic or newlib */
 #endif
 #if RSC2_HOST_CORO
 #include "host_coro.h"

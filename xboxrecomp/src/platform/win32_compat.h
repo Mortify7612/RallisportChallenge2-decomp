@@ -450,7 +450,7 @@ VOID RaiseException(DWORD code, DWORD flags, DWORD nargs, const ULONG_PTR *args)
  * 
  * Note: GCC needs correct struct. This is from nxdk
  * */
-#ifdef __linux__
+#if defined(__linux__) || defined(__SWITCH__)
 typedef struct _EXCEPTION_POINTERS
 {
     PEXCEPTION_RECORD ExceptionRecord;
@@ -462,6 +462,10 @@ typedef void *PEXCEPTION_POINTERS;
 typedef LONG (*PVECTORED_EXCEPTION_HANDLER)(PEXCEPTION_POINTERS info);
 PVOID AddVectoredExceptionHandler(ULONG FirstHandler, PVECTORED_EXCEPTION_HANDLER Handler);
 ULONG RemoveVectoredExceptionHandler(PVOID Handle);
+#if defined(__linux__) || defined(__SWITCH__)
+/* Runs the registered handlers; 1 when one resumed execution. */
+int w32_veh_run(EXCEPTION_POINTERS *ep);
+#endif
 
 #define EXCEPTION_CONTINUE_SEARCH       0
 #define EXCEPTION_EXECUTE_HANDLER       1
