@@ -166,8 +166,17 @@ if(WIN32)
 elseif(NINTENDO_SWITCH)
     # Switch homebrew: one static module (no -rdynamic, no libdl); crash
     # addresses are module offsets, for addr2line on rsc2.elf.
+    # -mtp=tpidr_el0: the generated code's x86 registers are thread-locals,
+    # and the default thread-pointer read is a call (__aarch64_read_tp),
+    # about a tenth of the game thread. Every thread copies its pointer into
+    # TPIDR_EL0 as it starts (nx_tp_mirror, platform/switch/nx_host.c).
+    option(RSC2_SWITCH_HW_TP "Generated code reads the thread pointer from TPIDR_EL0" ON)
+    set(RSC2_GEN_OPTS "-fno-strict-aliasing;-fwrapv;-w")
+    if(RSC2_SWITCH_HW_TP)
+        list(APPEND RSC2_GEN_OPTS "-mtp=tpidr_el0")
+    endif()
     set_source_files_properties(${RECOMP_GEN_SOURCES} PROPERTIES
-        COMPILE_OPTIONS "-fno-strict-aliasing;-fwrapv;-w")
+        COMPILE_OPTIONS "${RSC2_GEN_OPTS}")
     nx_generate_nacp(OUTPUT rsc2.nacp NAME "RalliSport Challenge 2"
                      AUTHOR "rsc2 recompilation" VERSION "0.6.0")
     nx_create_nro(${PROJECT_NAME} NACP rsc2.nacp)

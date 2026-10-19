@@ -1384,6 +1384,20 @@ static void *g_kernel_memory = NULL;
 
 /* Global offset accessible by recompiled code (via recomp_types.h) */
 ptrdiff_t g_xbox_mem_offset = 0;
+/* XBOX_FOLD_HIGH (recomp_types.h, xbox_ptr_folded): per 64 MB of guest
+ * space, what to add to an address for its host pointer. */
+intptr_t g_xbox_fold_add[64];
+
+static void fold_table_fill(void)
+{
+    uint32_t i;
+    for (i = 0; i < 64; i++) {
+        uint32_t a = i << 26;
+        uint32_t o = (a ^ ((uint32_t)((int32_t)a >> 31) << 30))
+                   + ((uint32_t)(a - 0xF0000000u < 0x04000000u) << 28);  /* tiled onto contiguous */
+        g_xbox_fold_add[i] = (intptr_t)o - (intptr_t)a + (intptr_t)g_xbox_mem_offset;
+    }
+}
 
 /* Bounds of the title's executable sections, from its own XBE section table.
  *
@@ -2559,6 +2573,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
     /* Set the global offset for recompiled code MEM macros */
     g_xbox_mem_offset = g_memory_offset;
+    fold_table_fill();
 
     /*
      * Initialize the Xbox stack for recompiled code.

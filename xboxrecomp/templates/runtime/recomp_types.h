@@ -446,13 +446,18 @@ void recomp_trace_bb(uint32_t va, uint32_t ebp);
  */
 #if defined(XBOX_FOLD_HIGH)
 /* The top half of the guest space folded into the second quarter, for a
- * host without 4 GB of address space to place (see platform/guest_addr.h).
+ * host without 4 GB of address space to place (see platform/guest_addr.h),
+ * and the tiled aperture onto the contiguous window. What the fold adds
+ * depends only on which 64 MB the address is in, so it is a table,
+ * g_xbox_fold_add (xbox_memory_layout.c, filled with g_xbox_mem_offset):
+ * a load and an add. The arithmetic it replaces was not inlined into the
+ * lifted functions -- a call per guest access, about a quarter of the
+ * game thread on the Switch.
  * A function, so `addr` is evaluated once: hand-written code passes `p++`. */
-static inline uintptr_t xbox_ptr_folded(uint32_t a)
+extern intptr_t g_xbox_fold_add[64];
+static inline __attribute__((always_inline)) uintptr_t xbox_ptr_folded(uint32_t a)
 {
-    uint32_t o = (a ^ ((uint32_t)((int32_t)a >> 31) << 30))
-               + ((uint32_t)(a - 0xF0000000u < 0x04000000u) << 28);   /* tiled onto contiguous */
-    return (uintptr_t)o + (uintptr_t)g_xbox_mem_offset;
+    return (uintptr_t)a + (uintptr_t)g_xbox_fold_add[a >> 26];
 }
 #define XBOX_PTR(addr) xbox_ptr_folded((uint32_t)(addr))
 #else

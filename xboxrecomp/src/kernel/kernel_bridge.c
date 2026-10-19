@@ -680,6 +680,12 @@ static void bridge_PsCreateSystemThreadEx(void)
         if (!fn) fn = recomp_lookup_manual(start_routine);
         if (fn) {
             if (is_first_call) {
+#if defined(__SWITCH__)
+                {   /* RSC2_NX_PROF_THREADS=game: the sampling profiler (nx_prof.c) */
+                    extern void nx_prof_register(const char *name);
+                    nx_prof_register("game");
+                }
+#endif
                 /* Main game thread: run directly, inheriting register state */
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;

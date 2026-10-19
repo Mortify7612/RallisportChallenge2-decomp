@@ -1027,6 +1027,10 @@ static void switch_setup(int argc, char **argv)
     snprintf(g_switch_game_dir, sizeof g_switch_game_dir, "%s/game", base);
     if (chdir(base) != 0)
         fprintf(stderr, "[SWITCH] cannot enter %s: %s\n", base, strerror(errno));
+    {   /* this thread's thread pointer where the generated code reads it */
+        extern void nx_tp_mirror(void);
+        nx_tp_mirror();
+    }
     if (R_SUCCEEDED(socketInitialize(NULL))) {
         nxlink = nxlinkConnectToHost(true, true) >= 0;
         if (!nxlink)

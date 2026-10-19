@@ -36,8 +36,8 @@ static u64 s_base;                      /* the module's: rsc2.elf's address 0 */
 #define PROF_THREADS 4
 #define PROF_SLOTS   8192               /* a power of two */
 #define PROF_DEPTH   24
-#define PROF_TOP_LEAF 60
-#define PROF_TOP_IN   120
+#define PROF_TOP_LEAF 400            /* the lifted code's profile is flat */
+#define PROF_TOP_IN   600
 
 typedef struct { u32 off, n; } Slot;
 typedef struct { u32 leaf, up, n; } Pair;

@@ -632,11 +632,28 @@ uint64_t nx_thread_cpu_us(void)
     return t * 10 / 192;
 }
 
+/* The generated code reads the thread pointer from TPIDR_EL0 (-mtp=tpidr_el0,
+ * rsc2/CMakeLists.txt) with one instruction. libnx keeps it elsewhere
+ * (TPIDRRO_EL0 + 0x1F8) and GCC's default reached it through a call to
+ * __aarch64_read_tp, which every lifted function made -- about a tenth of
+ * the game thread. TPIDR_EL0 is the thread's own (Horizon saves it with
+ * the thread) and unused by libnx, so each thread copies its pointer there
+ * when it starts: the same pointer, so the same addresses as the rest of
+ * the program's thread-locals. A thread that skipped this and ran lifted
+ * code would fault at its first register access, near address 0. */
+void nx_tp_mirror(void)
+{
+    extern void *__aarch64_read_tp(void);
+    uint64_t tp = (uint64_t)(uintptr_t)__aarch64_read_tp();
+    __asm__ volatile("msr tpidr_el0, %0" : : "r"(tp));
+}
+
 /* Thread placement (win32_compat.c, "Thread placement"): priority 59
  * (libnx's for pthreads; 60 for a guest thread under RECOMP_GUEST_PRIO=lower),
  * allowed on the application's cores 0-2 with its preferred core in turn. */
 void nx_thread_place(int guest)
 {
+    nx_tp_mirror();
     static volatile int next;
     int core = __atomic_fetch_add(&next, 1, __ATOMIC_RELAXED) % 3;
     Result rc = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 0x7);
