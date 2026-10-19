@@ -350,6 +350,9 @@ typedef struct {
     int nwb;
 } GPend;
 
+typedef struct { uint64_t key; GLuint s; } GSampC;
+typedef struct { GLint size; GLenum type; GLboolean norm; GLuint reloff, group; } GFmt;
+
 typedef struct GTex_ {
     int used;
     Nv2aVkTex d;                    /* the key, sampler fields cleared */
@@ -402,6 +405,7 @@ static struct {
     GLsync ring_fence[4];
     int ring_q;
     int b_ninputs;                  /* vertex attributes enabled, -1 unknown */
+    GFmt fmt[16];                   /* each attribute's format and binding, as set */
     /* The last draw's uniforms and where they sit in the ring: a draw with
      * the same ones binds nothing new. */
     Nv2aVkUbo last_ub;
@@ -410,12 +414,24 @@ static struct {
     int last_ub_valid;
     uint32_t ring_lap;              /* times the ring has wrapped */
     uint32_t pf_ub_same, pf_consts;
+    uint32_t pf_mergeable;          /* draws whose GL state is the last draw's */
+    uint32_t pf_raw;                /* draws with the title's own vertex formats */
+    uint32_t pf_rawno[5], pf_rawtype[16];   /* ...and why not: inputs, format, stride, address, other */
+    uint32_t last_draw_key[8];
+    int bind_changed;               /* any bind or state call this draw */
     /* set_state's last state, as a key: a draw with the same one makes no
      * state calls (each is work in Mesa even when nothing changes).
      * state_valid = 0 where anything else touches that state. */
     uint32_t state_key[24];
     int state_valid;
-    uint64_t pf_prep_us, pf_glcall_us;  /* draw_common: before its GL calls; the calls */
+    uint64_t pf_glcall_us;          /* draw_common's uploads and GL calls */
+    uint64_t pf_su[3];              /* ...and before them: textures, target, uniforms */
+    GSampC samp_cache[64];          /* sampler(), by key */
+    /* tex_get's memo: a draw with a texture another draw used this epoch
+     * gets the same answer, while no surface has become dirty or clean
+     * (dirty_gen) and no texture has been replaced (tex_gen). */
+    uint32_t dirty_gen, tex_gen;
+    struct { Nv2aVkTex d; uint32_t epoch, dgen, tgen, levels; GLuint tex; } tmemo[32];
     /* What draw_common last bound, so unchanged binds are skipped; any other
      * glBindTexture (bind_other) forgets it. */
     GLuint b_tex[8], b_samp[4], b_vs, b_fs;
@@ -473,6 +489,190 @@ static struct {
     uint32_t st_draws, st_cpu, st_notarget, st_noclip, st_clears, st_tex, st_texfail, st_wb;
 } G;
 
+/* ---- the GL command queue ----------------------------------------------
+ *
+ * RECOMP_GL_QUEUE (on by default on the Switch): the GL calls are made on
+ * a thread of their own. The executor's GL calls (nv2a_gl_queue.h, made
+ * from GL_FNS by tools/gen_gl_queue.py) copy themselves into this ring and
+ * return; the GL thread, which holds the context, makes them in order. A
+ * call with a result or a pointer waits for the GL thread to make it
+ * (glq_call). Everything else the renderer does -- reading guest memory,
+ * hashing, choosing programs -- stays on the executor, so the queue never
+ * holds a pointer into guest memory. On the Switch nouveau's own work was
+ * about 25 us a draw, most of the executor's time in a race, while the
+ * game's thread waited on the executor. */
+#define GLQ_SIZE (4u << 20)
+typedef struct { void (*run)(const void *); uint32_t size, pad; } GlqHead;
+static struct {
+    volatile int on;
+    uint8_t *buf;
+    volatile size_t head, tail;     /* bytes written / read, ever */
+    volatile int sleeping;          /* the GL thread waits on `work` */
+    HANDLE work, done;
+    void (*sync_fn)(void *);
+    void *volatile sync_arg;
+    volatile int sync_done;
+    uint32_t pf_syncs;              /* RECOMP_PERF: calls waited for, and the wait */
+    uint64_t pf_sync_ns;
+    struct { const char *name; uint32_t n; } pf_by[16];   /* ...by entry point */
+} Q;
+static __thread int t_gl_direct;    /* the GL thread, or one with its own context */
+static size_t q_need;
+
+static int glq_direct(void)
+{
+    return !Q.on || t_gl_direct;
+}
+
+/* Room for one call of `size` bytes after its header, never split at the
+ * ring's end (a header with run NULL there says "go back to the start"). */
+static void *glq_alloc(void (*run)(const void *), size_t size)
+{
+    size_t need = (sizeof(GlqHead) + size + 15) & ~(size_t)15, at;
+    for (;;) {
+        size_t head = Q.head, tail = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE);
+        size_t room = GLQ_SIZE - (head - tail);
+        at = head % GLQ_SIZE;
+        if (at + need > GLQ_SIZE) {
+            if (room >= GLQ_SIZE - at + need) {
+                ((GlqHead *)(Q.buf + at))->run = NULL;
+                __atomic_store_n(&Q.head, head + (GLQ_SIZE - at), __ATOMIC_RELEASE);
+                continue;
+            }
+        } else if (room >= need) {
+            break;
+        }
+        if (Q.sleeping)
+            SetEvent(Q.work);
+        Sleep(0);                       /* full: the GL thread is behind */
+    }
+    ((GlqHead *)(Q.buf + at))->run = run;
+    ((GlqHead *)(Q.buf + at))->size = (uint32_t)need;
+    q_need = need;
+    return Q.buf + at + sizeof(GlqHead);
+}
+
+static void glq_commit(void)
+{
+    __atomic_store_n(&Q.head, Q.head + q_need, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&Q.sleeping, __ATOMIC_ACQUIRE))
+        SetEvent(Q.work);
+}
+
+static void qrun_sync(const void *p)
+{
+    (void)p;
+    Q.sync_fn(Q.sync_arg);
+    __atomic_store_n(&Q.sync_done, 1, __ATOMIC_RELEASE);
+    SetEvent(Q.done);
+}
+
+/* fn(arg) on the GL thread, after everything queued before it; back when
+ * it has been made. */
+static void glq_call(void (*fn)(void *), void *arg, const char *name)
+{
+    int k;
+    struct timespec a, b;
+    clock_gettime(CLOCK_MONOTONIC, &a);
+    Q.sync_fn = fn;
+    Q.sync_arg = arg;
+    Q.sync_done = 0;
+    glq_alloc(qrun_sync, 0);
+    glq_commit();
+    while (!__atomic_load_n(&Q.sync_done, __ATOMIC_ACQUIRE))
+        WaitForSingleObject(Q.done, 1);
+    clock_gettime(CLOCK_MONOTONIC, &b);
+    Q.pf_syncs++;
+    Q.pf_sync_ns += (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000u
+                  + (uint64_t)b.tv_nsec - (uint64_t)a.tv_nsec;
+    for (k = 0; k < 16 && Q.pf_by[k].name && Q.pf_by[k].name != name; k++)
+        ;
+    if (k < 16) {
+        Q.pf_by[k].name = name;
+        Q.pf_by[k].n++;
+    }
+}
+
+static volatile int s_glq_ready;      /* the GL thread's start: 1 ok, -1 failed */
+
+static DWORD WINAPI glq_thread(LPVOID unused)
+{
+    unsigned spins = 0;
+    (void)unused;
+    t_gl_direct = 1;
+    if (SDL_GL_MakeCurrent(G.win, G.ctx) != 0) {
+        fprintf(stderr, "[GL] GL thread: make current failed (%s)\n", SDL_GetError());
+        __atomic_store_n(&s_glq_ready, -1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    __atomic_store_n(&s_glq_ready, 1, __ATOMIC_RELEASE);
+    for (;;) {
+        size_t tail = Q.tail, head = __atomic_load_n(&Q.head, __ATOMIC_ACQUIRE);
+        GlqHead *h;
+        if (tail == head) {
+            if (++spins < 64) {
+                Sleep(0);
+                continue;
+            }
+            __atomic_store_n(&Q.sleeping, 1, __ATOMIC_RELEASE);
+            if (__atomic_load_n(&Q.head, __ATOMIC_ACQUIRE) == tail)
+                WaitForSingleObject(Q.work, 2);
+            __atomic_store_n(&Q.sleeping, 0, __ATOMIC_RELEASE);
+            continue;
+        }
+        spins = 0;
+        h = (GlqHead *)(Q.buf + tail % GLQ_SIZE);
+        if (!h->run) {                  /* the ring's end: back to the start */
+            __atomic_store_n(&Q.tail, tail + (GLQ_SIZE - tail % GLQ_SIZE), __ATOMIC_RELEASE);
+            continue;
+        }
+        h->run((const uint8_t *)h + sizeof(GlqHead));
+        __atomic_store_n(&Q.tail, tail + h->size, __ATOMIC_RELEASE);
+    }
+    return 0;
+}
+
+#include "nv2a_gl_queue.h"
+
+static void qrun_swap(const void *p)
+{
+    (void)p;
+    SDL_GL_SwapWindow(G.win);
+}
+
+/* At the end of gl_init, its context current here: the context goes to the
+ * GL thread, and from then on the calls are queued. */
+static void glq_start(void)
+{
+    const char *e = getenv("RECOMP_GL_QUEUE");
+    HANDLE th;
+#if defined(__SWITCH__)
+    if (e && strcmp(e, "0") == 0)
+        return;
+#else
+    if (!(e && strcmp(e, "0") != 0))
+        return;
+#endif
+    Q.buf = (uint8_t *)malloc(GLQ_SIZE);
+    Q.work = CreateEventW(NULL, FALSE, FALSE, NULL);
+    Q.done = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!Q.buf || !Q.work || !Q.done)
+        return;
+    SDL_GL_MakeCurrent(G.win, NULL);
+    th = CreateThread(NULL, 1u << 20, glq_thread, NULL, 0, NULL);
+    if (th) {
+        CloseHandle(th);
+        while (!__atomic_load_n(&s_glq_ready, __ATOMIC_ACQUIRE))
+            Sleep(1);
+    }
+    if (__atomic_load_n(&s_glq_ready, __ATOMIC_ACQUIRE) == 1) {
+        Q.on = 1;
+        fprintf(stderr, "[GL] GL calls made on a thread of their own\n");
+    } else {
+        SDL_GL_MakeCurrent(G.win, G.ctx);   /* as before: this thread makes them */
+    }
+}
+
 /* RECOMP_GL_STEPS=<n>: log the first n first-time operations as they start
  * (a driver or emulator that dies mid-way shows where). */
 static void step(const char *what, uint32_t a, uint32_t b)
@@ -513,10 +713,27 @@ static uint8_t *guest(uint32_t va)
     return (uint8_t *)((uintptr_t)XBOX_FOLD(va) + xbox_GetMemoryOffset());
 }
 
+/* Four independent lanes, 32 bytes a step, folded together at the end: a
+ * single chain of multiplies waited on itself every 8 bytes, and checking
+ * the textures for changes this way was most of a frame's texture time on
+ * the Switch's A57. */
 static uint64_t hash_bytes(const uint8_t *p, size_t n)
 {
     uint64_t h = 0xcbf29ce484222325ull;
     size_t i = 0;
+    if (n >= 32) {
+        uint64_t a = h, b = 0x84222325cbf29ce4ull, c = 0x9E3779B97F4A7C15ull,
+                 e = 0xC2B2AE3D27D4EB4Full;
+        for (; i + 32 <= n; i += 32) {
+            uint64_t v[4];
+            memcpy(v, p + i, 32);
+            a = (a ^ v[0]) * 0x100000001b3ull; a ^= a >> 29;
+            b = (b ^ v[1]) * 0x100000001b3ull; b ^= b >> 29;
+            c = (c ^ v[2]) * 0x100000001b3ull; c ^= c >> 29;
+            e = (e ^ v[3]) * 0x100000001b3ull; e ^= e >> 29;
+        }
+        h = a ^ ((b << 17) | (b >> 47)) ^ ((c << 31) | (c >> 33)) ^ ((e << 47) | (e >> 17));
+    }
     for (; i + 8 <= n; i += 8) {
         uint64_t v;
         memcpy(&v, p + i, 8);
@@ -796,20 +1013,48 @@ static void perf_report(void)
                 " waiting on the general one\n", G.pf_spec, G.pf_spec_us / 1000.0,
                 G.pf_spec_gen / f);
     {
-        extern void nv2a_pb_perf_take(uint64_t out[5]);
-        uint64_t pb[5];
+        extern void nv2a_pb_perf_take(uint64_t out[6]);
+        uint64_t pb[6];
         nv2a_pb_perf_take(pb);
-        fprintf(stderr, "[PERF]   executor per frame: %.1f ms in all; fetching vertices %.1f,"
-                " triangle lists %.1f, state %.1f, the renderer's draws %.1f (setting up %.1f,"
-                " uploading and GL calls %.1f)\n", pb[4] / f / 1e6, pb[0] / f / 1e6, pb[1] / f / 1e6,
-                pb[2] / f / 1e6, pb[3] / f / 1e6, G.pf_prep_us / f / 1000.0,
+        fprintf(stderr, "[PERF]   executor per frame: %.1f ms in all (%.1f of it waiting to pace"
+                " flips); fetching vertices %.1f,"
+                " triangle lists %.1f, state %.1f, the renderer's draws %.1f (textures %.1f,"
+                " target %.1f, uniforms %.1f, uploading and GL calls %.1f)\n", pb[4] / f / 1e6,
+                pb[5] / f / 1e6, pb[0] / f / 1e6, pb[1] / f / 1e6, pb[2] / f / 1e6, pb[3] / f / 1e6,
+                G.pf_su[0] / f / 1000.0, G.pf_su[1] / f / 1000.0, G.pf_su[2] / f / 1000.0,
                 G.pf_glcall_us / f / 1000.0);
-        G.pf_prep_us = G.pf_glcall_us = 0;
+        G.pf_glcall_us = 0;
+        memset(G.pf_su, 0, sizeof G.pf_su);
     }
+    if (Q.on) {
+        int k;
+        fprintf(stderr, "[PERF]   GL thread: %.1f calls a frame waited for, %.1f ms:",
+                Q.pf_syncs / f, Q.pf_sync_ns / f / 1e6);
+        for (k = 0; k < 16 && Q.pf_by[k].name; k++)
+            fprintf(stderr, " %s %.1f", Q.pf_by[k].name, Q.pf_by[k].n / f);
+        fputc('\n', stderr);
+        memset(Q.pf_by, 0, sizeof Q.pf_by);
+    }
+    Q.pf_syncs = 0;
+    Q.pf_sync_ns = 0;
     if (G.pf_draws)
         fprintf(stderr, "[PERF]   per frame: %.0f draws with the uniforms of the draw before,"
-                " %.0f vertex constant uploads\n", G.pf_ub_same / f, G.pf_consts / f);
-    G.pf_ub_same = G.pf_consts = 0;
+                " %.0f vertex constant uploads, %.0f could join the draw before, %.0f with"
+                " the title's own vertex formats\n",
+                G.pf_ub_same / f, G.pf_consts / f, G.pf_mergeable / f, G.pf_raw / f);
+    G.pf_ub_same = G.pf_consts = G.pf_mergeable = G.pf_raw = 0;
+    if (G.pf_rawno[0] + G.pf_rawno[1] + G.pf_rawno[2] + G.pf_rawno[3] + G.pf_rawno[4]) {
+        int t;
+        fprintf(stderr, "[PERF]   not in their own formats: %u input count, %u format, %u stride,"
+                " %u address, %u other; formats:", G.pf_rawno[0], G.pf_rawno[1], G.pf_rawno[2],
+                G.pf_rawno[3], G.pf_rawno[4]);
+        for (t = 0; t < 16; t++)
+            if (G.pf_rawtype[t])
+                fprintf(stderr, " type %d x%u", t, G.pf_rawtype[t]);
+        fputc('\n', stderr);
+    }
+    memset(G.pf_rawno, 0, sizeof G.pf_rawno);
+    memset(G.pf_rawtype, 0, sizeof G.pf_rawtype);
     if (G.pf_fragz[3])
         fprintf(stderr, "[PERF]   of %.0f draws a frame, writing their depth: %.0f polygon offset,"
                 " %.0f z-buffer rounding, %.0f other\n", G.pf_fragz[3] / f, G.pf_fragz[0] / f,
@@ -1390,6 +1635,7 @@ static int sc_current(void)
 static DWORD WINAPI sc_worker(LPVOID unused)
 {
     (void)unused;
+    t_gl_direct = 1;                    /* its own context: never queued */
     if (!sc_current()) {
 #if defined(__SWITCH__)
         fprintf(stderr, "[GL] shader thread: make current failed (EGL 0x%x)\n", eglGetError());
@@ -1735,6 +1981,11 @@ static int gl_init(void)
     for (k = 0; k < 16; k++) {
         glVertexAttribFormat((GLuint)k, 4, GL_FLOAT, GL_FALSE, (GLuint)k * 16);
         glVertexAttribBinding((GLuint)k, 0);
+        G.fmt[k].size = 4;
+        G.fmt[k].type = GL_FLOAT;
+        G.fmt[k].norm = GL_FALSE;
+        G.fmt[k].reloff = (GLuint)k * 16;
+        G.fmt[k].group = 0;
     }
     G.b_ninputs = -1;
     G.white2d = white_tex(GL_TEXTURE_2D);
@@ -1775,6 +2026,7 @@ static int gl_init(void)
     glBindProgramPipeline(G.pipe);
     G.spec_left = spec_per_frame();
     sc_init();
+    glq_start();
     return 1;
 }
 
@@ -2032,6 +2284,7 @@ static void surf_land(GSurf *s, uint8_t *lin, uint32_t rows, int clean)
                    (size_t)s->w * s->bpp);
     if (clean) {
         s->dirty = 0;
+        G.dirty_gen++;
         /* What is in guest RAM now is what the texture holds. */
         s->up_epoch = G.epoch;
         surf_ref(s);
@@ -2066,6 +2319,7 @@ static void surf_writeback(GSurf *s)
      * win, as they would on the console. */
     if (s->dref_valid && hash_sparse(guest(s->va), surf_bytes(s)) != s->dref) {
         s->dirty = 0;
+        G.dirty_gen++;
         s->clear_only = 0;
         s->ref_valid = 0;
         s->dref_valid = 0;
@@ -2136,6 +2390,7 @@ static void alias_resolve(GSurf *cs)
             G.cur_zs = NULL;
             cs->dirty = 1;
             cs->gen++;
+            G.dirty_gen++;
             cs->pending_up = 0;
             cs->clear_only = 1;
             cs->clear_argb = c;
@@ -2143,6 +2398,7 @@ static void alias_resolve(GSurf *cs)
                 cs->rows = q->rows;
             q->dirty = 0;
             q->clear_only = 0;
+            G.dirty_gen++;
             q->ref_valid = 0;           /* guest RAM gets cs's bytes, not q's */
             continue;
         }
@@ -2206,6 +2462,7 @@ static GSurf *surf_get(const Nv2aVkState *st)
             s = &G.surf[G.nsurf++];
         }
         memset(s, 0, sizeof *s);
+        G.dirty_gen++;
         step("surface", st->color_va, ifmt);
         s->va = st->color_va;
         s->pitch = st->pitch;
@@ -2295,6 +2552,25 @@ static void surf_settle(GSurf *s)
 /* Bind the draw's surfaces. 0 when there is nothing to draw into. */
 /* Bind st's colour surface and depth buffer to draw into; `colour` 0: the
  * depth buffer alone (a clear of depth and stencil only). */
+/* Whether this pairing of colour texture and depth buffer was found
+ * complete before: then it is not asked again. The check waits for the GL
+ * thread (it returns a value), and targets change some twenty times a
+ * frame. */
+static int fb_checked(GLuint tex, GLuint rb)
+{
+    static struct { GLuint tex, rb; } ok[64];
+    static int n;
+    int i;
+    for (i = 0; i < n; i++)
+        if (ok[i].tex == tex && ok[i].rb == rb)
+            return 1;
+    ok[n & 63].tex = tex;
+    ok[n & 63].rb = rb;
+    if (n < 64)
+        n++;
+    return 0;
+}
+
 static int begin_target(const Nv2aVkState *st, int colour)
 {
     GSurf *cs = colour ? surf_get(st) : NULL;
@@ -2312,7 +2588,8 @@ static int begin_target(const Nv2aVkState *st, int colour)
                            cs ? cs->tex : 0, 0);
     glFramebufferRenderbuffer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER,
                               zs ? zs->rb : 0);
-    if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+    if (!fb_checked(cs ? cs->tex : 0, zs ? zs->rb : 0)
+            && glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         static int shown;
         if (shown++ < 10)
             fprintf(stderr, "[GL] incomplete target: surf %08X zeta %08X\n",
@@ -2358,6 +2635,8 @@ static void mark_drawn(const Nv2aVkState *st)
             G.cur_cs->dref = hash_sparse(guest(G.cur_cs->va), surf_bytes(G.cur_cs));
             G.cur_cs->dref_valid = 1;
         }
+        if (!G.cur_cs->dirty)
+            G.dirty_gen++;
         G.cur_cs->dirty = 1;
         G.cur_cs->gen++;
         if (rows > G.cur_cs->h)
@@ -2389,10 +2668,19 @@ static GLuint sampler(const Nv2aVkTex *t, uint32_t levels)
                  | (uint64_t)(mip ? (maxl < levels ? maxl : levels) : 0) << 34;
     GLuint s;
     GLenum minf;
+    GSampC *c;
     int i;
+    /* A direct-mapped cache in front of the list, which is searched one
+     * entry at a time (up to 256), for every stage of every draw. */
+    c = &G.samp_cache[(key * 0x9E3779B97F4A7C15ull) >> 58];
+    if (c->s && c->key == key)
+        return c->s;
     for (i = 0; i < G.nsamp; i++)
-        if (G.samp[i].key == key)
+        if (G.samp[i].key == key) {
+            c->key = key;
+            c->s = G.samp[i].s;
             return G.samp[i].s;
+        }
     if (G.nsamp == GL_MAX_SAMP)
         return G.samp[0].s;
     glGenSamplers(1, &s);
@@ -2653,6 +2941,17 @@ static GLuint rt_tex(const Nv2aVkTex *d, uint32_t bytes, uint32_t *levels_out)
     return e->tex;
 }
 
+static void tex_memo(const Nv2aVkTex *d, GLuint tex, uint32_t levels)
+{
+    uint32_t k = (d->offset >> 6 ^ d->offset >> 14 ^ d->color) & 31u;
+    G.tmemo[k].d = *d;
+    G.tmemo[k].epoch = G.epoch;
+    G.tmemo[k].dgen = G.dirty_gen;
+    G.tmemo[k].tgen = G.tex_gen;
+    G.tmemo[k].levels = levels;
+    G.tmemo[k].tex = tex;
+}
+
 /* A decoded, uploaded texture for stage state t; 0 when it cannot be had. */
 static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
 {
@@ -2667,6 +2966,14 @@ static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
     if (!d.valid || !d.width || !d.height || d.width > 4096 || d.height > 4096) {
         G.st_texfail++;
         return 0;
+    }
+    {
+        uint32_t k = (d.offset >> 6 ^ d.offset >> 14 ^ d.color) & 31u;
+        if (G.tmemo[k].tex && G.tmemo[k].epoch == G.epoch && G.tmemo[k].dgen == G.dirty_gen
+                && G.tmemo[k].tgen == G.tex_gen && memcmp(&G.tmemo[k].d, &d, sizeof d) == 0) {
+            *levels_out = G.tmemo[k].levels;
+            return G.tmemo[k].tex;
+        }
     }
     bytes = nv2a_pb_tex_bytes(&d);
     if (!bytes) {
@@ -2703,6 +3010,7 @@ static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
             if (tex_unchanged(c, bytes)) {
                 c->last_use = G.frame;
                 *levels_out = c->levels;
+                tex_memo(&d, c->tex, c->levels);
                 return c->tex;
             }
             e = c;
@@ -2734,12 +3042,27 @@ static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
         GtLabel prev = gt_push(GT_TEX);
         GLuint r = tex_upload(&d, bytes, e, h, levels_out);
         gt_pop(prev);
+        if (r)
+            tex_memo(&d, r, *levels_out);
         if (t0)
             G.pf_tex_us += now_us() - t0;
         G.pf_tex_up++;
         G.pf_tex_kb += bytes >> 10;
         return r;
     }
+}
+
+/* Level lv of a texture from BGRA pixels in client memory, rows `pitch`
+ * bytes apart. (Through a pixel-unpack buffer it was slower on the Switch,
+ * 40 ms for a movie frame: Mesa read the pixels back from the ring, which
+ * is mapped for the GPU, not for CPU reads.) */
+static void tex_image(GLenum target, GLint lv, GLsizei w, GLsizei h, const void *px,
+                      size_t row, size_t pitch)
+{
+    (void)row;
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(pitch / 4));
+    glTexImage2D(target, lv, GL_RGBA8, w, h, 0, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, px);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 }
 
 /* A DXT texture as it is: each face's levels follow one another in guest
@@ -2768,6 +3091,7 @@ static GLuint tex_upload_bc(const Nv2aVkTex *d, uint32_t bytes, GTex *e, uint64_
     w0 = d->width >> d->min_level ? d->width >> d->min_level : 1;
     h0 = d->height >> d->min_level ? d->height >> d->min_level : 1;
     step("texture bc", d->offset, d->color | w0 << 16);
+    G.tex_gen++;
     if (e->used && e->tex)
         glDeleteTextures(1, &e->tex);
     glGenTextures(1, &e->tex);
@@ -2810,10 +3134,38 @@ static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, GTex *e, uint64_t 
     h0 = d.size_from_format ? (d.height >> d.min_level) : d.height;
     if (!w0) w0 = 1;
     if (!h0) h0 = 1;
+    if (!d.cube && !d.size_from_format && (d.color == 0x12 || d.color == 0x1E)
+            && d.pitch % 4 == 0 && d.pitch / 4 >= w0) {
+        /* Linear A8R8G8B8 / X8R8G8B8 is BGRA bytes in rows of `pitch`: GL
+         * reads it as it is, where the decoder went texel by texel. The
+         * intro movies are a 640x320 one rewritten every frame, about 10 ms
+         * a frame decoded on the Switch. */
+        step("texture linear", d.offset, d.color | w0 << 16);
+        G.tex_gen++;
+        if (e->used && e->tex)
+            glDeleteTextures(1, &e->tex);
+        glGenTextures(1, &e->tex);
+        bind_other(GL_TEXTURE_2D, e->tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        if (d.color == 0x1E)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);
+        tex_image(GL_TEXTURE_2D, 0, (GLsizei)w0, (GLsizei)h0, guest(d.offset),
+                  (size_t)w0 * 4, d.pitch);
+        e->used = 1;
+        e->d = d;
+        e->hash = h;
+        e->shash = tex_hash_part(&d, bytes);
+        e->hash_ep = e->full_ep = G.epoch;
+        e->levels = 1;
+        e->last_use = G.frame;
+        *levels_out = 1;
+        return e->tex;
+    }
     buf = (uint32_t *)scratch((size_t)w0 * h0 * 4);
     if (!buf)
         return 0;
     step("texture", d.offset, d.color | w0 << 16);
+    G.tex_gen++;
     if (e->used && e->tex)
         glDeleteTextures(1, &e->tex);
     glGenTextures(1, &e->tex);
@@ -2825,9 +3177,9 @@ static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, GTex *e, uint64_t 
             for (lv = 0; lv < levels; lv++) {
                 uint32_t lw = w0 >> lv ? w0 >> lv : 1, lh = h0 >> lv ? h0 >> lv : 1;
                 nv2a_pb_tex_decode(&d, f, d.min_level + lv, lw, lh, buf);
-                glTexImage2D(d.cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f : GL_TEXTURE_2D,
-                             (GLint)lv, GL_RGBA8, (GLsizei)lw, (GLsizei)lh, 0, GL_BGRA,
-                             GL_UNSIGNED_INT_8_8_8_8_REV, buf);
+                tex_image(d.cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f : GL_TEXTURE_2D,
+                          (GLint)lv, (GLsizei)lw, (GLsizei)lh, buf, (size_t)lw * 4,
+                          (size_t)lw * 4);
             }
     }
     e->used = 1;
@@ -2952,6 +3304,7 @@ static void set_state(const Nv2aVkState *st)
         return;
     memcpy(G.state_key, key, sizeof key);
     G.state_valid = 1;
+    G.bind_changed = 1;
 
     if (st->blend_enable && !(st->blend_sfactor == 1 && st->blend_dfactor == 0)) {
         glEnable(GL_BLEND);
@@ -2993,6 +3346,35 @@ static void set_state(const Nv2aVkState *st)
     }
 }
 
+/* A draw's vertices as draw_common copies and describes them: groups of
+ * bytes (a vertex every `stride`) and, per program input, the group it is
+ * read from, at what offset in a vertex and in what format. The float
+ * paths are one group of vec4s; nv2a_vk_draw_program_raw passes the
+ * title's own arrays, which the GPU then converts. */
+typedef struct {
+    int ngroups, nin;
+    struct { const uint8_t *src; uint32_t stride, bytes; } g[16];
+    struct { uint8_t group; GLint size; GLenum type; GLboolean norm; GLuint reloff; } in[16];
+} GVtx;
+
+/* vec4 floats, input j at 16 * j: the layout the float paths use. */
+static void vtx_floats(GVtx *vx, const void *v, uint32_t stride, uint32_t nv, int nin)
+{
+    int j;
+    vx->ngroups = 1;
+    vx->g[0].src = (const uint8_t *)v;
+    vx->g[0].stride = stride;
+    vx->g[0].bytes = nv * stride;
+    vx->nin = nin;
+    for (j = 0; j < nin; j++) {
+        vx->in[j].group = 0;
+        vx->in[j].size = 4;
+        vx->in[j].type = GL_FLOAT;
+        vx->in[j].norm = GL_FALSE;
+        vx->in[j].reloff = (GLuint)j * 16;
+    }
+}
+
 /* [ring_off, ring_off + total) of the persistently mapped ring, made safe
  * to write: crossing into a quarter waits for the fence set when the writes
  * last left it (the GPU has read what was there), and leaving one sets its
@@ -3016,7 +3398,7 @@ static void ring_reserve(size_t total)
     }
 }
 
-static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t stride,
+static int draw_common(const Nv2aVkState *st, GProg *p, const GVtx *vx,
                        uint32_t nv, const uint32_t *idx, uint32_t nidx)
 {
     Nv2aVkUbo ub;
@@ -3042,6 +3424,11 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
             samp[i] = sampler(&st->tex[i], levels);
         }
     }
+    if (pt0) {
+        uint64_t t = now_us();
+        G.pf_su[0] += t - pt0;
+        pt0 = t;
+    }
     G.st_draws++;
     if (p->hash == 0)
         G.st_cpu++;
@@ -3050,7 +3437,7 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
         if (trace < 0)
             trace = getenv("RECOMP_GL_TRACE") ? atoi(getenv("RECOMP_GL_TRACE")) : 0;
         if (trace >= 2 && (G.frame % 30) == 0 && G.st_draws <= 4) {
-            const float *f = (const float *)v;
+            const float *f = (const float *)vx->g[0].src;
             fprintf(stderr, "[GL]   draw prog %08X in %d nv %u nidx %u topo %u surf %08X zeta %08X"
                     " clip %u,%u %ux%u cm %08X blend %u %X %X depth %u %X mask %u st %u cull %u %X"
                     " at %u %X %X rc %u tex0 %08X fmt %02X %ux%u sff %d | v0 %g %g %g %g\n",
@@ -3074,6 +3461,11 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
         G.st_noclip++;
         return 1;
     }
+    if (pt0) {
+        uint64_t t = now_us();
+        G.pf_su[1] += t - pt0;
+        pt0 = t;
+    }
     {
         const GSurf *c = G.cur_cs;
         nv2a_draw_ubo_fill(&ub, st, stage_on, w, h, st->wbuffer ? 2 : 0, 1.0f, 1.0f,
@@ -3087,7 +3479,8 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
     {
         size_t a = G.ubo_align, o_c, o_v, o_i, total;
         int consts = G.const_epoch != G.epoch || G.const_serial != nv2a_vsh_const_serial();
-        size_t vbytes = (size_t)nv * stride, ibytes = (size_t)nidx * 4;
+        size_t vbytes = 0, ibytes = (size_t)nidx * 4, goff[16];
+        int g;
         uint8_t *m;
         /* The same uniforms as the draw before, still in this lap of the
          * ring: bound already, so neither copied nor bound again (a
@@ -3096,7 +3489,11 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
         int ub_eq = G.last_ub_valid && memcmp(&ub, &G.last_ub, sizeof ub) == 0, same = 0;
         if (pt0) {
             pt1 = now_us();
-            G.pf_prep_us += pt1 - pt0;
+            G.pf_su[2] += pt1 - pt0;
+        }
+        for (g = 0; g < vx->ngroups; g++) {
+            goff[g] = vbytes;
+            vbytes += (vx->g[g].bytes + 15) & ~(size_t)15;
         }
         glBindBuffer(GL_ARRAY_BUFFER, G.ring);
         for (;;) {
@@ -3133,7 +3530,8 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
             memcpy(m, &ub, sizeof ub);
         if (consts)
             memcpy(m + o_c, nv2a_vsh_constants(), NV2A_VSH_CONSTANTS * 16);
-        memcpy(m + o_v, v, vbytes);
+        for (g = 0; g < vx->ngroups; g++)
+            memcpy(m + o_v + goff[g], vx->g[g].src, vx->g[g].bytes);
         memcpy(m + o_i, idx, ibytes);
         if (!G.ring_map)
             glUnmapBuffer(GL_ARRAY_BUFFER);
@@ -3161,16 +3559,19 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
             if (!G.b_valid || G.b_tex[i] != tex2d[i]) {
                 glActiveTexture(GL_TEXTURE0 + i);
                 glBindTexture(GL_TEXTURE_2D, tex2d[i]);
+                G.bind_changed = 1;
                 G.b_tex[i] = tex2d[i];
             }
             if (!G.b_valid || G.b_tex[4 + i] != texcube[i]) {
                 glActiveTexture(GL_TEXTURE4 + i);
                 glBindTexture(GL_TEXTURE_CUBE_MAP, texcube[i]);
+                G.bind_changed = 1;
                 G.b_tex[4 + i] = texcube[i];
             }
             if (!G.b_valid || G.b_samp[i] != samp[i]) {
                 glBindSampler((GLuint)i, samp[i]);
                 glBindSampler((GLuint)(4 + i), samp[i]);
+                G.bind_changed = 1;
                 G.b_samp[i] = samp[i];
             }
         }
@@ -3179,10 +3580,12 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
             GLuint fs = frag_get(st, &ub);
             if (G.b_vs != p->prog) {
                 glUseProgramStages(G.pipe, GL_VERTEX_SHADER_BIT, p->prog);
+                G.bind_changed = 1;
                 G.b_vs = p->prog;
             }
             if (G.b_fs != fs) {
                 glUseProgramStages(G.pipe, GL_FRAGMENT_SHADER_BIT, fs);
+                G.bind_changed = 1;
                 G.b_fs = fs;
             }
         }
@@ -3195,9 +3598,38 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
             }
             G.b_ninputs = p->ninputs;
         }
-        glBindVertexBuffer(0, G.ring, (GLintptr)o_v, (GLsizei)stride);
+        for (i = 0; i < vx->nin; i++) {
+            GFmt *c = &G.fmt[i];
+            if (c->size != vx->in[i].size || c->type != vx->in[i].type
+                    || c->norm != vx->in[i].norm || c->reloff != vx->in[i].reloff) {
+                glVertexAttribFormat((GLuint)i, vx->in[i].size, vx->in[i].type,
+                                     vx->in[i].norm, vx->in[i].reloff);
+                c->size = vx->in[i].size;
+                c->type = vx->in[i].type;
+                c->norm = vx->in[i].norm;
+                c->reloff = vx->in[i].reloff;
+            }
+            if (c->group != vx->in[i].group) {
+                glVertexAttribBinding((GLuint)i, vx->in[i].group);
+                c->group = vx->in[i].group;
+            }
+        }
+        for (g = 0; g < vx->ngroups; g++)
+            glBindVertexBuffer((GLuint)g, G.ring, (GLintptr)(o_v + goff[g]),
+                               (GLsizei)vx->g[g].stride);
         set_state(st);
         zq = G.zpass && !(gl_exp() & 1);
+        {
+            /* RECOMP_PERF: could this draw have joined the last one? */
+            uint32_t k[8] = { (uint32_t)(uintptr_t)G.cur_cs, (uint32_t)(uintptr_t)G.cur_zs,
+                              vx->g[0].stride, st->topology, st->clip_x | st->clip_y << 16,
+                              st->clip_w | st->clip_h << 16, (uint32_t)p->ninputs, 0 };
+            if (!G.bind_changed && same && !consts && !zq
+                    && memcmp(k, G.last_draw_key, sizeof k) == 0)
+                G.pf_mergeable++;
+            memcpy(G.last_draw_key, k, sizeof k);
+            G.bind_changed = 0;
+        }
         if (zq && G.nq == GL_MAX_QUERIES)
             reports_resolve();
         if (zq)
@@ -3227,8 +3659,11 @@ void nv2a_vk_draw(const Nv2aVkState *st, const Nv2aVshOutput *v, uint32_t nv,
         return;
     t0 = perf_on() ? now_us() : 0;
     p = prog_get(0);
-    if (p && p->prog)
-        (void)draw_common(st, p, v, sizeof *v, nv, idx, nidx);
+    if (p && p->prog) {
+        GVtx vx;
+        vtx_floats(&vx, v, sizeof *v, nv, p->ninputs);
+        (void)draw_common(st, p, &vx, nv, idx, nidx);
+    }
     if (t0)
         G.pf_draw_us += now_us() - t0;
     G.pf_draws++;
@@ -3260,10 +3695,174 @@ int nv2a_vk_draw_program(const Nv2aVkState *st, uint32_t hash, const float *vin,
         return 0;
     {
         uint64_t t0 = perf_on() ? now_us() : 0;
-        int r = draw_common(st, p, vin, (uint32_t)p->ninputs * 16, nv, idx, nidx);
+        GVtx vx;
+        int r;
+        vtx_floats(&vx, vin, (uint32_t)p->ninputs * 16, nv, p->ninputs);
+        r = draw_common(st, p, &vx, nv, idx, nidx);
         if (t0)
             G.pf_draw_us += now_us() - t0;
         G.pf_draws++;
+        return r;
+    }
+}
+
+/* The GL format of an NV097 vertex attribute type: 0 when the GPU cannot
+ * read it as it is (the packed 11:11:10 normal), else its bytes. */
+static uint32_t raw_format(uint32_t type, uint32_t size, GLint *gsize, GLenum *gtype,
+                           GLboolean *norm)
+{
+    if (size < 1 || size > 4)
+        return 0;
+    switch (type) {
+    case 0:                                 /* D3DCOLOR: B,G,R,A bytes */
+        if (size != 4)
+            return 0;
+        *gsize = GL_BGRA; *gtype = GL_UNSIGNED_BYTE; *norm = GL_TRUE;
+        return 4;
+    case 2:                                 /* float */
+        *gsize = (GLint)size; *gtype = GL_FLOAT; *norm = GL_FALSE;
+        return 4 * size;
+    case 4:                                 /* unsigned byte, normalised */
+        *gsize = (GLint)size; *gtype = GL_UNSIGNED_BYTE; *norm = GL_TRUE;
+        return size;
+    case 1:                                 /* signed short, normalised */
+        *gsize = (GLint)size; *gtype = GL_SHORT; *norm = GL_TRUE;
+        return 2 * size;
+    case 5:                                 /* signed short, as is */
+        *gsize = (GLint)size; *gtype = GL_SHORT; *norm = GL_FALSE;
+        return 2 * size;
+    default:
+        return 0;
+    }
+}
+
+/* The title's vertex arrays copied as they are -- inputs that share one
+ * interleaved array once -- and converted by the GPU through attribute
+ * formats, where the executor turned every component into a float (5-9 ms
+ * a frame of a race on the Switch). RECOMP_GL_RAW_VERTICES=0: always the
+ * float path. */
+int nv2a_vk_draw_program_raw(const Nv2aVkState *st, uint32_t hash, const Nv2aVkRawAttr *in,
+                             uint32_t nin, uint32_t nv, const uint32_t *idx, uint32_t nidx)
+{
+    static int on = -1;
+    GProg *p;
+    GVtx vx;
+    uint32_t j, elem[16];
+    int g;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GL_RAW_VERTICES");
+        on = !(e && strcmp(e, "0") == 0);
+    }
+    if (!on || !nin || nin > 16 || !nv)
+        return -1;
+    if (!nidx || !nv2a_vk_active())
+        return 1;
+    p = prog_get(hash);
+    if (!p || p->failed)
+        return 0;
+    if ((uint32_t)p->ninputs != nin) {
+        G.pf_rawno[0]++;
+        return -1;
+    }
+    vx.ngroups = 0;
+    vx.nin = (int)nin;
+    for (j = 0; j < nin; j++) {
+        const uint8_t *src = in[j].src;
+        uint32_t stride = in[j].stride, comp;
+        if (in[j].type == NV2A_RAW_DEFAULT) {
+            /* One vec4, read by every vertex (stride 0). */
+            static const float def[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+            for (g = 0; g < vx.ngroups; g++)
+                if (vx.g[g].src == (const uint8_t *)def)
+                    break;
+            if (g == vx.ngroups) {
+                if (g == 16)
+                    return -1;
+                vx.ngroups++;
+                vx.g[g].src = (const uint8_t *)def;
+                vx.g[g].stride = 0;
+                vx.g[g].bytes = 16;
+            }
+            vx.in[j].group = (uint8_t)g;
+            vx.in[j].size = 4;
+            vx.in[j].type = GL_FLOAT;
+            vx.in[j].norm = GL_FALSE;
+            vx.in[j].reloff = 0;
+            continue;
+        }
+        if (in[j].type == 6 && in[j].size >= 1 && src && stride) {
+            /* The packed 11:11:10 normal has no GL format: that input alone
+             * is made floats here, an array of its own. */
+            static float *buf;
+            static uint32_t cap;
+            uint32_t v;
+            float *o;
+            if (nv > cap) {
+                free(buf);
+                cap = nv + 1024;
+                buf = (float *)malloc((size_t)cap * 12);
+                if (!buf) {
+                    cap = 0;
+                    return -1;
+                }
+            }
+            o = buf;
+            for (v = 0; v < nv; v++, o += 3) {
+                uint32_t w;
+                memcpy(&w, src + (size_t)v * stride, 4);
+                o[0] = (float)((int32_t)(w << 21) >> 21) / 1023.0f;
+                o[1] = (float)((int32_t)(w << 10) >> 21) / 1023.0f;
+                o[2] = (float)((int32_t)w >> 22) / 511.0f;
+            }
+            if (vx.ngroups == 16)
+                return -1;
+            g = vx.ngroups++;
+            vx.g[g].src = (const uint8_t *)buf;
+            vx.g[g].stride = 12;
+            vx.g[g].bytes = nv * 12;
+            vx.in[j].group = (uint8_t)g;
+            vx.in[j].size = 3;
+            vx.in[j].type = GL_FLOAT;
+            vx.in[j].norm = GL_FALSE;
+            vx.in[j].reloff = 0;
+            continue;
+        }
+        elem[j] = raw_format(in[j].type, in[j].size, &vx.in[j].size, &vx.in[j].type,
+                             &vx.in[j].norm);
+        comp = in[j].type == 2 || in[j].type == 0 ? 4 : in[j].type == 4 ? 1 : 2;
+        if (!elem[j] || !src || !stride || stride % comp || ((uintptr_t)src % comp)
+                || elem[j] > stride) {
+            G.pf_rawno[!elem[j] ? 1 : stride % comp ? 2 : ((uintptr_t)src % comp) ? 3 : 4]++;
+            if (!elem[j])
+                G.pf_rawtype[in[j].type & 15]++;
+            return -1;
+        }
+        /* An array already copied that this element lies in: the same
+         * vertices, interleaved. */
+        for (g = 0; g < vx.ngroups; g++)
+            if (vx.g[g].stride == stride && src >= vx.g[g].src
+                    && src + elem[j] <= vx.g[g].src + stride)
+                break;
+        if (g == vx.ngroups) {
+            if (g == 16)
+                return -1;
+            vx.g[g].src = src;
+            vx.g[g].stride = stride;
+            vx.g[g].bytes = 0;
+            vx.ngroups++;
+        }
+        vx.in[j].group = (uint8_t)g;
+        vx.in[j].reloff = (GLuint)(src - vx.g[g].src);
+        if ((nv - 1) * stride + vx.in[j].reloff + elem[j] > vx.g[g].bytes)
+            vx.g[g].bytes = (nv - 1) * stride + vx.in[j].reloff + elem[j];
+    }
+    {
+        uint64_t t0 = perf_on() ? now_us() : 0;
+        int r = draw_common(st, p, &vx, nv, idx, nidx);
+        if (t0)
+            G.pf_draw_us += now_us() - t0;
+        G.pf_draws++;
+        G.pf_raw++;
         return r;
     }
 }
@@ -3297,6 +3896,7 @@ static void drop_inflight(const Nv2aVkState *st)
         q->dirty = 0;
         q->clear_only = 0;
         q->ref_valid = 0;
+        G.dirty_gen++;
     }
 }
 
@@ -3462,6 +4062,21 @@ void nv2a_vk_flush(void)
  * at most, at the end of the frame (or when the query pool runs out), as the
  * Vulkan renderer answers them at its sync. Until then a report's slot holds
  * what D3D put there -- "not done" -- which the title polls. */
+/* Every query's result into res: on the GL thread in one go when the
+ * calls are queued, rather than a wait for each. */
+static struct { const GLuint *q; int n; uint32_t *res; } s_qread;
+
+static void qread_run(void *unused)
+{
+    int i;
+    (void)unused;
+    for (i = 0; i < s_qread.n; i++) {
+        GLuint n = 0;
+        p_glGetQueryObjectuiv(s_qread.q[i], GL_QUERY_RESULT, &n);
+        s_qread.res[i] = n;
+    }
+}
+
 static void reports_write(const GLuint *queries, int nq, int clear_q,
                           const GReport *reps, int nreps)
 {
@@ -3472,10 +4087,14 @@ static void reports_write(const GLuint *queries, int nq, int clear_q,
         return;
     if (!res)
         res = (uint32_t *)calloc(GL_MAX_QUERIES, sizeof(uint32_t));
-    for (i = 0; i < nq; i++) {
-        GLuint n = 0;
-        glGetQueryObjectuiv(queries[i], GL_QUERY_RESULT, &n);
-        res[i] = n;
+    s_qread.q = queries;
+    s_qread.n = nq;
+    s_qread.res = res;
+    if (nq) {
+        if (glq_direct())
+            qread_run(NULL);
+        else
+            glq_call(qread_run, NULL, "query results");
     }
     for (k = 0; k < nreps; k++) {
         uint64_t sum = reps[k].with_carry ? G.carry : 0;
@@ -3690,7 +4309,12 @@ void nv2a_vk_present_queued(void)
     glEnable(GL_SCISSOR_TEST);
     {
         uint64_t t0 = perf_on() ? now_us() : 0;
-        SDL_GL_SwapWindow(G.win);
+        if (glq_direct()) {
+            SDL_GL_SwapWindow(G.win);
+        } else {
+            glq_alloc(qrun_swap, 0);
+            glq_commit();
+        }
         if (t0)
             G.pf_present_us += now_us() - t0;
     }

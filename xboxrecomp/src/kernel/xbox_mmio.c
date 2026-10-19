@@ -137,7 +137,18 @@ uint64_t xbox_mmio_read(uint32_t va, int size)
 
 void xbox_mmio_write(uint32_t va, uint64_t value, int size)
 {
+    extern void xbox_Nv2aKick(uint32_t va);
     int i = find(va);
+    if (va >= 0xFD000000u && va < 0xFE000000u) {
+        /* After the write, so the woken acknowledge thread sees it. */
+        int r = i >= 0 && s_mmio[i].wr;
+        if (r)
+            s_mmio[i].wr(s_mmio[i].dev, va - s_mmio[i].off_base, value, size);
+        else
+            memcpy(plain(va), &value, (size_t)size);
+        xbox_Nv2aKick(va);
+        return;
+    }
     if (i >= 0 && s_mmio[i].wr) {
         s_mmio[i].wr(s_mmio[i].dev, va - s_mmio[i].off_base, value, size);
         return;

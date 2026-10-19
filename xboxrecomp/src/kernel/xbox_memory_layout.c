@@ -1006,6 +1006,41 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* RECOMP_ACK_IDLE (on by default on the Switch): the loop below, with
+ * nothing to do -- PUT caught up, no flush waiting -- for a while, sleeps on
+ * an event for up to 1 ms instead of yielding, and a title write to PUT,
+ * the PFB flush or an interrupt status register (xbox_Nv2aKick, from
+ * xbox_mmio_write) wakes it. Yielding gives way only to threads of the same
+ * priority on the Switch, so the spinning loop kept most of a core from the
+ * game's own threads -- the intro movies' among them. */
+static HANDLE s_ack_event;
+static int ack_idle_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_ACK_IDLE");
+#if defined(__SWITCH__)
+        on = !(e && strcmp(e, "0") == 0);
+#else
+        on = e && strcmp(e, "0") != 0;
+#endif
+    }
+    return on;
+}
+
+void xbox_Nv2aKick(uint32_t va)
+{
+    switch (va - 0xFD000000u) {
+    case NV2A_USER_DMA_PUT: case 0x100410: case 0x000100: case 0x001100:
+    case 0x002100: case 0x400100: case 0x600100:
+        if (s_ack_event)
+            SetEvent(s_ack_event);
+        break;
+    default:
+        break;
+    }
+}
+
 /* RECOMP_ACK_STATS: how fast the loop below turns, and how often it
  * acknowledges a PFB flush -- every D3D kick waits for one. */
 static uint64_t s_ack_loops, s_ack_clears, s_ack_scan_us;
@@ -1014,6 +1049,7 @@ static int s_ack_stats;
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    unsigned idle = 0;
     s_ack_stats = getenv("RECOMP_ACK_STATS") != NULL;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         /* Entry 0, the PFB flush, is acknowledged further down, once the
@@ -1277,6 +1313,20 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 tick0 + (uint32_t)(xbox_GuestClockNs() / 1000000ull);
         }
 
+        if (ack_idle_on()) {
+            /* Idle: everything submitted is executed and no flush waits. */
+            uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            uint32_t get = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+            uint32_t flush = *(volatile uint32_t *)((char *)regs + NV2A_ACK[0].offset);
+            if (put == get && !(flush & NV2A_ACK[0].busy_mask))
+                idle++;
+            else
+                idle = 0;
+            if (idle > 32) {
+                WaitForSingleObject(s_ack_event, 1);
+                continue;
+            }
+        }
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
@@ -1287,6 +1337,8 @@ static void xbox_Nv2aAckStart(void)
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+    if (ack_idle_on())
+        s_ack_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {

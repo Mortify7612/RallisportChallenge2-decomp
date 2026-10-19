@@ -84,6 +84,22 @@ int  nv2a_vk_program(uint32_t hash, uint8_t inputs[16]);
 int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
                          uint32_t nv, const uint32_t *idx, uint32_t nidx);
 
+/* One program input as the title laid it out (the GL renderer's
+ * nv2a_vk_draw_program_raw): `src` is the first vertex drawn's element,
+ * the next one `stride` bytes on; `type` and `size` are the NV097 data type
+ * and component count. */
+typedef struct {
+    const uint8_t *src;
+    uint32_t stride, type, size;
+} Nv2aVkRawAttr;
+#define NV2A_RAW_DEFAULT 0xFFu      /* no array: (0, 0, 0, 1) for every vertex */
+
+/* nv2a_vk_draw_program with the inputs in the title's own formats, for the
+ * GPU to convert: 1 drawn, 0 the program is still being built, -1 a layout
+ * it does not take (draw it with nv2a_vk_draw_program). GL renderer only. */
+int nv2a_vk_draw_program_raw(const Nv2aVkState *s, uint32_t hash, const Nv2aVkRawAttr *in,
+                             uint32_t nin, uint32_t nv, const uint32_t *idx, uint32_t nidx);
+
 /* CLEAR_SURFACE: `flags` is its parameter (0x01 Z, 0x02 stencil, 0xF0
  * colour), `argb` the colour clear value, `zs` ZSTENCIL_CLEAR_VALUE. */
 void nv2a_vk_clear(const Nv2aVkState *s, uint32_t flags, uint32_t argb,

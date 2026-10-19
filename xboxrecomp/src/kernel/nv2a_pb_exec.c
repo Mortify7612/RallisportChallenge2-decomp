@@ -3213,7 +3213,7 @@ static uint32_t k_or_1(uint32_t kk) { return kk ? kk : 1; }
  * time goes before the renderer has it, in ns -- fetching the vertices,
  * making the triangle list, gathering the state, the renderer's draw --
  * summed for nv2a_gl.c's report (nv2a_pb_perf_take). */
-static uint64_t s_pf[5];
+static uint64_t s_pf[6];          /* ... [5] the flip pacer's waits */
 static int pb_perf(void)
 {
     static int on = -1;
@@ -3239,7 +3239,7 @@ uint64_t nv2a_pb_walk_ns;            /* nv2a_pb_scan.c: every pb_walk */
 
 int nv2a_pb_perf_on(void) { return pb_perf(); }
 
-void nv2a_pb_perf_take(uint64_t out[5])
+void nv2a_pb_perf_take(uint64_t out[6])
 {
     s_pf[4] = nv2a_pb_walk_ns;
     nv2a_pb_walk_ns = 0;
@@ -3278,6 +3278,92 @@ static int vk_program_batch(void)
     }
     ranged = hi - lo < NV_MAX_INDICES && hi - lo + 1 <= 2 * n + 64;
     nv = ranged ? hi - lo + 1 : n;
+#if defined(XBOXRECOMP_HAVE_GL) && !defined(XBOXRECOMP_HAVE_VULKAN)
+    /* The GL renderer reads the title's own arrays, the GPU converting
+     * them (nv2a_vk_draw_program_raw): no vertex fetch here. */
+    if (ranged && kk && kk <= 16) {
+        Nv2aVkRawAttr ra[16];
+        const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        int r;
+        for (i = 0; i < kk; i++) {
+            const VertexAttr *a = &s_gpu.attr[ins[i]];
+            size_t first = (size_t)lo * a->stride;
+            if (!a->size || !a->stride || (!s_gpu.inline_active && !a->offset)) {
+                /* No array: (0, 0, 0, 1) for every vertex, as fetch_attr. */
+                ra[i].src = NULL;
+                ra[i].stride = 0;
+                ra[i].type = NV2A_RAW_DEFAULT;
+                ra[i].size = 4;
+                continue;
+            }
+            if (s_gpu.inline_active) {
+                if ((size_t)a->offset + first + (size_t)(nv - 1) * a->stride + 4 * a->size
+                        > (size_t)s_gpu.inline_count * 4)
+                    break;
+                ra[i].src = (const uint8_t *)s_gpu.inline_buf + a->offset + first;
+            } else {
+                if (!a->offset)
+                    break;
+                ra[i].src = mem + XBOX_FOLD(a->offset) + first;
+            }
+            ra[i].stride = a->stride;
+            ra[i].type = a->type;
+            ra[i].size = a->size;
+            {
+                /* What the renderer would refuse, refused here, before the
+                 * triangle list is made: elements off their components'
+                 * alignment (RSC2 packs floats 2 bytes apart in places). */
+                uint32_t comp = a->type == 4 ? 1 : a->type == 1 || a->type == 5 ? 2 : 4;
+                if (a->type != 6 && (a->stride % comp || (uintptr_t)ra[i].src % comp))
+                    break;
+            }
+        }
+        if (i == kk) {
+            if (t0) {
+                t1 = pb_ns();
+                s_pf[0] += t1 - t0;
+                t0 = t1;
+            }
+            k = vk_tri_list(n);
+            for (i = 0; i < k; i++)
+                s_vk_idx[i] = s_gpu.idx[s_vk_idx[i]] - lo;
+            if (t0) {
+                t1 = pb_ns();
+                s_pf[1] += t1 - t0;
+                t0 = t1;
+            }
+            if (!k) {
+                s_gpu.batches_program++;
+                s_gpu.verts_program += n;
+                return 1;
+            }
+            vk_state(&st);
+            if (t0) {
+                t1 = pb_ns();
+                s_pf[2] += t1 - t0;
+                t0 = t1;
+            }
+            r = nv2a_vk_draw_program_raw(&st, h, ra, kk, nv, s_vk_idx, k);
+            if (t0)
+                s_pf[3] += pb_ns() - t0;
+            if (r == 0)
+                return 0;               /* still compiling: the CPU path draws it */
+            if (r > 0) {
+                s_gpu.batches_program++;
+                s_gpu.verts_program += n;
+                s_gpu.tris_drawn += k / 3;
+                s_gpu.xf_drawn += k / 3;
+                note_drawn();
+                return 1;
+            }
+            /* -1: a layout the GPU cannot take as it is; fetched below. The
+             * triangle list is made again there, from the same indices. */
+            k = kk ? kk : 1;
+            if (t0)
+                t0 = pb_ns();
+        }
+    }
+#endif
     if (!kk)
         for (j = 0; j < nv; j++) {
             float *o = vin + (size_t)j * 4;
@@ -4419,6 +4505,8 @@ static void flip_pace(void)
         next = now + period;                  /* fell behind: new grid */
         return;
     }
+    if (pb_perf())
+        s_pf[5] += (uint64_t)((next > now ? next - now : 0.0) * 1e9);
     while ((now = flip_now_s()) < next) {
         double left = next - now;
         if (left > 0.002) {
