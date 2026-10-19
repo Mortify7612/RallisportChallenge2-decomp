@@ -28,8 +28,9 @@ int nx_memory_check(void)
     PadState pad;
 
     svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
-    fprintf(stderr, "[SWITCH] %llu MB of memory (%s)\n", (unsigned long long)(total >> 20),
-            appletGetAppletType() == AppletType_Application ? "application" : "applet mode");
+    fprintf(stderr, "[SWITCH] %llu MB of memory (%s), %s\n", (unsigned long long)(total >> 20),
+            appletGetAppletType() == AppletType_Application ? "application" : "applet mode",
+            appletGetOperationMode() == AppletOperationMode_Console ? "docked" : "handheld");
     if (total >= NX_MEM_NEEDED || (force && strcmp(force, "1") == 0))
         return 1;
 

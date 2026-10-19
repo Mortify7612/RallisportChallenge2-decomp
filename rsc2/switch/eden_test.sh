@@ -17,6 +17,9 @@
 # the dumped frames, and summary.txt: crashes, stalls, the last [PERF]
 # reports and the frame comparison. Exits 1 if the game crashed.
 #
+# Eden runs in handheld mode (use_docked_mode=0 in eden-cli's
+# sdl2-config.ini, set on each run).
+#
 # Setup, once (rsc2/switch/README.md, "Eden"): Eden's AppImage extracted to
 # work/eden/AppDir (`./Eden.AppImage --appimage-extract` in work/eden), its
 # keys in ~/.local/share/eden/keys, and the game in the SD folder below
@@ -75,6 +78,13 @@ cp "$sd/rsc2.env" "$out/settings.env"
 rm -rf "$sd/dumps"
 mkdir -p "$sd/dumps"
 rm -f "$sd/rsc2.log"
+# Handheld, as the owner plays and measures on the console (the GPU's
+# clock and the screen's 1280x720 differ docked).
+cfg=${EDEN_CONFIG:-$HOME/.config/eden/sdl2-config.ini}
+if [ -e "$cfg" ]; then
+    sed -i 's/^use_docked_mode\\default=true$/use_docked_mode\\default=false/;
+            s/^use_docked_mode=1$/use_docked_mode=0/' "$cfg"
+fi
 
 echo "eden_test.sh: running for ${secs}s -> $out"
 # timeout ends xvfb-run, which takes Eden and the X server down with it.
