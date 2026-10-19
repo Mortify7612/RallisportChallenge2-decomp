@@ -207,6 +207,54 @@ vec4 stage_fetch(uint st, sampler2D s2, samplerCube sc)
     }
 }
 
+/* One general combiner stage. A function so the specialised build can
+ * call it once per stage with a constant `s` (main): Mesa does not unroll
+ * the loop, and with `s` unknown the register file R[] is indexed at run
+ * time -- kept in local memory, which on the Switch's GPU made the shader
+ * most of the frame. */
+void rc_stage(uint s, uint flags)
+{
+    uvec4 w = K_CW(s);
+    uint icw = w.x, aicw = w.y, ocw = w.z, aocw = w.w;
+    uint fl = ocw >> 12, afl = aocw >> 12;
+    R[1] = u.f0[(flags & 0x010u) != 0u ? s : 0u];
+    R[2] = u.f1[(flags & 0x100u) != 0u ? s : 0u];
+    bool mux = (flags & 1u) != 0u ? R[12].a >= 0.5
+                                  : (int(R[12].a * 255.0) & 1) != 0;
+    NV2A_MP vec3 A = read_rgb(icw >> 24), B = read_rgb(icw >> 16);
+    NV2A_MP vec3 C = read_rgb(icw >> 8),  D = read_rgb(icw);
+    NV2A_MP float aA = read_alpha(aicw >> 24), aB = read_alpha(aicw >> 16);
+    NV2A_MP float aC = read_alpha(aicw >> 8),  aD = read_alpha(aicw);
+
+    NV2A_MP vec3 pab = (fl & 2u) != 0u ? vec3(dot(A, B)) : A * B;
+    NV2A_MP vec3 pcd = (fl & 1u) != 0u ? vec3(dot(C, D)) : C * D;
+    NV2A_MP vec3 sum = (fl & 4u) != 0u ? (mux ? pcd : pab) : pab + pcd;
+    NV2A_MP vec3 ab = map_out3(pab, fl & 0x38u);
+    NV2A_MP vec3 cd = map_out3(pcd, fl & 0x38u);
+    NV2A_MP vec3 ms = map_out3(sum, fl & 0x38u);
+
+    NV2A_MP float apab = aA * aB, apcd = aC * aD;
+    NV2A_MP float asum = (afl & 4u) != 0u ? (mux ? apcd : apab) : apab + apcd;
+    NV2A_MP float aab = clamp(map_out(apab, afl & 0x38u), -1.0, 1.0);
+    NV2A_MP float acd = clamp(map_out(apcd, afl & 0x38u), -1.0, 1.0);
+    NV2A_MP float ams = clamp(map_out(asum, afl & 0x38u), -1.0, 1.0);
+
+    uint d;
+    d = (ocw >> 4) & 15u;
+    if (d != 0u) { R[d].rgb = ab; if ((fl & 0x80u) != 0u) R[d].a = ab.b; }
+    d = ocw & 15u;
+    if (d != 0u) { R[d].rgb = cd; if ((fl & 0x40u) != 0u) R[d].a = cd.b; }
+    d = (ocw >> 8) & 15u;
+    if (d != 0u) R[d].rgb = ms;
+    d = (aocw >> 4) & 15u;
+    if (d != 0u) R[d].a = aab;
+    d = aocw & 15u;
+    if (d != 0u) R[d].a = acd;
+    d = (aocw >> 8) & 15u;
+    if (d != 0u) R[d].a = ams;
+    R[0] = vec4(0.0);
+}
+
 bool alpha_pass(float a)
 {
     int v = int(a * 255.0 + 0.5), r = int(u.misc.z & 0xFFu);
@@ -275,47 +323,19 @@ void main()
         R[8] = t0; R[9] = t1; R[10] = t2; R[11] = t3;
         R[12].a = (K_MISC.w & 0x1Fu) != 0u ? t0.a : 1.0;
 
-        for (uint s = 0u; s < n; s++) {
-            uvec4 w = K_CW(s);
-            uint icw = w.x, aicw = w.y, ocw = w.z, aocw = w.w;
-            uint fl = ocw >> 12, afl = aocw >> 12;
-            R[1] = u.f0[(flags & 0x010u) != 0u ? s : 0u];
-            R[2] = u.f1[(flags & 0x100u) != 0u ? s : 0u];
-            bool mux = (flags & 1u) != 0u ? R[12].a >= 0.5
-                                          : (int(R[12].a * 255.0) & 1) != 0;
-            NV2A_MP vec3 A = read_rgb(icw >> 24), B = read_rgb(icw >> 16);
-            NV2A_MP vec3 C = read_rgb(icw >> 8),  D = read_rgb(icw);
-            NV2A_MP float aA = read_alpha(aicw >> 24), aB = read_alpha(aicw >> 16);
-            NV2A_MP float aC = read_alpha(aicw >> 8),  aD = read_alpha(aicw);
-
-            NV2A_MP vec3 pab = (fl & 2u) != 0u ? vec3(dot(A, B)) : A * B;
-            NV2A_MP vec3 pcd = (fl & 1u) != 0u ? vec3(dot(C, D)) : C * D;
-            NV2A_MP vec3 sum = (fl & 4u) != 0u ? (mux ? pcd : pab) : pab + pcd;
-            NV2A_MP vec3 ab = map_out3(pab, fl & 0x38u);
-            NV2A_MP vec3 cd = map_out3(pcd, fl & 0x38u);
-            NV2A_MP vec3 ms = map_out3(sum, fl & 0x38u);
-
-            NV2A_MP float apab = aA * aB, apcd = aC * aD;
-            NV2A_MP float asum = (afl & 4u) != 0u ? (mux ? apcd : apab) : apab + apcd;
-            NV2A_MP float aab = clamp(map_out(apab, afl & 0x38u), -1.0, 1.0);
-            NV2A_MP float acd = clamp(map_out(apcd, afl & 0x38u), -1.0, 1.0);
-            NV2A_MP float ams = clamp(map_out(asum, afl & 0x38u), -1.0, 1.0);
-
-            uint d;
-            d = (ocw >> 4) & 15u;
-            if (d != 0u) { R[d].rgb = ab; if ((fl & 0x80u) != 0u) R[d].a = ab.b; }
-            d = ocw & 15u;
-            if (d != 0u) { R[d].rgb = cd; if ((fl & 0x40u) != 0u) R[d].a = cd.b; }
-            d = (ocw >> 8) & 15u;
-            if (d != 0u) R[d].rgb = ms;
-            d = (aocw >> 4) & 15u;
-            if (d != 0u) R[d].a = aab;
-            d = aocw & 15u;
-            if (d != 0u) R[d].a = acd;
-            d = (aocw >> 8) & 15u;
-            if (d != 0u) R[d].a = ams;
-            R[0] = vec4(0.0);
-        }
+#ifdef NV2A_SPEC
+        if (n > 0u) rc_stage(0u, flags);
+        if (n > 1u) rc_stage(1u, flags);
+        if (n > 2u) rc_stage(2u, flags);
+        if (n > 3u) rc_stage(3u, flags);
+        if (n > 4u) rc_stage(4u, flags);
+        if (n > 5u) rc_stage(5u, flags);
+        if (n > 6u) rc_stage(6u, flags);
+        if (n > 7u) rc_stage(7u, flags);
+#else
+        for (uint s = 0u; s < n; s++)
+            rc_stage(s, flags);
+#endif
 
         uint f0 = K_MISC2.y, f1 = K_MISC2.z;
         if (f0 != 0u || f1 != 0u) {

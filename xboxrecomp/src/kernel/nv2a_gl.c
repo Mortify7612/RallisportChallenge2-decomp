@@ -137,6 +137,8 @@ extern uint32_t nv2a_pb_presented_frames(void);
     X(PFNGLGETQUERYOBJECTUI64VPROC, glGetQueryObjectui64v) \
     X(PFNGLGETINTEGER64VPROC, glGetInteger64v) \
     X(PFNGLCREATESHADERPROGRAMVPROC, glCreateShaderProgramv) \
+    X(PFNGLCOMPRESSEDTEXIMAGE2DPROC, glCompressedTexImage2D) \
+    X(PFNGLGETSTRINGIPROC, glGetStringi) \
     X(PFNGLGENPROGRAMPIPELINESPROC, glGenProgramPipelines) \
     X(PFNGLBINDPROGRAMPIPELINEPROC, glBindProgramPipeline) \
     X(PFNGLUSEPROGRAMSTAGESPROC, glUseProgramStages) \
@@ -232,6 +234,8 @@ GL_FNS(GL_DECL)
 #define glGetQueryObjectui64v p_glGetQueryObjectui64v
 #define glGetInteger64v p_glGetInteger64v
 #define glCreateShaderProgramv p_glCreateShaderProgramv
+#define glCompressedTexImage2D p_glCompressedTexImage2D
+#define glGetStringi p_glGetStringi
 #define glGenProgramPipelines p_glGenProgramPipelines
 #define glBindProgramPipeline p_glBindProgramPipeline
 #define glUseProgramStages p_glUseProgramStages
@@ -266,6 +270,11 @@ static int gl_load(void)
 #define GL_MAX_QUERIES 4096
 #define GL_RING_SIZE   (32u << 20)
 #define GL_MAX_FRAG    1024         /* specialised fragment programs */
+#ifndef GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+#define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
+#define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT 0x83F2
+#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
+#endif
 #define GL_MAX_GT      512          /* GPU time stamps in a frame */
 #define GL_MAX_GT_STATS 48
 
@@ -390,9 +399,11 @@ static struct {
      * write) and the specialised ones; one program pipeline holds a draw's
      * two stages. */
     GLuint pipe, fs_gen[2];
+    int bc_ok;                      /* DXT textures uploaded as they are */
     GFrag frag[GL_MAX_FRAG];
     int spec_left;                  /* specialised compiles left this frame */
     uint32_t pf_spec, pf_spec_gen;  /* compiled; draws on the general shader */
+    uint32_t pf_fragz[4];           /* draws writing gl_FragDepth: poff, zint, other; all */
     uint64_t pf_spec_us;
     struct { uint64_t key; GLuint s; } samp[GL_MAX_SAMP];
     int nsamp;
@@ -753,6 +764,11 @@ static void perf_report(void)
         fprintf(stderr, "[PERF]   shaders: %u specialised built (%.1f ms), %.0f draws a frame"
                 " waiting on the general one\n", G.pf_spec, G.pf_spec_us / 1000.0,
                 G.pf_spec_gen / f);
+    if (G.pf_fragz[3])
+        fprintf(stderr, "[PERF]   of %.0f draws a frame, writing their depth: %.0f polygon offset,"
+                " %.0f z-buffer rounding, %.0f other\n", G.pf_fragz[3] / f, G.pf_fragz[0] / f,
+                G.pf_fragz[1] / f, G.pf_fragz[2] / f);
+    memset(G.pf_fragz, 0, sizeof G.pf_fragz);
     G.pf_spec = G.pf_spec_gen = 0;
     G.pf_spec_us = 0;
     if (s_exp_cycle || s_exp > 0)
@@ -971,6 +987,9 @@ static GLuint spec_build(const GSpec *v)
 static GLuint frag_get(const Nv2aVkState *st, const Nv2aVkUbo *ub)
 {
     int fast = !needs_fragdepth(st);
+    G.pf_fragz[3]++;
+    if (!fast)
+        G.pf_fragz[st->poff_factor != 0.0f || st->poff_units != 0.0f ? 0 : st->zint ? 1 : 2]++;
     GSpec v;
     GFrag *e = NULL;
     uint64_t h;
@@ -1158,6 +1177,20 @@ static int gl_init(void)
     gt_init();
     G.clear_q = -1;
     G.epoch = 1;
+    {
+        /* DXT as S3TC (GL_EXT_texture_compression_s3tc): the GPU reads the
+         * blocks as the title stored them. RECOMP_GL_BC=0 decodes them on
+         * the CPU instead, as before. */
+        const char *e = getenv("RECOMP_GL_BC");
+        GLint n = 0;
+        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+        for (k = 0; k < n && !(e && strcmp(e, "0") == 0); k++)
+            if (!strcmp((const char *)glGetStringi(GL_EXTENSIONS, (GLuint)k),
+                        "GL_EXT_texture_compression_s3tc"))
+                G.bc_ok = 1;
+        fprintf(stderr, "[GL] DXT textures %s\n", G.bc_ok ? "uploaded compressed"
+                : "decoded on the CPU");
+    }
     G.fs_gen[0] = frag_general(0);
     G.fs_gen[1] = frag_general(1);
     if (!G.fs_gen[0] || !G.fs_gen[1] || !prog_get(0)->prog) {
@@ -2100,6 +2133,15 @@ static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
         }
     }
     h = tex_hash_full(&d, bytes);
+    {
+        static int trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_GL_UPLOAD_TRACE") != NULL;
+        if (trace && (G.frame % 20) == 0)
+            fprintf(stderr, "[GL] F%u upload texture %08X %ux%u fmt %02X%s levels %u (%s)\n",
+                    G.frame, d.offset, d.width, d.height, d.color, d.cube ? " cube" : "",
+                    d.levels, !e ? "evicting" : e->used ? "changed" : "new");
+    }
     if (!e) {
         /* Full: the least recently used in this neighbourhood. */
         uint32_t k;
@@ -2123,6 +2165,58 @@ static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
     }
 }
 
+/* A DXT texture as it is: each face's levels follow one another in guest
+ * RAM, faces a stride apart (nv2a_pb_tex_bytes / 6), from min_level on.
+ * Decoding a streamed 512x1024 track texture on the Switch's CPU took tens
+ * of milliseconds, and the decoded copy is 4-8 times the bytes for the GPU
+ * to read. */
+static GLuint tex_upload_bc(const Nv2aVkTex *d, uint32_t bytes, GTex *e, uint64_t h,
+                            uint32_t *levels_out)
+{
+    uint32_t faces = d->cube ? 6 : 1, bb = d3d8_format_dxt_block_bytes(d->color);
+    uint32_t fstride = bytes / faces, skip = 0, levels, l, f, w0, h0;
+    GLenum ifmt = d->color == 0x0C ? GL_COMPRESSED_RGBA_S3TC_DXT1_EXT
+                : d->color == 0x0E ? GL_COMPRESSED_RGBA_S3TC_DXT3_EXT
+                                   : GL_COMPRESSED_RGBA_S3TC_DXT5_EXT;
+    GLenum target = d->cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
+    const uint8_t *src = guest(d->offset);
+
+    levels = d->levels > d->min_level ? d->levels - d->min_level : 1;
+    if (levels > 13)
+        levels = 13;
+    for (l = 0; l < d->min_level; l++) {
+        uint32_t lw = d->width >> l ? d->width >> l : 1, lh = d->height >> l ? d->height >> l : 1;
+        skip += ((lw + 3) / 4) * ((lh + 3) / 4) * bb;
+    }
+    w0 = d->width >> d->min_level ? d->width >> d->min_level : 1;
+    h0 = d->height >> d->min_level ? d->height >> d->min_level : 1;
+    step("texture bc", d->offset, d->color | w0 << 16);
+    if (e->used && e->tex)
+        glDeleteTextures(1, &e->tex);
+    glGenTextures(1, &e->tex);
+    bind_other(target, e->tex);
+    glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, (GLint)levels - 1);
+    for (f = 0; f < faces; f++) {
+        const uint8_t *fs = src + (size_t)f * fstride + skip;
+        for (l = 0; l < levels; l++) {
+            uint32_t lw = w0 >> l ? w0 >> l : 1, lh = h0 >> l ? h0 >> l : 1;
+            uint32_t n = ((lw + 3) / 4) * ((lh + 3) / 4) * bb;
+            glCompressedTexImage2D(d->cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f : GL_TEXTURE_2D,
+                                   (GLint)l, ifmt, (GLsizei)lw, (GLsizei)lh, 0, (GLsizei)n, fs);
+            fs += n;
+        }
+    }
+    e->used = 1;
+    e->d = *d;
+    e->hash = h;
+    e->shash = tex_hash_part(d, bytes);
+    e->hash_ep = e->full_ep = G.epoch;
+    e->levels = levels;
+    e->last_use = G.frame;
+    *levels_out = levels;
+    return e->tex;
+}
+
 /* Decode d into entry e and upload it. */
 static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, GTex *e, uint64_t h,
                          uint32_t *levels_out)
@@ -2130,6 +2224,8 @@ static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, GTex *e, uint64_t 
     Nv2aVkTex d = *dp;
     uint32_t faces, levels, lv, f, w0, h0, *buf;
     faces = d.cube ? 6 : 1;
+    if (G.bc_ok && d.size_from_format && d3d8_format_dxt_block_bytes(d.color))
+        return tex_upload_bc(&d, bytes, e, h, levels_out);
     levels = d.size_from_format && d.levels > d.min_level ? d.levels - d.min_level : 1;
     if (levels > 13)
         levels = 13;
