@@ -1028,6 +1028,15 @@ static int ack_idle_on(void)
     return on;
 }
 
+/* DMA_GET from the executor as it goes (nv2a_pb_scan.c): the physical
+ * address of the next word it will read, as the GPU reports it. */
+void xbox_Nv2aProgressGet(uint32_t va)
+{
+    if (g_nv2a_memory)
+        __atomic_store_n((volatile uint32_t *)((char *)g_nv2a_memory + NV2A_USER_DMA_GET),
+                         va & 0x0FFFFFFFu, __ATOMIC_RELEASE);
+}
+
 /* PGRAPH PATT_COLOR0 from the executor (nv2a_pb_exec.c, method 0x0310 of
  * the pattern object): D3D's GPU progress counter. */
 void xbox_Nv2aPatternColor0(uint32_t v)

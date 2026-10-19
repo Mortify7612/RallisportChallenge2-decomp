@@ -2700,6 +2700,19 @@ static XboxTimer g_timers[XBOX_MAX_TIMERS];
 static CRITICAL_SECTION g_timer_lock;
 static int g_timer_started;
 
+/* RECOMP_NV2A_IRQ_WAKE=1 (a Switch default): a GPU notify the executor
+ * raised (nv2a_irq.c) wakes the timer thread to deliver it at once, instead
+ * of at the next 2 ms tick -- 8 a race frame, each holding the executor up.
+ * It first froze RSC2 on the Switch; the cause was the notify going on
+ * before D3D's handler had read its parameter (xbox_Nv2aIrqNotify). */
+static HANDLE s_timer_wake;
+
+void xbox_KernelTimerWake(void)
+{
+    if (s_timer_wake)
+        SetEvent(s_timer_wake);
+}
+
 static DWORD WINAPI kernel_timer_thread(LPVOID unused)
 {
     int slot = xbox_worker_stack_alloc();
@@ -2727,13 +2740,22 @@ static DWORD WINAPI kernel_timer_thread(LPVOID unused)
         g_fs_base = tib;
     }
 
+    {
+        const char *e = getenv("RECOMP_NV2A_IRQ_WAKE");
+        if (e && strcmp(e, "0") != 0)
+            s_timer_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    }
     for (;;) {
         long long now;
         int i;
 
         /* 2 ms when the PTIMER alarm is modelled: D3D's synthesised vblank
          * is a 16.68 ms alarm, and a 10 ms tick fires it up to 10 ms late. */
-        Sleep(xbox_Nv2aIrqEnabled() ? 2 : 10);
+        if (s_timer_wake && xbox_Nv2aIrqEnabled()) {
+            WaitForSingleObject(s_timer_wake, 2);
+        } else {
+            Sleep(xbox_Nv2aIrqEnabled() ? 2 : 10);
+        }
         kernel_vblank_tick();  /* the GPU's frame clock */
         kernel_drain_dpcs();   /* deferred work, before due timers */
         now = (long long)GetTickCount64();

@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "kernel.h"
 #include "xbox_memory_layout.h"
@@ -80,6 +81,7 @@
 #define PGRAPH_INTR_EN   0x400140u
 #define PGRAPH_TRAPPED_ADDR 0x400704u
 #define PGRAPH_TRAPPED_DATA 0x400708u
+#define PGRAPH_FIFO      0x400720u     /* bit 0: PGRAPH may take methods */
 
 /* The NV2A's core clock, which PTIMER counts in before the numerator and
  * denominator scale it -- xemu's default for the retail PLL setting. */
@@ -90,6 +92,11 @@ static int s_pfb;                       /* PFB page trapped too */
 static uint8_t s_store[5][PAGE];        /* backing for everything else */
 static volatile uint32_t s_pcrtc_intr, s_ptimer_intr, s_pgraph_intr;
 static volatile uint32_t s_alarm, s_alarm_armed;
+static volatile uint32_t s_fifo_off;    /* the ISR's DPC turned PGRAPH_FIFO off */
+/* The parameter as it was when the ISR cleared the
+ * notify, and how often the ISR then read another. */
+static volatile uint32_t s_ack_data, s_ack_armed, s_ack_changed;
+static int s_ack_delay_us = -1;         /* RECOMP_NV2A_ACK_DELAY_US: test only */
 static struct timespec s_t0;
 
 static int page_index(uint32_t off)
@@ -179,6 +186,15 @@ static uint64_t reg_read_model(void *dev, uint32_t off, int size)
     case PTIMER_INTR_0:  v = s_ptimer_intr; break;
     case PTIMER_TIME_0:  v = ptimer_time0(); break;
     case PGRAPH_INTR:    v = s_pgraph_intr; break;
+    case PGRAPH_TRAPPED_DATA:
+        v = store_rd(off);
+        if (__atomic_exchange_n(&s_ack_armed, 0, __ATOMIC_SEQ_CST) && v != s_ack_data) {
+            uint32_t n = __atomic_add_fetch(&s_ack_changed, 1, __ATOMIC_SEQ_CST);
+            if (n <= 5)
+                fprintf(stderr, "[NOTIFY] parameter %08X cleared, %08X read: overwritten (%u)\n",
+                        s_ack_data, v, n);
+        }
+        break;
     case PTIMER_TIME_1:  v = (uint32_t)((ptimer_clock() >> 27) & 0x1FFFFFFFull); break;
     default:             v = store_rd(off); break;
     }
@@ -222,7 +238,19 @@ static void reg_write(void *dev, uint32_t off, uint64_t val, int size)
     case PMC_INTR_0:     break;                              /* read-only */
     case PCRTC_INTR_0:   __atomic_and_fetch(&s_pcrtc_intr, ~v, __ATOMIC_SEQ_CST); break;
     case PTIMER_INTR_0:  __atomic_and_fetch(&s_ptimer_intr, ~v, __ATOMIC_SEQ_CST); break;
-    case PGRAPH_INTR:    __atomic_and_fetch(&s_pgraph_intr, ~v, __ATOMIC_SEQ_CST); break;
+    case PGRAPH_INTR:
+        if (v & PGRAPH_INTR_ERROR) {
+            s_ack_data = store_rd(PGRAPH_TRAPPED_DATA);
+            __atomic_store_n(&s_ack_armed, 1, __ATOMIC_SEQ_CST);
+        }
+        __atomic_and_fetch(&s_pgraph_intr, ~v, __ATOMIC_SEQ_CST);
+        if (s_ack_delay_us < 0) {
+            const char *e = getenv("RECOMP_NV2A_ACK_DELAY_US");
+            s_ack_delay_us = e ? atoi(e) : 0;
+        }
+        if (s_ack_delay_us && (v & PGRAPH_INTR_ERROR))
+            usleep((useconds_t)s_ack_delay_us);   /* widen the clear-to-read window */
+        break;
     case PFB_WBC:
         /* The flush is done the moment it is asked for. D3D's kick sets the
          * bit and spins until it clears; when the ack thread cleared it, the
@@ -239,6 +267,13 @@ static void reg_write(void *dev, uint32_t off, uint64_t val, int size)
          * raises (xbox_Nv2aIrqNotify); it also polls PGRAPH PATT_COLOR0,
          * its progress counter, which the executor writes. Without those
          * it hung on the first race load. */
+    case PGRAPH_FIFO:
+        /* D3D's PGRAPH handler (0x0036C070) turns method fetch off while it
+         * works and back on when done; the executor's notify waits for it
+         * (xbox_Nv2aIrqNotify). */
+        store_wr(off, v);
+        __atomic_store_n(&s_fifo_off, !(v & 1u), __ATOMIC_SEQ_CST);
+        break;
     case PTIMER_ALARM_0:
         store_wr(off, v);
         s_alarm = v;
@@ -249,6 +284,10 @@ static void reg_write(void *dev, uint32_t off, uint64_t val, int size)
 }
 
 int xbox_Nv2aIrqEnabled(void) { return __atomic_load_n(&s_enabled, __ATOMIC_SEQ_CST); }
+
+/* The PFB flush done at once (RECOMP_NV2A_PFB_ASYNC): the title can be
+ * ahead of the executor. */
+int xbox_Nv2aIrqAsync(void) { return s_enabled && s_pfb; }
 
 int xbox_Nv2aIrqOwns(uint32_t va)
 {
@@ -310,28 +349,67 @@ void xbox_Nv2aIrqNotifyStats(uint32_t *n, uint64_t *ns)
     s_notify_ns = 0;
 }
 
+/* Half a second without the ISR: say so (a few times) and go on. */
+static int notify_late(const struct timespec *t0, uint32_t param)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if ((now.tv_sec - t0->tv_sec) * 1000 + (now.tv_nsec - t0->tv_nsec) / 1000000 <= 500)
+        return 0;
+    {
+        static int shown;
+        if (shown++ < 5)
+            fprintf(stderr, "  [NV2A-IRQ] notify %08X not acknowledged in 500 ms\n", param);
+    }
+    return 1;
+}
+
 int xbox_Nv2aIrqNotify(uint32_t subch, uint32_t method, uint32_t param)
 {
     struct timespec t0, now;
     if (!s_enabled || !s_pfb)
         return 0;
+    static int trace = -1;
+    if (trace < 0)
+        trace = getenv("RECOMP_NOTIFY_TRACE") != NULL;
+    if (trace) {
+        /* RECOMP_NOTIFY_TRACE: the first notifies' parameters. RSC2 raises
+         * 0x09, 0x28 and 0x....0021 every frame; 5 only when D3D waits for
+         * push-buffer room (0x368002). */
+        static unsigned long n;
+        if (n++ < 40)
+            fprintf(stderr, "[NOTIFY] #%lu subch %u method %04X param %08X\n", n, subch, method, param);
+    }
+    static int gate = -1;
+    if (gate < 0) {
+        const char *e = getenv("RECOMP_NV2A_NOTIFY_FIFO");
+        gate = !e || strcmp(e, "0") != 0;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    /* A handler still at work (FIFO access off) has yet to read the trap
+     * registers this would overwrite. */
+    while (gate && __atomic_load_n(&s_fifo_off, __ATOMIC_SEQ_CST) && !notify_late(&t0, param))
+        Sleep(0);
     store_wr(PGRAPH_TRAPPED_ADDR, (method & 0x1FFFu) | ((subch & 7u) << 16));
     store_wr(PGRAPH_TRAPPED_DATA, param);
     store_wr(PGRAPH_NSOURCE, 1u);
     __atomic_or_fetch(&s_pgraph_intr, PGRAPH_INTR_ERROR, __ATOMIC_SEQ_CST);
-    /* Delivered at the timer thread's next tick (up to 2 ms; about 4.6 ms
-     * of a race frame's executor in Eden). Waking it at once froze RSC2 on
-     * the Switch within a minute: the ISR then runs in parallel with D3D's
-     * own patch-flush-wait sequence (0x368002-0x36809B) and its wake-up is
-     * lost. Prompt delivery needs the ISR kept out of the guest's code the
-     * way one CPU would (IRQL), not just sooner. */
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-    while (__atomic_load_n(&s_pgraph_intr, __ATOMIC_SEQ_CST) & PGRAPH_INTR_ERROR) {
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if ((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000 > 500) {
-            static int shown;
-            if (shown++ < 5)
-                fprintf(stderr, "  [NV2A-IRQ] notify %08X not acknowledged in 500 ms\n", param);
+    {
+        extern void xbox_KernelTimerWake(void);
+        xbox_KernelTimerWake();         /* with RECOMP_NV2A_IRQ_WAKE only */
+    }
+    /* The GPU goes on once the interrupt is cleared and PGRAPH's FIFO
+     * access is back on. D3D's handler (0x0036C070) turns access off,
+     * clears the interrupt and only then reads TRAPPED_DATA (the notify's
+     * parameter) and acts on it. Going on at the clear alone, the next
+     * notify could overwrite the parameter first: a 5 ("push-buffer room",
+     * which sets the event D3D waits on at 0x0036809B) was handled as
+     * another, and the game froze. That took a prompt ISR (the Switch with
+     * RECOMP_NV2A_IRQ_WAKE) to hit within a minute. RECOMP_NV2A_NOTIFY_FIFO=0
+     * waits for the clear only, as before. */
+    while ((__atomic_load_n(&s_pgraph_intr, __ATOMIC_SEQ_CST) & PGRAPH_INTR_ERROR)
+            || (gate && __atomic_load_n(&s_fifo_off, __ATOMIC_SEQ_CST))) {
+        if (notify_late(&t0, param)) {
             __atomic_and_fetch(&s_pgraph_intr, ~PGRAPH_INTR_ERROR, __ATOMIC_SEQ_CST);
             break;
         }

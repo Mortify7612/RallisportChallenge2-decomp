@@ -1074,6 +1074,9 @@ static void switch_setup(int argc, char **argv)
      * executor draws this one: the race 28 -> 38 fps in Eden. =0 in
      * rsc2.env: the game waits for the executor at every kick, as before. */
     setenv("RECOMP_NV2A_PFB_ASYNC", "1", 0);
+    /* Its notifies delivered at once rather than at the next 2 ms tick: the
+     * executor waited about 4.6 ms a race frame for them (kernel_bridge.c). */
+    setenv("RECOMP_NV2A_IRQ_WAKE", "1", 0);
 }
 #endif
 
