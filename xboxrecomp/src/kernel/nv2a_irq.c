@@ -298,6 +298,18 @@ int xbox_Nv2aIrqPoke(uint32_t off, uint32_t v)
  * and the GPU waits until the ISR clears it (xemu's pgraph.c). Here the
  * executor waits, up to half a second. 0 when PGRAPH is not modelled
  * (RECOMP_NV2A_PFB_ASYNC). */
+static uint64_t s_notify_ns;
+static uint32_t s_notify_n;
+
+/* RECOMP_PERF: notifies since the last call, and the executor's wait. */
+void xbox_Nv2aIrqNotifyStats(uint32_t *n, uint64_t *ns)
+{
+    *n = s_notify_n;
+    *ns = s_notify_ns;
+    s_notify_n = 0;
+    s_notify_ns = 0;
+}
+
 int xbox_Nv2aIrqNotify(uint32_t subch, uint32_t method, uint32_t param)
 {
     struct timespec t0, now;
@@ -307,6 +319,12 @@ int xbox_Nv2aIrqNotify(uint32_t subch, uint32_t method, uint32_t param)
     store_wr(PGRAPH_TRAPPED_DATA, param);
     store_wr(PGRAPH_NSOURCE, 1u);
     __atomic_or_fetch(&s_pgraph_intr, PGRAPH_INTR_ERROR, __ATOMIC_SEQ_CST);
+    /* Delivered at the timer thread's next tick (up to 2 ms; about 4.6 ms
+     * of a race frame's executor in Eden). Waking it at once froze RSC2 on
+     * the Switch within a minute: the ISR then runs in parallel with D3D's
+     * own patch-flush-wait sequence (0x368002-0x36809B) and its wake-up is
+     * lost. Prompt delivery needs the ISR kept out of the guest's code the
+     * way one CPU would (IRQL), not just sooner. */
     clock_gettime(CLOCK_MONOTONIC, &t0);
     while (__atomic_load_n(&s_pgraph_intr, __ATOMIC_SEQ_CST) & PGRAPH_INTR_ERROR) {
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -319,6 +337,10 @@ int xbox_Nv2aIrqNotify(uint32_t subch, uint32_t method, uint32_t param)
         }
         Sleep(0);
     }
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    s_notify_n++;
+    s_notify_ns += (uint64_t)(now.tv_sec - t0.tv_sec) * 1000000000u
+                 + (uint64_t)(now.tv_nsec - t0.tv_nsec);
     return 1;
 }
 

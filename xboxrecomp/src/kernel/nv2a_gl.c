@@ -1051,6 +1051,15 @@ static void perf_report(void)
         G.pf_glcall_us = 0;
         memset(G.pf_su, 0, sizeof G.pf_su);
     }
+    {
+        extern void xbox_Nv2aIrqNotifyStats(uint32_t *n, uint64_t *ns);
+        uint32_t nn;
+        uint64_t nns;
+        xbox_Nv2aIrqNotifyStats(&nn, &nns);
+        if (nn)
+            fprintf(stderr, "[PERF]   GPU notifies: %.1f a frame, the executor waiting %.1f ms for"
+                    " the ISR\n", nn / f, nns / f / 1e6);
+    }
     if (Q.on) {
         int k;
         fprintf(stderr, "[PERF]   GL thread: %.1f calls a frame waited for, %.1f ms:",
