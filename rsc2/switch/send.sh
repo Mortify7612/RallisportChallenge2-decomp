@@ -37,6 +37,17 @@ case "$1" in *=*|'') ;; *) addr=$1; shift ;; esac
 # can be started before pressing Y. Don't probe its port by hand: hbmenu
 # leaves the netloader after any connection, upload or not.
 end=$(( $(date +%s) + ${WAIT:-300} ))
+# The last session's connection on 28771 lingers in TIME_WAIT for about a
+# minute after it closes, and nxlink's server cannot bind until it is gone:
+# the upload succeeded, then "bind listen socket: Address already in use",
+# and the game's output went nowhere. Wait it out first (28771 = 0x7063).
+i=0
+while awk 'NR > 1 && $2 ~ /:7063$/ { f = 1 } END { exit !f }' /proc/net/tcp /proc/net/tcp6 2>/dev/null; do
+    [ $i -eq 0 ] && echo "send.sh: waiting for the last session's port 28771 to close"
+    i=$((i + 1))
+    [ $i -lt 120 ] || break
+    sleep 1
+done
 while :; do
     # Line-buffered, so the log keeps what came before a crash of nxlink.
     stdbuf -oL "$DEVKITPRO/tools/bin/nxlink" -s ${addr:+-a "$addr"} -p rsc2/rsc2.nro \
