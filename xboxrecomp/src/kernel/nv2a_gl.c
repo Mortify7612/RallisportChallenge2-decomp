@@ -429,10 +429,13 @@ static struct {
     uint64_t pf_su[3];              /* ...and before them: textures, target, uniforms */
     GSampC samp_cache[64];          /* sampler(), by key */
     /* tex_get's memo: a draw with a texture another draw used this epoch
-     * gets the same answer, while no surface has become dirty or clean
-     * (dirty_gen) and no texture has been replaced (tex_gen). */
+     * gets the same answer, while no surface has been made (dirty_gen), no
+     * surface over its bytes has become dirty or clean (memo_drop) and its
+     * GL texture has not been deleted (memo_forget). */
     uint32_t dirty_gen, tex_gen;
-    struct { Nv2aVkTex d; uint32_t epoch, dgen, tgen, levels; GLuint tex; } tmemo[32];
+    uint32_t pf_tlook, pf_tmemo, pf_thash;   /* RECOMP_PERF: lookups, memo answers, hashes */
+    uint64_t pf_thash_bytes;
+    struct { Nv2aVkTex d; uint32_t epoch, dgen, tgen, levels, bytes; GLuint tex; } tmemo[512];
     /* What draw_common last bound, so unchanged binds are skipped; any other
      * glBindTexture (bind_other) forgets it. */
     GLuint b_tex[8], b_samp[4], b_vs, b_fs;
@@ -672,6 +675,27 @@ static void glq_start(void)
     } else {
         SDL_GL_MakeCurrent(G.win, G.ctx);   /* as before: this thread makes them */
     }
+}
+
+/* Surface s became dirty or clean: tex_get's memo forgets the textures over
+ * its bytes (they may now be the surface's to copy back, or no longer). */
+static size_t surf_bytes(const GSurf *s);
+/* GL texture t is being deleted: memo entries naming it go. */
+static void memo_forget(GLuint t)
+{
+    uint32_t k;
+    for (k = 0; k < 512; k++)
+        if (G.tmemo[k].tex == t)
+            G.tmemo[k].tex = 0;
+}
+
+static void memo_drop(const GSurf *s)
+{
+    uint32_t va = s->va, n = (uint32_t)surf_bytes(s), k;
+    for (k = 0; k < 512; k++)
+        if (G.tmemo[k].tex && va < G.tmemo[k].d.offset + G.tmemo[k].bytes
+                && G.tmemo[k].d.offset < va + n)
+            G.tmemo[k].tex = 0;
 }
 
 /* RECOMP_GL_STEPS=<n>: log the first n first-time operations as they start
@@ -1038,6 +1062,12 @@ static void perf_report(void)
     }
     Q.pf_syncs = 0;
     Q.pf_sync_ns = 0;
+    if (G.pf_tlook)
+        fprintf(stderr, "[PERF]   textures per frame: %.0f looked up, %.0f answered by the memo,"
+                " %.0f checked, %.0f KB hashed\n", G.pf_tlook / f, G.pf_tmemo / f,
+                G.pf_thash / f, G.pf_thash_bytes / f / 1024.0);
+    G.pf_tlook = G.pf_tmemo = G.pf_thash = 0;
+    G.pf_thash_bytes = 0;
     if (G.pf_draws)
         fprintf(stderr, "[PERF]   per frame: %.0f draws with the uniforms of the draw before,"
                 " %.0f vertex constant uploads, %.0f could join the draw before, %.0f with"
@@ -2298,7 +2328,7 @@ static void surf_land(GSurf *s, uint8_t *lin, uint32_t rows, int clean)
                    (size_t)s->w * s->bpp);
     if (clean) {
         s->dirty = 0;
-        G.dirty_gen++;
+        memo_drop(s);
         /* What is in guest RAM now is what the texture holds. */
         s->up_epoch = G.epoch;
         surf_ref(s);
@@ -2333,7 +2363,7 @@ static void surf_writeback(GSurf *s)
      * win, as they would on the console. */
     if (s->dref_valid && hash_sparse(guest(s->va), surf_bytes(s)) != s->dref) {
         s->dirty = 0;
-        G.dirty_gen++;
+        memo_drop(s);
         s->clear_only = 0;
         s->ref_valid = 0;
         s->dref_valid = 0;
@@ -2404,7 +2434,7 @@ static void alias_resolve(GSurf *cs)
             G.cur_zs = NULL;
             cs->dirty = 1;
             cs->gen++;
-            G.dirty_gen++;
+            memo_drop(cs);
             cs->pending_up = 0;
             cs->clear_only = 1;
             cs->clear_argb = c;
@@ -2412,7 +2442,7 @@ static void alias_resolve(GSurf *cs)
                 cs->rows = q->rows;
             q->dirty = 0;
             q->clear_only = 0;
-            G.dirty_gen++;
+            memo_drop(q);
             q->ref_valid = 0;           /* guest RAM gets cs's bytes, not q's */
             continue;
         }
@@ -2650,7 +2680,7 @@ static void mark_drawn(const Nv2aVkState *st)
             G.cur_cs->dref_valid = 1;
         }
         if (!G.cur_cs->dirty)
-            G.dirty_gen++;
+            memo_drop(G.cur_cs);
         G.cur_cs->dirty = 1;
         G.cur_cs->gen++;
         if (rows > G.cur_cs->h)
@@ -2793,11 +2823,14 @@ static int tex_unchanged(GTex *c, uint32_t bytes)
         c->hash_ep = G.epoch;           /* settled: looked at again in a few epochs */
         return 1;
     }
+    G.pf_thash++;
     if (tex_hash_sparse() && bytes >= GL_TEX_SPARSE_MIN && G.epoch - c->full_ep < GL_TEX_FULL_EPOCHS
             && (G.epoch + (uint32_t)(c - G.tex)) % GL_TEX_FULL_EPOCHS != 0) {
+        G.pf_thash_bytes += bytes / 16;
         if (tex_hash_part(&c->d, bytes) != c->shash)
             return 0;
     } else {
+        G.pf_thash_bytes += bytes;
         if (tex_hash_full(&c->d, bytes) != c->hash)
             return 0;
         c->full_ep = G.epoch;
@@ -2978,9 +3011,16 @@ static GLuint rt_tex(const Nv2aVkTex *d, uint32_t bytes, uint32_t *levels_out)
     return e->tex;
 }
 
-static void tex_memo(const Nv2aVkTex *d, GLuint tex, uint32_t levels)
+static uint32_t tmemo_slot(const Nv2aVkTex *d)
 {
-    uint32_t k = (d->offset >> 6 ^ d->offset >> 14 ^ d->color) & 31u;
+    return ((d->offset * 0x9E3779B1u) ^ (d->color * 0x85EBCA6Bu) ^ (d->width << 3)
+            ^ d->height) >> 23;
+}
+
+static void tex_memo(const Nv2aVkTex *d, GLuint tex, uint32_t levels, uint32_t bytes)
+{
+    uint32_t k = tmemo_slot(d);
+    G.tmemo[k].bytes = bytes;
     G.tmemo[k].d = *d;
     G.tmemo[k].epoch = G.epoch;
     G.tmemo[k].dgen = G.dirty_gen;
@@ -2999,16 +3039,27 @@ static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
 
     d.filter = d.addr_u = d.addr_v = d.addr_p = 0;
     d.max_lod = 0;
+    /* Registers a format does not read hold whatever an earlier draw left:
+     * RSC2's DXT textures came with two or three pitches and palettes, and
+     * each was a texture of its own -- cached, checked and uploaded again,
+     * and a miss in the memo below. The palette is P8's only; swizzled and
+     * DXT textures have no pitch. */
+    if (d.color != 0x0B)
+        d.palette = 0;
+    if (d.size_from_format)
+        d.pitch = 0;
     G.st_tex++;
     if (!d.valid || !d.width || !d.height || d.width > 4096 || d.height > 4096) {
         G.st_texfail++;
         return 0;
     }
+    G.pf_tlook++;
     {
-        uint32_t k = (d.offset >> 6 ^ d.offset >> 14 ^ d.color) & 31u;
+        uint32_t k = tmemo_slot(&d);
         if (G.tmemo[k].tex && G.tmemo[k].epoch == G.epoch && G.tmemo[k].dgen == G.dirty_gen
-                && G.tmemo[k].tgen == G.tex_gen && memcmp(&G.tmemo[k].d, &d, sizeof d) == 0) {
+                && memcmp(&G.tmemo[k].d, &d, sizeof d) == 0) {
             *levels_out = G.tmemo[k].levels;
+            G.pf_tmemo++;
             return G.tmemo[k].tex;
         }
     }
@@ -3047,7 +3098,7 @@ static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
             if (tex_unchanged(c, bytes)) {
                 c->last_use = G.frame;
                 *levels_out = c->levels;
-                tex_memo(&d, c->tex, c->levels);
+                tex_memo(&d, c->tex, c->levels, bytes);
                 return c->tex;
             }
             e = c;
@@ -3080,7 +3131,7 @@ static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
         GLuint r = tex_upload(&d, bytes, e, h, levels_out);
         gt_pop(prev);
         if (r)
-            tex_memo(&d, r, *levels_out);
+            tex_memo(&d, r, *levels_out, bytes);
         if (t0)
             G.pf_tex_us += now_us() - t0;
         G.pf_tex_up++;
@@ -3128,7 +3179,8 @@ static GLuint tex_upload_bc(const Nv2aVkTex *d, uint32_t bytes, GTex *e, uint64_
     w0 = d->width >> d->min_level ? d->width >> d->min_level : 1;
     h0 = d->height >> d->min_level ? d->height >> d->min_level : 1;
     step("texture bc", d->offset, d->color | w0 << 16);
-    G.tex_gen++;
+    if (e->used && e->tex)
+        memo_forget(e->tex);
     if (e->used && e->tex)
         glDeleteTextures(1, &e->tex);
     glGenTextures(1, &e->tex);
@@ -3178,7 +3230,8 @@ static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, GTex *e, uint64_t 
          * intro movies are a 640x320 one rewritten every frame, about 10 ms
          * a frame decoded on the Switch. */
         step("texture linear", d.offset, d.color | w0 << 16);
-        G.tex_gen++;
+        if (e->used && e->tex)
+            memo_forget(e->tex);
         if (e->used && e->tex)
             glDeleteTextures(1, &e->tex);
         glGenTextures(1, &e->tex);
@@ -3202,7 +3255,8 @@ static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, GTex *e, uint64_t 
     if (!buf)
         return 0;
     step("texture", d.offset, d.color | w0 << 16);
-    G.tex_gen++;
+    if (e->used && e->tex)
+        memo_forget(e->tex);
     if (e->used && e->tex)
         glDeleteTextures(1, &e->tex);
     glGenTextures(1, &e->tex);
@@ -3933,7 +3987,7 @@ static void drop_inflight(const Nv2aVkState *st)
         q->dirty = 0;
         q->clear_only = 0;
         q->ref_valid = 0;
-        G.dirty_gen++;
+        memo_drop(q);
     }
 }
 
