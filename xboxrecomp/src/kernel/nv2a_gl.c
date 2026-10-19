@@ -508,11 +508,16 @@ static struct {
 #define GLQ_SIZE (4u << 20)
 #define GLQ_COPY_MAX (1u << 20)        /* data a queued call may carry (a DXT texture level) */
 typedef struct { void (*run)(const void *); uint32_t size, pad; } GlqHead;
+/* head (the executor's), tail (the GL thread's) and sleeping each on a
+ * cache line of their own: sharing one, every queued call fought the GL
+ * thread for it (glq_commit was 3% of the Switch executor's race). */
 static struct {
     volatile int on;
     uint8_t *buf;
-    volatile size_t head, tail;     /* bytes written / read, ever */
-    volatile int sleeping;          /* the GL thread waits on `work` */
+    _Alignas(64) volatile size_t head;  /* bytes written, ever */
+    _Alignas(64) volatile size_t tail;  /* bytes read, ever */
+    _Alignas(64) volatile int sleeping; /* the GL thread waits on `work` */
+    _Alignas(64) int pad_;
     HANDLE work, done;
     void (*sync_fn)(void *);
     void *volatile sync_arg;
@@ -904,6 +909,8 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n)
                  e = 0xC2B2AE3D27D4EB4Full;
         for (; i + 32 <= n; i += 32) {
             uint64_t v[4];
+            if (n >= 1024)                     /* the long full checks: stay ahead */
+                __builtin_prefetch(p + i + 512);
             memcpy(v, p + i, 32);
             a = (a ^ v[0]) * 0x100000001b3ull; a ^= a >> 29;
             b = (b ^ v[1]) * 0x100000001b3ull; b ^= b >> 29;
@@ -929,8 +936,17 @@ static uint64_t hash_sparse(const uint8_t *p, size_t n)
 {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
     size_t off;
-    for (off = 0; off + 64 <= n; off += 1024)
+    /* Each block is a cache miss in guest RAM, and waited on in turn they
+     * were most of the Switch's texture checks: ask for the ones 8 ahead. */
+    for (off = 0; off + 64 <= n && off < 8 * 1024; off += 1024)
+        __builtin_prefetch(p + off), __builtin_prefetch(p + off + 63);
+    for (off = 0; off + 64 <= n; off += 1024) {
+        if (off + 8 * 1024 + 64 <= n) {
+            __builtin_prefetch(p + off + 8 * 1024);
+            __builtin_prefetch(p + off + 8 * 1024 + 63);
+        }
         h = h * 31 + hash_bytes(p + off, 64);
+    }
     return n >= 64 ? h * 31 + hash_bytes(p + n - 64, 64) : h;
 }
 

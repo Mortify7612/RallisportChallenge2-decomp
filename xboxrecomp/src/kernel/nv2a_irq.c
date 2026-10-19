@@ -127,6 +127,51 @@ static void store_wr(uint32_t off, uint32_t v)
     memcpy(&s_store[p][off & (PAGE - 1) & ~3u], &v, 4);
 }
 
+/* Notifies queued for the ISR (RECOMP_NV2A_NOTIFY_ASYNC, on by default):
+ * the executor records one and goes on, and the next is put in the trap
+ * registers once D3D's handler has finished the one before -- when it
+ * turns FIFO access back on with the interrupt cleared. One at a time,
+ * each with its own parameter, which is all the handler needs; the
+ * executor stopping until each was handled (as the GPU does) was about 5%
+ * of its time in a Switch race, waiting on another core. */
+#define NQ 64
+static struct { uint32_t addr, data; } s_nq[NQ];
+static unsigned s_nq_head, s_nq_tail;   /* pushed / presented, ever */
+static int s_presented;                 /* one is in the trap registers */
+static volatile int s_nq_lock;
+
+static void nq_lock(void)
+{
+    while (__atomic_test_and_set(&s_nq_lock, __ATOMIC_ACQUIRE))
+        Sleep(0);
+}
+
+static void nq_unlock(void)
+{
+    __atomic_clear(&s_nq_lock, __ATOMIC_RELEASE);
+}
+
+/* Under nq_lock: the next queued notify into the trap registers, if the
+ * last is done with. */
+static void nq_present(void)
+{
+    uint32_t i;
+    if (s_presented || s_nq_tail == s_nq_head || __atomic_load_n(&s_fifo_off, __ATOMIC_SEQ_CST)
+            || (__atomic_load_n(&s_pgraph_intr, __ATOMIC_SEQ_CST) & PGRAPH_INTR_ERROR))
+        return;
+    i = s_nq_tail++ % NQ;
+    store_wr(PGRAPH_TRAPPED_ADDR, s_nq[i].addr);
+    store_wr(PGRAPH_TRAPPED_DATA, s_nq[i].data);
+    store_wr(PGRAPH_NSOURCE, 1u);
+    s_presented = 1;
+    __atomic_or_fetch(&s_pgraph_intr, PGRAPH_INTR_ERROR, __ATOMIC_SEQ_CST);
+    {
+        extern void xbox_KernelTimerWake(void);
+        xbox_KernelTimerWake();
+    }
+}
+
+
 /* PTIMER's count: host time in core-clock ticks, scaled by the guest's
  * DENOMINATOR/NUMERATOR (xemu's ptimer_get_clock). */
 static uint64_t ptimer_clock(void)
@@ -273,6 +318,14 @@ static void reg_write(void *dev, uint32_t off, uint64_t val, int size)
          * (xbox_Nv2aIrqNotify). */
         store_wr(off, v);
         __atomic_store_n(&s_fifo_off, !(v & 1u), __ATOMIC_SEQ_CST);
+        if (v & 1u) {
+            nq_lock();
+            if (s_presented && !(__atomic_load_n(&s_pgraph_intr, __ATOMIC_SEQ_CST)
+                                 & PGRAPH_INTR_ERROR))
+                s_presented = 0;            /* handled: the next one */
+            nq_present();
+            nq_unlock();
+        }
         break;
     case PTIMER_ALARM_0:
         store_wr(off, v);
@@ -380,12 +433,39 @@ int xbox_Nv2aIrqNotify(uint32_t subch, uint32_t method, uint32_t param)
         if (n++ < 40)
             fprintf(stderr, "[NOTIFY] #%lu subch %u method %04X param %08X\n", n, subch, method, param);
     }
-    static int gate = -1;
+    static int gate = -1, async = -1;
     if (gate < 0) {
         const char *e = getenv("RECOMP_NV2A_NOTIFY_FIFO");
         gate = !e || strcmp(e, "0") != 0;
+        e = getenv("RECOMP_NV2A_NOTIFY_ASYNC");
+        async = gate && (!e || strcmp(e, "0") != 0);
     }
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    if (async) {
+        nq_lock();
+        while (s_nq_head - s_nq_tail >= NQ) {   /* full: the ISR is far behind */
+            nq_unlock();
+            if (notify_late(&t0, param)) {
+                nq_lock();
+                s_presented = 0;                /* given up on: the next */
+                __atomic_and_fetch(&s_pgraph_intr, ~PGRAPH_INTR_ERROR, __ATOMIC_SEQ_CST);
+                nq_present();
+                break;
+            }
+            Sleep(0);
+            nq_lock();
+        }
+        s_nq[s_nq_head % NQ].addr = (method & 0x1FFFu) | ((subch & 7u) << 16);
+        s_nq[s_nq_head % NQ].data = param;
+        s_nq_head++;
+        nq_present();
+        nq_unlock();
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        s_notify_n++;
+        s_notify_ns += (uint64_t)(now.tv_sec - t0.tv_sec) * 1000000000u
+                     + (uint64_t)(now.tv_nsec - t0.tv_nsec);
+        return 1;
+    }
     /* A handler still at work (FIFO access off) has yet to read the trap
      * registers this would overwrite. */
     while (gate && __atomic_load_n(&s_fifo_off, __ATOMIC_SEQ_CST) && !notify_late(&t0, param))
