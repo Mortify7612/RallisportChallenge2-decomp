@@ -104,6 +104,7 @@ extern uint32_t nv2a_pb_presented_frames(void);
     X(PFNGLBUFFERDATAPROC, glBufferData) \
     X(PFNGLBUFFERSUBDATAPROC, glBufferSubData) \
     X(PFNGLBINDBUFFERBASEPROC, glBindBufferBase) \
+    X(PFNGLBINDBUFFERRANGEPROC, glBindBufferRange) \
     X(PFNGLGENVERTEXARRAYSPROC, glGenVertexArrays) \
     X(PFNGLBINDVERTEXARRAYPROC, glBindVertexArray) \
     X(PFNGLENABLEVERTEXATTRIBARRAYPROC, glEnableVertexAttribArray) \
@@ -133,7 +134,11 @@ extern uint32_t nv2a_pb_presented_frames(void);
     X(PFNGLGETQUERYOBJECTUIVPROC, glGetQueryObjectuiv) \
     X(PFNGLMAPBUFFERRANGEPROC, glMapBufferRange) \
     X(PFNGLUNMAPBUFFERPROC, glUnmapBuffer) \
-    X(PFNGLCOPYIMAGESUBDATAPROC, glCopyImageSubData)
+    X(PFNGLCOPYIMAGESUBDATAPROC, glCopyImageSubData) \
+    X(PFNGLFENCESYNCPROC, glFenceSync) \
+    X(PFNGLCLIENTWAITSYNCPROC, glClientWaitSync) \
+    X(PFNGLDELETESYNCPROC, glDeleteSync) \
+    X(PFNGLFLUSHPROC, glFlush)
 
 #define GL_DECL(t, n) static t p_##n;
 GL_FNS(GL_DECL)
@@ -186,6 +191,7 @@ GL_FNS(GL_DECL)
 #define glBufferData p_glBufferData
 #define glBufferSubData p_glBufferSubData
 #define glBindBufferBase p_glBindBufferBase
+#define glBindBufferRange p_glBindBufferRange
 #define glGenVertexArrays p_glGenVertexArrays
 #define glBindVertexArray p_glBindVertexArray
 #define glEnableVertexAttribArray p_glEnableVertexAttribArray
@@ -216,6 +222,10 @@ GL_FNS(GL_DECL)
 #define glMapBufferRange p_glMapBufferRange
 #define glUnmapBuffer p_glUnmapBuffer
 #define glCopyImageSubData p_glCopyImageSubData
+#define glFenceSync p_glFenceSync
+#define glClientWaitSync p_glClientWaitSync
+#define glDeleteSync p_glDeleteSync
+#define glFlush p_glFlush
 
 static int gl_load(void)
 {
@@ -238,6 +248,7 @@ static int gl_load(void)
 #define GL_SURF_H    1024           /* rows of a linear surface, as Vulkan's */
 #define GL_MAX_REPORTS 256
 #define GL_MAX_QUERIES 4096
+#define GL_RING_SIZE   (32u << 20)
 
 typedef struct {
     uint32_t va, pitch, bpp, w, h, fmt;
@@ -254,11 +265,20 @@ typedef struct {
     uint64_t ref, sref;
     uint32_t ref_ep, ref_full_ep;
     int ref_valid;
+    /* Dirty with nothing but one full clear (alias_resolve). */
+    int clear_only;
+    /* Guest RAM changed under it: upload before the next draw, or never if a
+     * full clear comes first (surf_settle). */
+    int pending_up;
+    uint32_t clear_argb;
 } GSurf;
 
-/* A surface the title samples as a texture, copied on the GPU (rt_tex). */
+/* A surface the title samples as a texture, copied on the GPU (rt_tex), or
+ * a cube map whose six faces are surfaces (rt_cube). */
 typedef struct {
-    uint32_t va, w, h, x8, gen, last_use;
+    uint32_t va, w, h, x8, last_use;
+    int cube;
+    uint32_t fgen[6];               /* the surface's (each face's) gen + 1 at its copy */
     GLuint tex;
 } GRtTex;
 #define GL_MAX_RT 16
@@ -268,6 +288,21 @@ typedef struct {
     GLuint rb;
     uint32_t last_use;
 } GZeta;
+
+typedef struct { uint32_t va; uint64_t stamp; int q0, q1, with_carry; } GReport;
+
+/* A flipped frame the GPU may still be drawing: its visibility reports and
+ * its surfaces' copy-backs (into pbo), landed a frame later (pend_retire). */
+typedef struct {
+    int active;
+    GLsync fence;
+    GLuint *queries;
+    int nq, clear_q, nreps;
+    GReport reps[GL_MAX_REPORTS];
+    GLuint pbo;
+    struct { GSurf *s; GLuint tex; uint32_t gen, rows; size_t off; } wb[GL_MAX_SURF];
+    int nwb;
+} GPend;
 
 typedef struct GTex_ {
     int used;
@@ -292,6 +327,15 @@ static struct {
     SDL_GLContext ctx;
     int own_win, win_w, win_h;
     GLuint fbo, rfbo, vao, vbo, ibo, ubo, cbo, pbo;
+    /* One streaming buffer for every draw's uniforms, constants, vertices
+     * and indices (draw_common), written unsynchronized at ring_off and
+     * orphaned when it wraps. */
+    GLuint ring;
+    size_t ring_off, ubo_align;
+    /* What draw_common last bound, so unchanged binds are skipped; any other
+     * glBindTexture (bind_other) forgets it. */
+    GLuint b_tex[8], b_samp[4], b_prog;
+    int b_valid;
     GLuint white2d, whitecube;
     GSurf surf[GL_MAX_SURF];
     int nsurf;
@@ -315,13 +359,19 @@ static struct {
     GLuint *queries;
     int nq, clear_q;
     uint64_t carry;
-    struct { uint32_t va; uint64_t stamp; int q0, q1, with_carry; } reps[GL_MAX_REPORTS];
+    GReport reps[GL_MAX_REPORTS];
     int nreps;
+    /* The flipped frame still on the GPU (pend_retire), and the query
+     * pools: one for it, one for the frame being recorded. */
+    GPend pend;
+    GLuint *qpool[2];
     uint32_t present_va, present_pitch;
     GRtTex rt[GL_MAX_RT];
     uint32_t prev_present_va;
     /* RECOMP_PERF: where the pushbuffer thread's time goes (perf_report). */
     uint64_t pf_draw_us, pf_tex_us, pf_flush_us, pf_present_us, pf_t0, pf_cpu0;
+    uint64_t pf_wait_us, pf_wb_us;  /* waiting for the GPU at flips; every copy-back */
+    uint64_t pf_queue_us;           /* queueing a flip's copy-backs */
     uint32_t pf_draws, pf_tex_up, pf_tex_kb, pf_surf_up, pf_wb, pf_frames;
     uint8_t *rb;                    /* readback scratch */
     size_t rb_size;
@@ -434,17 +484,28 @@ static void perf_report(void)
         return;
     f = G.pf_frames ? (double)G.pf_frames : 1.0;
     fprintf(stderr, "[PERF] %.1f fps; pushbuffer thread %.0f%% cpu; per frame: %.0f draws %.1f ms,"
-            " textures %.1f ms (%.1f uploads, %.0f KB), surface uploads %.1f, write-backs %.1f,"
-            " flush %.1f ms, present %.1f ms\n",
+            " textures %.1f ms (%.1f uploads, %.0f KB), surface uploads %.1f, write-backs %.1f"
+            " (%.1f ms), flush %.1f ms (GPU wait %.1f, queueing copy-backs %.1f), present %.1f ms\n",
             G.pf_frames / secs, (double)(cpu - G.pf_cpu0) / (secs * 1e4),
             G.pf_draws / f, G.pf_draw_us / f / 1000.0, G.pf_tex_us / f / 1000.0,
             G.pf_tex_up / f, G.pf_tex_kb / f, G.pf_surf_up / f, G.pf_wb / f,
-            G.pf_flush_us / f / 1000.0, G.pf_present_us / f / 1000.0);
+            G.pf_wb_us / f / 1000.0, G.pf_flush_us / f / 1000.0, G.pf_wait_us / f / 1000.0,
+            G.pf_queue_us / f / 1000.0,
+            G.pf_present_us / f / 1000.0);
     xbox_thread_perf_report(secs);
     G.pf_draw_us = G.pf_tex_us = G.pf_flush_us = G.pf_present_us = 0;
+    G.pf_wait_us = G.pf_wb_us = G.pf_queue_us = 0;
     G.pf_draws = G.pf_tex_up = G.pf_tex_kb = G.pf_surf_up = G.pf_wb = G.pf_frames = 0;
     G.pf_t0 = t;
     G.pf_cpu0 = cpu;
+}
+
+/* A texture bind outside draw_common: whatever it last bound is not known
+ * to be there any more. */
+static void bind_other(GLenum target, GLuint t)
+{
+    glBindTexture(target, t);
+    G.b_valid = 0;
 }
 
 /* ---- shaders ----------------------------------------------------------- */
@@ -604,7 +665,7 @@ static GLuint white_tex(GLenum target)
     GLuint t;
     int f;
     glGenTextures(1, &t);
-    glBindTexture(target, t);
+    bind_other(target, t);
     if (target == GL_TEXTURE_CUBE_MAP)
         for (f = 0; f < 6; f++)
             glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + f, 0, GL_RGBA8, 1, 1, 0, GL_BGRA,
@@ -618,6 +679,7 @@ static GLuint white_tex(GLenum target)
 static int gl_init(void)
 {
     SDL_Window *win = (SDL_Window *)__atomic_load_n(&s_handed_win, __ATOMIC_ACQUIRE);
+    int k;
 
     if (win) {
         G.win = win;
@@ -668,11 +730,24 @@ static int gl_init(void)
     glBufferData(GL_UNIFORM_BUFFER, NV2A_VSH_CONSTANTS * 16, NULL, GL_DYNAMIC_DRAW);
     glBindBufferBase(GL_UNIFORM_BUFFER, 0, G.ubo);
     glBindBufferBase(GL_UNIFORM_BUFFER, 3, G.cbo);
+    {
+        GLint a = 256;
+        glGetIntegerv(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, &a);
+        G.ubo_align = a > 16 ? (size_t)a : 16;
+    }
+    glGenBuffers(1, &G.ring);
+    glBindBuffer(GL_ARRAY_BUFFER, G.ring);
+    glBufferData(GL_ARRAY_BUFFER, GL_RING_SIZE, NULL, GL_STREAM_DRAW);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, G.ring);      /* the VAO's, for good */
     G.white2d = white_tex(GL_TEXTURE_2D);
     G.whitecube = white_tex(GL_TEXTURE_CUBE_MAP);
     G.tex = (GTex *)calloc(GL_MAX_TEX, sizeof(GTex));
-    G.queries = (GLuint *)calloc(GL_MAX_QUERIES, sizeof(GLuint));
-    glGenQueries(GL_MAX_QUERIES, G.queries);
+    for (k = 0; k < 2; k++) {
+        G.qpool[k] = (GLuint *)calloc(GL_MAX_QUERIES, sizeof(GLuint));
+        glGenQueries(GL_MAX_QUERIES, G.qpool[k]);
+    }
+    G.queries = G.qpool[0];
+    glGenBuffers(1, &G.pend.pbo);
     G.clear_q = -1;
     G.epoch = 1;
     if (!prog_get(0)->prog) {
@@ -823,8 +898,17 @@ static void surf_upload(GSurf *s)
                    (size_t)s->w * s->bpp);
     surf_pixfmt(s, &fmt, &type);
     G.pf_surf_up++;
+    {
+        static int trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_GL_UPLOAD_TRACE") != NULL;
+        if (trace && (G.frame % 60) == 0)
+            fprintf(stderr, "[GL] F%u upload surface %08X %ux%u bpp %u%s rows %u ref %d\n",
+                    G.frame, s->va, s->w, s->h, s->bpp, s->swz ? " swizzled" : "", rows,
+                    s->ref_valid);
+    }
     step("upload", s->va, s->fmt);
-    glBindTexture(GL_TEXTURE_2D, s->tex);
+    bind_other(GL_TEXTURE_2D, s->tex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)s->w, (GLsizei)rows, fmt, type, lin);
     surf_ref(s);
 }
@@ -833,38 +917,52 @@ static void tex_touch(uint32_t va, size_t bytes);
 static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, struct GTex_ *e, uint64_t h,
                          uint32_t *levels_out);
 static void reports_resolve(void);
+static void flush_pipelined(void);
 
 /* The surface's texture into guest RAM. */
-static void surf_writeback(GSurf *s)
+static const char *wb_why = "?";
+static void pend_retire_inner(void);
+/* RECOMP_GL_SYNC_TRACE: who lands the flipped frame early (the source line;
+ * the flip's own is flush_pipelined's). */
+#define pend_retire() do { \
+        static int t_ = -1; \
+        if (t_ < 0) t_ = getenv("RECOMP_GL_SYNC_TRACE") != NULL; \
+        if (t_ && G.pend.active && (G.frame % 60) == 0) \
+            fprintf(stderr, "[GLSYNC] F%u line %d (%s)\n", G.frame, __LINE__, wb_why); \
+        pend_retire_inner(); \
+    } while (0)
+
+/* The rows of s that guest RAM holds. */
+static uint32_t surf_wb_rows(const GSurf *s)
 {
-    uint32_t rows = s->swz ? s->h : (s->rows < s->h ? s->rows : s->h), y;
-    uint8_t *lin;
+    return s->swz ? s->h : (s->rows < s->h ? s->rows : s->h);
+}
+
+/* Copy s's texture into the bound pixel pack buffer at off. */
+static void surf_readpix(GSurf *s, uint32_t rows, size_t off)
+{
     GLenum fmt, type;
-    if (!s->dirty || !rows)
-        return;
-    lin = scratch((size_t)s->w * rows * s->bpp);
-    if (!lin)
-        return;
     surf_pixfmt(s, &fmt, &type);
     step("write-back", s->va, s->fmt);
+    {
+        static int trace = -1;
+        if (trace < 0)
+            trace = getenv("RECOMP_GL_UPLOAD_TRACE") != NULL;
+        if (trace && (G.frame % 60) == 0)
+            fprintf(stderr, "[GL] F%u write-back (%s) surface %08X %ux%u bpp %u%s rows %u\n",
+                    G.frame, wb_why, s->va, s->w, s->h, s->bpp, s->swz ? " swizzled" : "", rows);
+    }
     glBindFramebuffer(GL_READ_FRAMEBUFFER, G.rfbo);
     glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
-    {
-        /* Through a pixel buffer: the GPU copies into it and it is mapped
-         * here. (Read straight into client memory, Ryujinx's emulated GPU
-         * took the emulator down with an X BadMatch.) */
-        size_t n = (size_t)s->w * rows * s->bpp;
-        const void *m;
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, G.pbo);
-        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)n, NULL, GL_STREAM_READ);
-        glReadPixels(0, 0, (GLsizei)s->w, (GLsizei)rows, fmt, type, NULL);
-        m = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)n, GL_MAP_READ_BIT);
-        if (m)
-            memcpy(lin, m, n);
-        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
-        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    }
+    glReadPixels(0, 0, (GLsizei)s->w, (GLsizei)rows, fmt, type, (void *)(uintptr_t)off);
+}
+
+/* Read-back pixels of s (rows of w * bpp bytes) into guest RAM. `clean`:
+ * they are what the texture holds now, so s is no longer dirty. */
+static void surf_land(GSurf *s, uint8_t *lin, uint32_t rows, int clean)
+{
+    uint32_t y;
     {
         static int trace = -1;
         if (trace < 0)
@@ -883,11 +981,57 @@ static void surf_writeback(GSurf *s)
         for (y = 0; y < rows; y++)
             memcpy(guest(s->va) + (size_t)y * s->pitch, lin + (size_t)y * s->w * s->bpp,
                    (size_t)s->w * s->bpp);
-    s->dirty = 0;
-    /* What is in guest RAM now is what the texture holds. */
-    s->up_epoch = G.epoch;
-    surf_ref(s);
+    if (clean) {
+        s->dirty = 0;
+        /* What is in guest RAM now is what the texture holds. */
+        s->up_epoch = G.epoch;
+        surf_ref(s);
+    }
     tex_touch(s->va, surf_bytes(s));
+}
+
+/* The GPU's contents of s into guest RAM, now: waits for the GPU. */
+static void surf_writeback(GSurf *s)
+{
+    uint32_t rows = surf_wb_rows(s);
+    uint8_t *lin;
+    uint64_t t0;
+    size_t n;
+    const void *m;
+
+    /* A flipped frame's copy-back of it, landed first, may be all it needs:
+     * that frame has had a frame's time to finish. */
+    if (s->dirty == 2) {
+        static int t_ = -1;
+        if (t_ < 0) t_ = getenv("RECOMP_GL_SYNC_TRACE") != NULL;
+        if (t_ && G.pend.active && (G.frame % 60) == 0)
+            fprintf(stderr, "[GLSYNC] F%u for %08X %ux%u%s\n", G.frame, s->va, s->w, s->h,
+                    s->swz ? " swizzled" : "");
+        pend_retire();
+    }
+    if (!s->dirty || !rows)
+        return;
+    n = (size_t)s->w * rows * s->bpp;
+    lin = scratch(n);
+    if (!lin)
+        return;
+    pend_retire();      /* lands before this, so never over it */
+    t0 = perf_on() ? now_us() : 0;
+    G.pf_wb++;
+    /* Through a pixel buffer: the GPU copies into it and it is mapped
+     * here. (Read straight into client memory, Ryujinx's emulated GPU
+     * took the emulator down with an X BadMatch.) */
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, G.pbo);
+    glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)n, NULL, GL_STREAM_READ);
+    surf_readpix(s, rows, 0);
+    m = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)n, GL_MAP_READ_BIT);
+    if (m)
+        memcpy(lin, m, n);
+    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    surf_land(s, lin, rows, 1);
+    if (t0)
+        G.pf_wb_us += now_us() - t0;
 }
 
 /* Copy back every dirty surface that overlaps [va, va + bytes). */
@@ -897,7 +1041,60 @@ static void writeback_overlap(uint32_t va, uint32_t bytes)
     for (i = 0; i < G.nsurf; i++) {
         GSurf *s = &G.surf[i];
         if (s->dirty && va < s->va + surf_bytes(s) && s->va < va + bytes)
-            surf_writeback(s);
+            wb_why = "overlap", surf_writeback(s);
+    }
+}
+
+/* Another surface over cs's bytes that the GPU has and guest RAM has not.
+ * D3D clears a swizzled render target through a linear surface on the same
+ * memory and then draws swizzled: both were copied back every frame, one
+ * over the other, and the loser uploaded again the next (two of them in a
+ * race). A surface that holds nothing but a full clear over exactly cs's
+ * bytes hands cs the clear on the GPU instead, as the Vulkan renderer does;
+ * any other overlap is copied back first, so cs's upload sees it. */
+static void alias_resolve(GSurf *cs)
+{
+    int i;
+    for (i = 0; i < G.nsurf; i++) {
+        GSurf *q = &G.surf[i];
+        uint32_t c = 0;
+        if (q == cs || !q->dirty || !(cs->va < q->va + surf_bytes(q) && cs->va + surf_bytes(cs) > q->va))
+            continue;
+        if (q->clear_only && q->va == cs->va && surf_bytes(q) == surf_bytes(cs)
+                && q->bpp == cs->bpp && q->fmt == cs->fmt) {
+            c = q->clear_argb;
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, G.rfbo);
+            glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, cs->tex, 0);
+            glDisable(GL_SCISSOR_TEST);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glClearColor((float)((c >> 16) & 0xFF) / 255.0f, (float)((c >> 8) & 0xFF) / 255.0f,
+                         (float)(c & 0xFF) / 255.0f, (float)(c >> 24) / 255.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            glEnable(GL_SCISSOR_TEST);
+            G.cur_cs = NULL;            /* the draw framebuffer binding moved */
+            G.cur_zs = NULL;
+            cs->dirty = 1;
+            cs->gen++;
+            cs->pending_up = 0;
+            cs->clear_only = 1;
+            cs->clear_argb = c;
+            if (!cs->swz && cs->rows < q->rows)
+                cs->rows = q->rows;
+            q->dirty = 0;
+            q->clear_only = 0;
+            q->ref_valid = 0;           /* guest RAM gets cs's bytes, not q's */
+            continue;
+        }
+        {
+            static int trace = -1;
+            if (trace < 0)
+                trace = getenv("RECOMP_GL_UPLOAD_TRACE") != NULL;
+            if (trace && (G.frame % 60) == 0)
+                fprintf(stderr, "[GL] F%u alias: target %08X %ux%u pitch %u bpp %u%s rows %u over %08X\n",
+                        G.frame, cs->va, cs->w, cs->h, cs->pitch, cs->bpp, cs->swz ? " swizzled" : "",
+                        cs->rows, q->va);
+        }
+        wb_why = "alias", surf_writeback(q);
     }
 }
 
@@ -957,7 +1154,7 @@ static GSurf *surf_get(const Nv2aVkState *st)
         s->w = w;
         s->h = swz ? st->swz_h : GL_SURF_H;
         glGenTextures(1, &s->tex);
-        glBindTexture(GL_TEXTURE_2D, s->tex);
+        bind_other(GL_TEXTURE_2D, s->tex);
         glTexImage2D(GL_TEXTURE_2D, 0, (GLint)ifmt, (GLsizei)s->w, (GLsizei)s->h, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, NULL);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
@@ -969,8 +1166,9 @@ static GSurf *surf_get(const Nv2aVkState *st)
         s->ref_valid = 0;            /* more rows than the reference covers */
     }
     s->last_use = G.frame;
-    if (!s->dirty && s->up_epoch != G.epoch && !surf_unchanged(s))
-        surf_upload(s);
+    alias_resolve(s);
+    if (!s->dirty && !s->pending_up && s->up_epoch != G.epoch && !surf_unchanged(s))
+        s->pending_up = 1;
     return s;
 }
 
@@ -1022,11 +1220,27 @@ static GZeta *zeta_get(uint32_t key, uint32_t w)
     return z;
 }
 
-/* Bind the draw's surfaces. 0 when there is nothing to draw into. */
-static int begin_target(const Nv2aVkState *st)
+/* The target is about to be drawn into (not wholly cleared): bring in
+ * what guest RAM has first, if it changed. */
+static void surf_settle(GSurf *s)
 {
-    GSurf *cs = surf_get(st);
-    GZeta *zs = zeta_get(st->zeta_key, cs ? cs->w : 1024);
+    if (s && s->pending_up) {
+        s->pending_up = 0;
+        surf_upload(s);
+    }
+}
+
+/* Bind the draw's surfaces. 0 when there is nothing to draw into. */
+/* Bind st's colour surface and depth buffer to draw into; `colour` 0: the
+ * depth buffer alone (a clear of depth and stencil only). */
+static int begin_target(const Nv2aVkState *st, int colour)
+{
+    GSurf *cs = colour ? surf_get(st) : NULL;
+    /* The width the colour surface would have, unbound or not: zeta_get
+     * keeps a buffer per width, and a depth clear must reach the one the
+     * draws after it use (a wider one left the race's depth uncleared). */
+    uint32_t w = st->swz_w ? st->swz_w : st->bpp ? st->pitch / st->bpp : 0;
+    GZeta *zs = zeta_get(st->zeta_key, cs ? cs->w : w);
     if (!cs && !zs)
         return 0;
     if (G.cur_cs == cs && G.cur_zs == zs)
@@ -1214,6 +1428,102 @@ static void tex_touch(uint32_t va, size_t bytes)
     }
 }
 
+/* The rt cache entry for a surface at va sampled as w x h (a cube: six
+ * faces), made (or taken from the least recently used) when missing. */
+static GRtTex *rt_slot(uint32_t va, uint32_t w, uint32_t h, int x8, int cube)
+{
+    GLenum target = cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
+    GRtTex *e = NULL;
+    int i, f;
+    for (i = 0; i < GL_MAX_RT; i++)
+        if (G.rt[i].tex && G.rt[i].va == va && G.rt[i].w == w && G.rt[i].h == h
+                && G.rt[i].x8 == (uint32_t)x8 && G.rt[i].cube == cube) {
+            e = &G.rt[i];
+            break;
+        }
+    if (!e) {
+        e = &G.rt[0];
+        for (i = 0; i < GL_MAX_RT; i++) {
+            if (!G.rt[i].tex) { e = &G.rt[i]; break; }
+            if (G.rt[i].last_use < e->last_use)
+                e = &G.rt[i];
+        }
+        if (e->tex)
+            glDeleteTextures(1, &e->tex);
+        memset(e, 0, sizeof *e);
+        step("rt texture", va, w | h << 16);
+        e->va = va;
+        e->w = w;
+        e->h = h;
+        e->x8 = (uint32_t)x8;
+        e->cube = cube;
+        glGenTextures(1, &e->tex);
+        bind_other(target, e->tex);
+        for (f = 0; f < (cube ? 6 : 1); f++)
+            glTexImage2D(cube ? GL_TEXTURE_CUBE_MAP_POSITIVE_X + f : GL_TEXTURE_2D, 0, GL_RGBA8,
+                         (GLsizei)w, (GLsizei)h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, 0);
+        if (x8)
+            glTexParameteri(target, GL_TEXTURE_SWIZZLE_A, GL_ONE);
+    }
+    e->last_use = G.frame;
+    return e;
+}
+
+/* A cube map whose faces are swizzled surfaces (RSC2's car reflection: six
+ * 128x128 faces, three redrawn a frame), put together on the GPU from the
+ * faces' textures as the Vulkan renderer does. Each face's surface was drawn
+ * since its copy-back or still matches guest RAM. Through guest RAM, the
+ * faces drawn were copied back and the whole cube decoded again for every
+ * frame -- waiting for the GPU in the middle of it. Any face without such a
+ * surface: the old path. */
+static GLuint rt_cube(const Nv2aVkTex *d, uint32_t bytes, uint32_t *levels_out)
+{
+    GSurf *face[6];
+    GRtTex *e;
+    uint32_t fbytes = bytes / 6, f;
+    int i, x8;
+
+    if (d->color == 0x06) x8 = 0;
+    else if (d->color == 0x07) x8 = 1;
+    else return 0;
+    if (d->width != d->height || bytes % 6 || d->levels > 1)
+        return 0;
+    for (f = 0; f < 6; f++) {
+        uint32_t va = d->offset + f * fbytes;
+        face[f] = NULL;
+        for (i = 0; i < G.nsurf; i++) {
+            GSurf *q = &G.surf[i];
+            if (q->va == va && q->swz && q->w == d->width && q->h == d->height && q->bpp == 4
+                    && q->fmt == GL_RGBA8) {
+                face[f] = q;
+                break;
+            }
+        }
+        if (!face[f] || face[f]->pending_up)
+            return 0;
+        /* Anything else dirty over the face: not ours to resolve. */
+        for (i = 0; i < G.nsurf; i++) {
+            GSurf *q = &G.surf[i];
+            if (q != face[f] && q->dirty && va < q->va + surf_bytes(q) && va + fbytes > q->va)
+                return 0;
+        }
+        if (!face[f]->dirty && !surf_unchanged(face[f]))
+            return 0;
+    }
+    e = rt_slot(d->offset, d->width, d->height, x8, 1);
+    for (f = 0; f < 6; f++) {
+        if (e->fgen[f] == face[f]->gen + 1)
+            continue;
+        glCopyImageSubData(face[f]->tex, GL_TEXTURE_2D, 0, 0, 0, 0,
+                           e->tex, GL_TEXTURE_CUBE_MAP, 0, 0, 0, (GLint)f,
+                           (GLsizei)d->width, (GLsizei)d->height, 1);
+        e->fgen[f] = face[f]->gen + 1;
+    }
+    *levels_out = 1;
+    return e->tex;
+}
+
 /* A texture that is a surface the GPU drew and guest RAM does not have yet:
  * sampled from a copy made on the GPU (glCopyImageSubData, again only when
  * the surface changed) instead of reading the surface back -- which waits
@@ -1233,8 +1543,10 @@ static GLuint rt_tex(const Nv2aVkTex *d, uint32_t bytes, uint32_t *levels_out)
         const char *env = getenv("RECOMP_GL_RT_DIRECT");
         on = !(env && strcmp(env, "0") == 0);
     }
-    if (!on || d->cube)
+    if (!on)
         return 0;
+    if (d->cube)
+        return rt_cube(d, bytes, levels_out);
     switch (d->color) {
     case 0x06: x8 = 0; swz = 1; break;          /* A8R8G8B8 */
     case 0x07: x8 = 1; swz = 1; break;          /* X8R8G8B8 */
@@ -1255,42 +1567,12 @@ static GLuint rt_tex(const Nv2aVkTex *d, uint32_t bytes, uint32_t *levels_out)
     if (swz ? (d->width != q->w || d->height != q->h)
             : (d->pitch != q->pitch || d->width > q->w || d->height > q->h))
         return 0;
-    for (i = 0; i < GL_MAX_RT; i++)
-        if (G.rt[i].tex && G.rt[i].va == q->va && G.rt[i].w == d->width
-                && G.rt[i].h == d->height && G.rt[i].x8 == (uint32_t)x8) {
-            e = &G.rt[i];
-            break;
-        }
-    if (!e) {
-        e = &G.rt[0];
-        for (i = 0; i < GL_MAX_RT; i++) {
-            if (!G.rt[i].tex) { e = &G.rt[i]; break; }
-            if (G.rt[i].last_use < e->last_use)
-                e = &G.rt[i];
-        }
-        if (e->tex)
-            glDeleteTextures(1, &e->tex);
-        memset(e, 0, sizeof *e);
-        step("rt texture", q->va, d->width | d->height << 16);
-        e->va = q->va;
-        e->w = d->width;
-        e->h = d->height;
-        e->x8 = (uint32_t)x8;
-        e->gen = q->gen - 1;
-        glGenTextures(1, &e->tex);
-        glBindTexture(GL_TEXTURE_2D, e->tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)e->w, (GLsizei)e->h, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-        if (x8)
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_SWIZZLE_A, GL_ONE);
-    }
-    e->last_use = G.frame;
-    if (e->gen != q->gen) {
+    e = rt_slot(q->va, d->width, d->height, x8, 0);
+    if (e->fgen[0] != q->gen + 1) {
         glCopyImageSubData(q->tex, GL_TEXTURE_2D, 0, 0, 0, 0,
                            e->tex, GL_TEXTURE_2D, 0, 0, 0, 0,
                            (GLsizei)e->w, (GLsizei)e->h, 1);
-        e->gen = q->gen;
+        e->fgen[0] = q->gen + 1;
     }
     *levels_out = 1;
     return e->tex;
@@ -1300,7 +1582,7 @@ static GLuint rt_tex(const Nv2aVkTex *d, uint32_t bytes, uint32_t *levels_out)
 static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
 {
     Nv2aVkTex d = *t;
-    uint32_t bytes, faces, levels, lv, f, w0, h0, slot, n, *buf;
+    uint32_t bytes, slot, n;
     uint64_t h;
     GTex *e = NULL;
 
@@ -1322,6 +1604,18 @@ static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
             return rt;
     }
     /* Drawn by the GPU this frame: guest RAM has to have it first. */
+    {
+        static int trace = -1;
+        int i;
+        if (trace < 0)
+            trace = getenv("RECOMP_GL_UPLOAD_TRACE") != NULL;
+        for (i = 0; trace && i < G.nsurf; i++)
+            if (G.surf[i].dirty && d.offset < G.surf[i].va + surf_bytes(&G.surf[i])
+                    && G.surf[i].va < d.offset + bytes && (G.frame % 60) == 0)
+                fprintf(stderr, "[GL] F%u texture %08X %ux%u fmt %02X%s levels %u needs surface %08X\n",
+                        G.frame, d.offset, d.width, d.height, d.color, d.cube ? " cube" : "",
+                        d.levels, G.surf[i].va);
+    }
     writeback_overlap(d.offset, bytes);
     slot = (d.offset * 2654435761u) & (GL_MAX_TEX - 1);
     for (n = 0; n < GL_MAX_TEX; n++) {
@@ -1385,7 +1679,7 @@ static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, GTex *e, uint64_t 
     glGenTextures(1, &e->tex);
     {
         GLenum target = d.cube ? GL_TEXTURE_CUBE_MAP : GL_TEXTURE_2D;
-        glBindTexture(target, e->tex);
+        bind_other(target, e->tex);
         glTexParameteri(target, GL_TEXTURE_MAX_LEVEL, (GLint)levels - 1);
         for (f = 0; f < faces; f++)
             for (lv = 0; lv < levels; lv++) {
@@ -1590,10 +1884,11 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
                     f[0], f[1], f[2], f[3]);
         }
     }
-    if (!begin_target(st)) {
+    if (!begin_target(st, 1)) {
         G.st_notarget++;
         return 1;
     }
+    surf_settle(G.cur_cs);
     target_size(&w, &h);
     glViewport(0, 0, (GLsizei)w, (GLsizei)h);
     if (!set_scissor(st)) {
@@ -1606,50 +1901,100 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
                            c && !c->swz && c->bpp == 4 && c->w == 640 && G.cur_zs && c->rows <= 480
                            ? nv2a_draw_wide_factor(nv2a_vk_view_aspect()) : 1.0f);
     }
-    glBindBuffer(GL_UNIFORM_BUFFER, G.ubo);
-    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof ub, &ub);
-    if (G.const_epoch != G.epoch || G.const_serial != nv2a_vsh_const_serial()) {
-        glBindBuffer(GL_UNIFORM_BUFFER, G.cbo);
-        glBufferSubData(GL_UNIFORM_BUFFER, 0, NV2A_VSH_CONSTANTS * 16, nv2a_vsh_constants());
-        G.const_epoch = G.epoch;
-        G.const_serial = nv2a_vsh_const_serial();
-    }
-    for (i = 0; i < 4; i++) {
-        glActiveTexture(GL_TEXTURE0 + i);
-        glBindTexture(GL_TEXTURE_2D, tex2d[i]);
-        glBindSampler((GLuint)i, samp[i]);
-        glActiveTexture(GL_TEXTURE4 + i);
-        glBindTexture(GL_TEXTURE_CUBE_MAP, texcube[i]);
-        glBindSampler((GLuint)(4 + i), samp[i]);
-    }
-    glUseProgram(p->prog);
-    glBindVertexArray(G.vao);
-    glBindBuffer(GL_ARRAY_BUFFER, G.vbo);
-    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)nv * stride, v, GL_STREAM_DRAW);
-    for (i = 0; i < 16; i++) {
-        if (i < p->ninputs) {
-            glEnableVertexAttribArray((GLuint)i);
-            glVertexAttribPointer((GLuint)i, 4, GL_FLOAT, GL_FALSE, (GLsizei)stride,
-                                  (const void *)(uintptr_t)(i * 16));
-        } else {
-            glDisableVertexAttribArray((GLuint)i);
+    /* Everything the draw reads, in one piece of the ring: the uniforms, the
+     * vertex constants when they changed, the vertices, the indices. A
+     * glBufferSubData / glBufferData per buffer per draw was 0.4 ms a draw
+     * on the Switch (each could wait for the GPU or allocate). */
+    {
+        size_t a = G.ubo_align, o_c, o_v, o_i, total;
+        int consts = G.const_epoch != G.epoch || G.const_serial != nv2a_vsh_const_serial();
+        size_t vbytes = (size_t)nv * stride, ibytes = (size_t)nidx * 4;
+        uint8_t *m;
+        glBindBuffer(GL_ARRAY_BUFFER, G.ring);
+        for (;;) {
+            o_c = (sizeof ub + a - 1) & ~(a - 1);
+            o_v = consts ? ((o_c + NV2A_VSH_CONSTANTS * 16 + a - 1) & ~(a - 1)) : o_c;
+            o_i = (o_v + vbytes + 15) & ~(size_t)15;
+            total = o_i + ibytes;
+            if (total > GL_RING_SIZE)
+                return 1;
+            if (G.ring_off + total <= GL_RING_SIZE)
+                break;
+            /* Wrap: new storage (draws in flight keep the old), and the
+             * vertex constants with it. */
+            glBufferData(GL_ARRAY_BUFFER, GL_RING_SIZE, NULL, GL_STREAM_DRAW);
+            G.ring_off = 0;
+            consts = 1;
         }
+        m = (uint8_t *)glMapBufferRange(GL_ARRAY_BUFFER, (GLintptr)G.ring_off, (GLsizeiptr)total,
+                                        GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT
+                                        | GL_MAP_INVALIDATE_RANGE_BIT);
+        if (!m)
+            return 1;
+        memcpy(m, &ub, sizeof ub);
+        if (consts)
+            memcpy(m + o_c, nv2a_vsh_constants(), NV2A_VSH_CONSTANTS * 16);
+        memcpy(m + o_v, v, vbytes);
+        memcpy(m + o_i, idx, ibytes);
+        glUnmapBuffer(GL_ARRAY_BUFFER);
+        glBindBufferRange(GL_UNIFORM_BUFFER, 0, G.ring, (GLintptr)G.ring_off, sizeof ub);
+        if (consts) {
+            glBindBufferRange(GL_UNIFORM_BUFFER, 3, G.ring, (GLintptr)(G.ring_off + o_c),
+                              NV2A_VSH_CONSTANTS * 16);
+            G.const_epoch = G.epoch;
+            G.const_serial = nv2a_vsh_const_serial();
+        }
+        o_v += G.ring_off;
+        o_i += G.ring_off;
+        G.ring_off = (G.ring_off + total + a - 1) & ~(a - 1);
+
+        for (i = 0; i < 4; i++) {
+            if (!G.b_valid || G.b_tex[i] != tex2d[i]) {
+                glActiveTexture(GL_TEXTURE0 + i);
+                glBindTexture(GL_TEXTURE_2D, tex2d[i]);
+                G.b_tex[i] = tex2d[i];
+            }
+            if (!G.b_valid || G.b_tex[4 + i] != texcube[i]) {
+                glActiveTexture(GL_TEXTURE4 + i);
+                glBindTexture(GL_TEXTURE_CUBE_MAP, texcube[i]);
+                G.b_tex[4 + i] = texcube[i];
+            }
+            if (!G.b_valid || G.b_samp[i] != samp[i]) {
+                glBindSampler((GLuint)i, samp[i]);
+                glBindSampler((GLuint)(4 + i), samp[i]);
+                G.b_samp[i] = samp[i];
+            }
+        }
+        G.b_valid = 1;
+        if (G.b_prog != p->prog) {
+            glUseProgram(p->prog);
+            G.b_prog = p->prog;
+        }
+        for (i = 0; i < 16; i++) {
+            if (i < p->ninputs) {
+                glEnableVertexAttribArray((GLuint)i);
+                glVertexAttribPointer((GLuint)i, 4, GL_FLOAT, GL_FALSE, (GLsizei)stride,
+                                      (const void *)(uintptr_t)(o_v + (size_t)i * 16));
+            } else {
+                glDisableVertexAttribArray((GLuint)i);
+            }
+        }
+        set_state(st);
+        if (G.zpass && G.nq == GL_MAX_QUERIES)
+            reports_resolve();
+        if (G.zpass)
+            glBeginQuery(GL_SAMPLES_PASSED, G.queries[G.nq]);
+        step("draw", p->hash, st->color_va);
+        glDrawElements(st->topology == 2 ? GL_POINTS : st->topology == 1 ? GL_LINES : GL_TRIANGLES,
+                       (GLsizei)nidx, GL_UNSIGNED_INT, (const void *)(uintptr_t)o_i);
     }
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, G.ibo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, (GLsizeiptr)nidx * 4, idx, GL_STREAM_DRAW);
-    set_state(st);
-    if (G.zpass && G.nq == GL_MAX_QUERIES)
-        reports_resolve();
-    if (G.zpass)
-        glBeginQuery(GL_SAMPLES_PASSED, G.queries[G.nq]);
-    step("draw", p->hash, st->color_va);
-    glDrawElements(st->topology == 2 ? GL_POINTS : st->topology == 1 ? GL_LINES : GL_TRIANGLES,
-                   (GLsizei)nidx, GL_UNSIGNED_INT, NULL);
     if (G.zpass) {
         glEndQuery(GL_SAMPLES_PASSED);
         G.nq++;
     }
     mark_drawn(st);
+    if (G.cur_cs)
+        G.cur_cs->clear_only = 0;
     return 1;
 }
 
@@ -1703,12 +2048,63 @@ int nv2a_vk_draw_program(const Nv2aVkState *st, uint32_t hash, const float *vin,
     }
 }
 
+/* A full colour clear about to overwrite st's surface: what another
+ * surface over exactly those bytes holds that guest RAM does not -- drawn
+ * this frame, or a flipped frame's copy-back still on its way -- is of no
+ * use any more, so it is dropped (an in-flight copy never lands) instead of
+ * copied back by alias_resolve, which waited for the GPU. RSC2 clears its
+ * swizzled shadow map, reflection faces and a 64x64 effect target through
+ * linear surfaces every frame. After the Vulkan renderer's drop_inflight. */
+static void drop_inflight(const Nv2aVkState *st)
+{
+    int swz = st->swz_w != 0, i;
+    uint32_t bytes;
+    if (swz)
+        bytes = st->clip_w >= st->swz_w && st->clip_h >= st->swz_h
+              ? st->swz_w * st->swz_h * st->bpp : 0;
+    else
+        bytes = st->bpp && st->clip_w >= st->pitch / st->bpp ? st->clip_h * st->pitch : 0;
+    if (!bytes)
+        return;
+    for (i = 0; i < G.nsurf; i++) {
+        GSurf *q = &G.surf[i];
+        /* Only the same bytes in another shape: the one buffer drawn as two
+         * surfaces. */
+        if (!q->dirty || q->va != st->color_va || surf_bytes(q) != bytes
+                || (q->swz == swz && q->bpp == st->bpp
+                    && (swz ? q->w == st->swz_w : q->pitch == st->pitch)))
+            continue;
+        q->dirty = 0;
+        q->clear_only = 0;
+        q->ref_valid = 0;
+    }
+}
+
 void nv2a_vk_clear(const Nv2aVkState *st, uint32_t flags, uint32_t argb, uint32_t zs)
 {
     GLbitfield bits = 0;
-    if (!nv2a_vk_active() || !begin_target(st) || !set_scissor(st))
+    if (!nv2a_vk_active())
+        return;
+    /* Every channel over the whole surface: nothing under it survives. */
+    if ((flags & 0xF0) == 0xF0 && st->clip_x == 0 && st->clip_y == 0)
+        drop_inflight(st);
+    /* Depth and stencil only: the colour surface is not touched, so it is
+     * not resolved either -- RSC2 clears the reflection faces' depth with
+     * a linear surface over each face set, which copied the face back. */
+    if (!begin_target(st, (flags & 0xF0) != 0) || !set_scissor(st))
         return;
     G.st_clears++;
+    if (G.cur_cs && G.cur_cs->pending_up) {
+        GSurf *c = G.cur_cs;
+        int full = (flags & 0xF0) == 0xF0 && st->clip_x == 0 && st->clip_y == 0
+                && st->clip_w >= c->w && st->clip_h >= (c->swz ? c->h : c->rows);
+        if (full) {
+            c->pending_up = 0;          /* every byte of it is about to go */
+            c->up_epoch = G.epoch;
+        } else {
+            surf_settle(c);
+        }
+    }
     if ((flags & 0xF0) && G.cur_cs) {
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glClearColor((float)((argb >> 16) & 0xFF) / 255.0f, (float)((argb >> 8) & 0xFF) / 255.0f,
@@ -1734,8 +2130,15 @@ void nv2a_vk_clear(const Nv2aVkState *st, uint32_t flags, uint32_t argb, uint32_
         return;
     step("clear", st->color_va, bits);
     glClear(bits);
-    if (bits & GL_COLOR_BUFFER_BIT)
+    if (bits & GL_COLOR_BUFFER_BIT) {
+        GSurf *c = G.cur_cs;
         mark_drawn(st);
+        /* A full clear leaves nothing but the clear; a partial one, more. */
+        c->clear_only = st->clip_x == 0 && st->clip_y == 0 && st->clip_w >= c->w
+                     && st->clip_h >= (c->swz ? c->h : c->rows);
+        if (c->clear_only)
+            c->clear_argb = argb;
+    }
 }
 
 /* ---- sync, visibility, presentation ------------------------------------ */
@@ -1747,7 +2150,7 @@ void nv2a_vk_clear(const Nv2aVkState *st, uint32_t flags, uint32_t argb, uint32_
  * does read them through guest RAM still copies them back first.
  * RECOMP_GL_FB_WRITEBACK=1 copies every surface back as before, =0 skips
  * the flipped ones even headless (for measuring); frame dumps keep them. */
-static int writeback_needed(const GSurf *s)
+static int wb_mode(void)
 {
     static int mode = -2;
     if (mode == -2) {
@@ -1757,11 +2160,31 @@ static int writeback_needed(const GSurf *s)
                          || getenv("RECOMP_VIDEO_RECORD") || getenv("RECOMP_FB_DUMP_FLIPS")))
             mode = 1;
     }
+    return mode;
+}
+
+static int writeback_needed(const GSurf *s)
+{
+    int mode = wb_mode();
     if (mode == 1 || s->swz)
         return 1;
     if (s->va != G.present_va && s->va != G.prev_present_va)
         return 1;
     return mode == 0 ? 0 : G.own_win;
+}
+
+/* Whether flips are pipelined (flush_pipelined). RECOMP_GL_PIPELINE=0
+ * waits for each frame at its flip as before; so do frame dumps and
+ * recordings, which read the frame from guest RAM right after it, unless
+ * RECOMP_GL_PIPELINE=1 (their frames are then a flip late). */
+static int pipelined(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GL_PIPELINE");
+        on = e ? strcmp(e, "0") != 0 : wb_mode() != 1;
+    }
+    return on;
 }
 
 void nv2a_vk_flush(void)
@@ -1771,13 +2194,18 @@ void nv2a_vk_flush(void)
     if (G.state <= 0)
         return;
     t0 = perf_on() ? now_us() : 0;
-    reports_resolve();
-    for (i = 0; i < G.nsurf; i++) {
-        if (!G.surf[i].dirty || !writeback_needed(&G.surf[i]))
-            continue;
-        G.st_wb++;
-        G.pf_wb++;
-        surf_writeback(&G.surf[i]);
+    if (pipelined()) {
+        flush_pipelined();
+    } else {
+        reports_resolve();
+        if (t0)
+            G.pf_wait_us += now_us() - t0;
+        for (i = 0; i < G.nsurf; i++) {
+            if (!G.surf[i].dirty || !writeback_needed(&G.surf[i]))
+                continue;
+            G.st_wb++;
+            wb_why = "flush", surf_writeback(&G.surf[i]);
+        }
     }
     {
         static int trace = -1;
@@ -1812,38 +2240,163 @@ void nv2a_vk_flush(void)
  * at most, at the end of the frame (or when the query pool runs out), as the
  * Vulkan renderer answers them at its sync. Until then a report's slot holds
  * what D3D put there -- "not done" -- which the title polls. */
-static void reports_resolve(void)
+static void reports_write(const GLuint *queries, int nq, int clear_q,
+                          const GReport *reps, int nreps)
 {
     static uint32_t *res;
     int i, k;
     uint64_t since;
-    if (!G.nq && !G.nreps)
+    if (!nq && !nreps)
         return;
     if (!res)
         res = (uint32_t *)calloc(GL_MAX_QUERIES, sizeof(uint32_t));
-    for (i = 0; i < G.nq; i++) {
+    for (i = 0; i < nq; i++) {
         GLuint n = 0;
-        glGetQueryObjectuiv(G.queries[i], GL_QUERY_RESULT, &n);
+        glGetQueryObjectuiv(queries[i], GL_QUERY_RESULT, &n);
         res[i] = n;
     }
-    for (k = 0; k < G.nreps; k++) {
-        uint64_t sum = G.reps[k].with_carry ? G.carry : 0;
+    for (k = 0; k < nreps; k++) {
+        uint64_t sum = reps[k].with_carry ? G.carry : 0;
         uint32_t count, done = 0;
-        uint8_t *g = guest(G.reps[k].va);
-        for (i = G.reps[k].q0; i < G.reps[k].q1; i++)
+        uint8_t *g = guest(reps[k].va);
+        for (i = reps[k].q0; i < reps[k].q1; i++)
             sum += res[i];
         count = (uint32_t)sum;
-        memcpy(g, &G.reps[k].stamp, 8);
+        memcpy(g, &reps[k].stamp, 8);
         memcpy(g + 8, &count, 4);
         memcpy(g + 12, &done, 4);
     }
-    since = G.clear_q < 0 ? G.carry : 0;
-    for (i = G.clear_q < 0 ? 0 : G.clear_q; i < G.nq; i++)
+    since = clear_q < 0 ? G.carry : 0;
+    for (i = clear_q < 0 ? 0 : clear_q; i < nq; i++)
         since += res[i];
     G.carry = since;
+}
+
+/* This window's reports, now (after the flipped frame's: they count on
+ * from it). */
+static void reports_resolve(void)
+{
+    pend_retire();
+    reports_write(G.queries, G.nq, G.clear_q, G.reps, G.nreps);
     G.clear_q = -1;
     G.nq = 0;
     G.nreps = 0;
+}
+
+/* Land the flipped frame: wait for it -- it has had the next frame's
+ * recording to finish in -- then answer its reports and put its surfaces'
+ * copy-backs in guest RAM. A surface drawn again since keeps its newer
+ * contents marked dirty; one emptied meanwhile (alias_resolve) is skipped. */
+static void pend_retire_inner(void)
+{
+    GPend *p = &G.pend;
+    uint64_t t0;
+    int i;
+    if (!p->active)
+        return;
+    p->active = 0;
+    t0 = perf_on() ? now_us() : 0;
+    while (glClientWaitSync(p->fence, GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull) == GL_TIMEOUT_EXPIRED)
+        ;
+    glDeleteSync(p->fence);
+    p->fence = 0;
+    if (t0)
+        G.pf_wait_us += now_us() - t0;
+    reports_write(p->queries, p->nq, p->clear_q, p->reps, p->nreps);
+    if (p->nwb) {
+        size_t total = p->wb[p->nwb - 1].off + (size_t)p->wb[p->nwb - 1].s->w
+                       * p->wb[p->nwb - 1].rows * p->wb[p->nwb - 1].s->bpp;
+        const uint8_t *m;
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, p->pbo);
+        m = (const uint8_t *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, (GLsizeiptr)total,
+                                              GL_MAP_READ_BIT);
+        for (i = 0; m && i < p->nwb; i++) {
+            GSurf *s = p->wb[i].s;
+            uint32_t rows = p->wb[i].rows;
+            size_t n = (size_t)s->w * rows * s->bpp;
+            uint8_t *lin;
+            if (s->tex != p->wb[i].tex || !s->dirty || !(lin = scratch(n)))
+                continue;
+            memcpy(lin, m + p->wb[i].off, n);
+            surf_land(s, lin, rows, s->dirty == 2 && s->gen == p->wb[i].gen);
+        }
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+        p->nwb = 0;
+    }
+    if (t0)
+        G.pf_wb_us += now_us() - t0;
+}
+
+/* The flip, pipelined: the frame's copy-backs are queued on the GPU and its
+ * reports kept, and both land a frame later (pend_retire) -- as the Vulkan
+ * renderer does -- instead of waiting here for the GPU to finish the frame,
+ * so the next frame is recorded while the GPU draws this one. */
+static void flush_pipelined(void)
+{
+    static int offscreen_wb = -1;
+    GPend *p = &G.pend;
+    size_t total = 0;
+    uint64_t t0;
+    int i;
+
+    /* RECOMP_GL_FLIP_WRITEBACK=0 (the Switch's default): surfaces never
+     * shown (shadow maps, the reflection's faces) are not copied back at
+     * flips: they stay dirty, and a texture over them still has them copied
+     * back when it is drawn with. Only a CPU read of them would miss it.
+     * The Switch's Mesa reads pixels into a buffer on the CPU, waiting for
+     * the frame: a third of a second a frame in a race. */
+    if (offscreen_wb < 0) {
+        const char *e = getenv("RECOMP_GL_FLIP_WRITEBACK");
+#if defined(__SWITCH__)
+        offscreen_wb = e && strcmp(e, "0") != 0;
+#else
+        offscreen_wb = !(e && strcmp(e, "0") == 0);
+#endif
+    }
+    pend_retire();
+    t0 = perf_on() ? now_us() : 0;
+    p->nwb = 0;
+    for (i = 0; i < G.nsurf; i++) {
+        GSurf *s = &G.surf[i];
+        uint32_t rows = surf_wb_rows(s);
+        if (s->dirty != 1 || !rows || !writeback_needed(s))
+            continue;
+        if (!offscreen_wb && s->va != G.present_va && s->va != G.prev_present_va)
+            continue;
+        p->wb[p->nwb].s = s;
+        p->wb[p->nwb].tex = s->tex;
+        p->wb[p->nwb].gen = s->gen;
+        p->wb[p->nwb].rows = rows;
+        p->wb[p->nwb].off = total;
+        total += ((size_t)s->w * rows * s->bpp + 255) & ~(size_t)255;
+        p->nwb++;
+    }
+    if (p->nwb) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, p->pbo);
+        glBufferData(GL_PIXEL_PACK_BUFFER, (GLsizeiptr)total, NULL, GL_STREAM_READ);
+        for (i = 0; i < p->nwb; i++) {
+            G.st_wb++;
+            G.pf_wb++;
+            wb_why = "flip", surf_readpix(p->wb[i].s, p->wb[i].rows, p->wb[i].off);
+            p->wb[i].s->dirty = 2;
+        }
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    }
+    if (t0)
+        G.pf_queue_us += now_us() - t0;
+    p->queries = G.queries;
+    p->nq = G.nq;
+    p->clear_q = G.clear_q;
+    p->nreps = G.nreps;
+    memcpy(p->reps, G.reps, (size_t)G.nreps * sizeof G.reps[0]);
+    G.queries = G.queries == G.qpool[0] ? G.qpool[1] : G.qpool[0];
+    G.nq = 0;
+    G.nreps = 0;
+    G.clear_q = -1;
+    p->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    p->active = 1;
+    glFlush();
 }
 
 void nv2a_vk_zpass(int enable)
@@ -1858,7 +2411,6 @@ void nv2a_vk_report_clear(void)
     if (G.state <= 0)
         return;
     G.clear_q = G.nq;
-    G.carry = 0;
 }
 
 void nv2a_vk_report_get(uint32_t va, uint64_t stamp)

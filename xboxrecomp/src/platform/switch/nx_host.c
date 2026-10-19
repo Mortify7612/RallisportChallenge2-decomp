@@ -177,22 +177,46 @@ static void nx_probe(uint64_t at)
     fflush(stderr);
 }
 
+/* The guest space's slot, taken before main: libnx maps every thread's
+ * stack into the stack region at a random place, so by the time the layout
+ * asks for 1088 MB in one piece the 2 GB region can be too broken up to have
+ * it (a black screen, all devices unmapped). The first reservation of up to
+ * this size gets it. */
+#define NX_EARLY_SPAN (0x44000000ull + (32ull << 20))
+static void *s_early;
+static uint64_t s_early_len;
+
+__attribute__((constructor)) static void nx_early_span(void)
+{
+    virtmemLock();
+    s_early = virtmemFindStack(NX_EARLY_SPAN, 0x10000);
+    if (s_early && !virtmemAddReservation(s_early, NX_EARLY_SPAN))
+        s_early = NULL;
+    virtmemUnlock();
+    s_early_len = s_early ? NX_EARLY_SPAN : 0;
+}
+
 /* A slot of the stack region, the one place an unprivileged process can
  * map memory at an address of its choosing (svcMapMemory). The guest space
  * fits it folded (platform/guest_addr.h): 0x44000000 bytes. */
 static void *span_new(uint64_t len)
 {
-    void *base;
+    void *base = NULL;
     static int probed;
 
     len = (len + 0x1FFFFFull) & ~0x1FFFFFull;
     if (s_nspan >= NX_MAX_SPANS)
         return NULL;
-    virtmemLock();
-    base = virtmemFindStack(len, 0x10000);
-    if (base && !virtmemAddReservation(base, len))
-        base = NULL;
-    virtmemUnlock();
+    if (s_early && len <= s_early_len) {
+        base = s_early;             /* reserved already; the tail stays unused */
+        s_early = NULL;
+    } else {
+        virtmemLock();
+        base = virtmemFindStack(len, 0x10000);
+        if (base && !virtmemAddReservation(base, len))
+            base = NULL;
+        virtmemUnlock();
+    }
     if (!base) {
         uint64_t sa = 0, ss = 0;
         svcGetInfo(&sa, InfoType_StackRegionAddress, CUR_PROCESS_HANDLE, 0);
