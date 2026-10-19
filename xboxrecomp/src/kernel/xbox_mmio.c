@@ -86,11 +86,44 @@ static void *plain(uint32_t va)
  * barely pays for it. */
 #define XBOX_MMIO_YIELD_EVERY 64
 
+/* RECOMP_MMIO_POLL_TRACE=1: every 4M reads, the registers read most --
+ * what a thread spinning on the hardware is waiting for. (RSC2's main
+ * thread: the PFB flush at 0xFD100410, which nv2a_ack_thread clears once
+ * the executor has caught up; cleared as soon as it was read instead, the
+ * game hung on 0xFD400B10 at startup.) */
+static void poll_trace(uint32_t va)
+{
+    static int on = -1;
+    static struct { uint32_t va; unsigned long n; } top[32];
+    static unsigned long total;
+    int k;
+    if (on < 0)
+        on = getenv("RECOMP_MMIO_POLL_TRACE") != NULL;
+    if (!on)
+        return;
+    for (k = 0; k < 32 && top[k].va && top[k].va != va; k++)
+        ;
+    if (k < 32) {
+        top[k].va = va;
+        top[k].n++;
+    }
+    if (++total % (4ul << 20) == 0) {
+        fprintf(stderr, "[MMIO] most read:");
+        for (k = 0; k < 32 && top[k].va; k++)
+            if (top[k].n > total / 50)
+                fprintf(stderr, " %08X x%lu", top[k].va, top[k].n);
+        fputc('\n', stderr);
+        memset(top, 0, sizeof top);
+        total = 0;
+    }
+}
+
 uint64_t xbox_mmio_read(uint32_t va, int size)
 {
     static __thread unsigned reads;
     int i = find(va);
     uint64_t v = 0;
+    poll_trace(va);
     if (++reads % XBOX_MMIO_YIELD_EVERY == 0) {
         extern void xbox_thread_tick(int poll);
         xbox_thread_tick(1);

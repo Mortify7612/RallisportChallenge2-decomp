@@ -41,7 +41,12 @@
 
 #include <SDL.h>
 #include <GL/glcorearb.h>
+#if defined(__SWITCH__)
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#endif
 
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,6 +143,10 @@ extern uint32_t nv2a_pb_presented_frames(void);
     X(PFNGLGETINTEGER64VPROC, glGetInteger64v) \
     X(PFNGLCREATESHADERPROGRAMVPROC, glCreateShaderProgramv) \
     X(PFNGLCOMPRESSEDTEXIMAGE2DPROC, glCompressedTexImage2D) \
+    X(PFNGLVERTEXATTRIBFORMATPROC, glVertexAttribFormat) \
+    X(PFNGLDELETEBUFFERSPROC, glDeleteBuffers) \
+    X(PFNGLVERTEXATTRIBBINDINGPROC, glVertexAttribBinding) \
+    X(PFNGLBINDVERTEXBUFFERPROC, glBindVertexBuffer) \
     X(PFNGLGETSTRINGIPROC, glGetStringi) \
     X(PFNGLGENPROGRAMPIPELINESPROC, glGenProgramPipelines) \
     X(PFNGLBINDPROGRAMPIPELINEPROC, glBindProgramPipeline) \
@@ -235,6 +244,10 @@ GL_FNS(GL_DECL)
 #define glGetInteger64v p_glGetInteger64v
 #define glCreateShaderProgramv p_glCreateShaderProgramv
 #define glCompressedTexImage2D p_glCompressedTexImage2D
+#define glVertexAttribFormat p_glVertexAttribFormat
+#define glDeleteBuffers p_glDeleteBuffers
+#define glVertexAttribBinding p_glVertexAttribBinding
+#define glBindVertexBuffer p_glBindVertexBuffer
 #define glGetStringi p_glGetStringi
 #define glGenProgramPipelines p_glGenProgramPipelines
 #define glBindProgramPipeline p_glBindProgramPipeline
@@ -367,7 +380,8 @@ typedef struct {
 typedef struct {
     uint64_t h;                     /* 0: free */
     GLuint prog;
-    int failed;
+    GLsync fence;                   /* the compiling thread's, until passed */
+    volatile int state;             /* 0 not built, 1 queued, 2 built, -1 failed */
 } GFrag;
 
 static struct {
@@ -381,6 +395,27 @@ static struct {
      * orphaned when it wraps. */
     GLuint ring;
     size_t ring_off, ubo_align;
+    /* GL_ARB_buffer_storage: the ring mapped once, for good, and a fence
+     * for each quarter, set when the writes leave it and waited for before
+     * they come back round (ring_reserve). */
+    uint8_t *ring_map;
+    GLsync ring_fence[4];
+    int ring_q;
+    int b_ninputs;                  /* vertex attributes enabled, -1 unknown */
+    /* The last draw's uniforms and where they sit in the ring: a draw with
+     * the same ones binds nothing new. */
+    Nv2aVkUbo last_ub;
+    size_t last_ub_off;
+    uint32_t last_ub_lap;           /* ring_lap it was written in */
+    int last_ub_valid;
+    uint32_t ring_lap;              /* times the ring has wrapped */
+    uint32_t pf_ub_same, pf_consts;
+    /* set_state's last state, as a key: a draw with the same one makes no
+     * state calls (each is work in Mesa even when nothing changes).
+     * state_valid = 0 where anything else touches that state. */
+    uint32_t state_key[24];
+    int state_valid;
+    uint64_t pf_prep_us, pf_glcall_us;  /* draw_common: before its GL calls; the calls */
     /* What draw_common last bound, so unchanged binds are skipped; any other
      * glBindTexture (bind_other) forgets it. */
     GLuint b_tex[8], b_samp[4], b_vs, b_fs;
@@ -528,7 +563,7 @@ static int perf_on(void)
     return on;
 }
 
-/* RECOMP_GL_GPU_TIME=1 (on with RECOMP_PERF on the Switch): where the
+/* RECOMP_GL_GPU_TIME=1 (with RECOMP_PERF): where the
  * GPU's time goes, after the [PERF] line. A timestamp is taken whenever the
  * work changes -- another render target, texture or surface uploads, the
  * reflection's cube copies, copy-backs, the present -- and the span to the
@@ -575,11 +610,7 @@ static void gt_sync_clock(void)
 static void gt_init(void)
 {
     const char *e = getenv("RECOMP_GL_GPU_TIME");
-#if defined(__SWITCH__)
-    GT.on = e ? strcmp(e, "0") != 0 : 1;
-#else
     GT.on = e && strcmp(e, "0") != 0;
-#endif
     GT.on = GT.on && perf_on() && pipelined();
     if (GT.on) {
         glGenQueries(GL_MAX_GT + 1, GT.fr[0].q);
@@ -764,6 +795,21 @@ static void perf_report(void)
         fprintf(stderr, "[PERF]   shaders: %u specialised built (%.1f ms), %.0f draws a frame"
                 " waiting on the general one\n", G.pf_spec, G.pf_spec_us / 1000.0,
                 G.pf_spec_gen / f);
+    {
+        extern void nv2a_pb_perf_take(uint64_t out[5]);
+        uint64_t pb[5];
+        nv2a_pb_perf_take(pb);
+        fprintf(stderr, "[PERF]   executor per frame: %.1f ms in all; fetching vertices %.1f,"
+                " triangle lists %.1f, state %.1f, the renderer's draws %.1f (setting up %.1f,"
+                " uploading and GL calls %.1f)\n", pb[4] / f / 1e6, pb[0] / f / 1e6, pb[1] / f / 1e6,
+                pb[2] / f / 1e6, pb[3] / f / 1e6, G.pf_prep_us / f / 1000.0,
+                G.pf_glcall_us / f / 1000.0);
+        G.pf_prep_us = G.pf_glcall_us = 0;
+    }
+    if (G.pf_draws)
+        fprintf(stderr, "[PERF]   per frame: %.0f draws with the uniforms of the draw before,"
+                " %.0f vertex constant uploads\n", G.pf_ub_same / f, G.pf_consts / f);
+    G.pf_ub_same = G.pf_consts = 0;
     if (G.pf_fragz[3])
         fprintf(stderr, "[PERF]   of %.0f draws a frame, writing their depth: %.0f polygon offset,"
                 " %.0f z-buffer rounding, %.0f other\n", G.pf_fragz[3] / f, G.pf_fragz[0] / f,
@@ -887,9 +933,10 @@ static GLuint frag_general(int fast)
  * Switch that made the race's 640x480 scene about 135 ms of GPU time a
  * frame. As in the Vulkan renderer, a draw's setup is compiled again with
  * those values as constants (NV2A_SPEC), and without the depth write when
- * the draw does not need it (NV2A_FAST_DEPTH). Compiling is on this thread,
- * a few a frame (RECOMP_GL_SPEC_PER_FRAME, default 2, 1 on the Switch, where
- * Mesa takes most of a second over each); draws use the
+ * the draw does not need it (NV2A_FAST_DEPTH). They are compiled on a
+ * thread of their own (sc_worker), or without one on this thread, a few a
+ * frame (RECOMP_GL_SPEC_PER_FRAME, default 2, 1 on the Switch, where Mesa
+ * takes most of a second over each); draws use the
  * general program until theirs is built. RECOMP_GL_SPEC=0 keeps every draw
  * on the general program; RECOMP_GL_FAST_DEPTH=0 keeps the depth write. */
 static int spec_on(void)
@@ -959,12 +1006,316 @@ static void spec_vals(GSpec *v, const Nv2aVkUbo *ub, int fast)
     v->fast = (uint32_t)fast;
 }
 
+/* ---- generated fragment programs ---------------------------------------
+ *
+ * The specialised program, written out for one setup: only the texture
+ * stages that fetch, the combiner stages that run, each as plain
+ * statements on named registers -- no functions, switches, loops or
+ * arrays. nv2a.frag with the setup's values as constants compiles to the
+ * same thing, but Mesa inlines and folds the whole general shader first:
+ * 1-7 s a program on the Switch, a freeze each time a new setup came into
+ * view. Every rule follows nv2a.frag (stage_fetch, rc_stage, the final
+ * combiner, alpha_pass, the depth write), which follows the software
+ * rasteriser. RECOMP_GL_SPEC_GEN=0 builds from nv2a.frag instead. */
+typedef struct { char *p; size_t n, cap; } GBuf;
+
+static void gb(GBuf *b, const char *fmt, ...)
+{
+    va_list ap;
+    int k;
+    if (!b->p)
+        return;
+    va_start(ap, fmt);
+    k = vsnprintf(b->p + b->n, b->cap - b->n, fmt, ap);
+    va_end(ap);
+    if (k < 0 || (size_t)k >= b->cap - b->n) {
+        free(b->p);                 /* too long: give up, the caller falls back */
+        b->p = NULL;
+        return;
+    }
+    b->n += (size_t)k;
+}
+
+/* map_in: x (a vec3 or float expression) by the input mapping of b. */
+static void gen_map_in(char *o, size_t n, const char *x, uint32_t b)
+{
+    switch ((b >> 5) & 7u) {
+    case 0:  snprintf(o, n, "max(%s, 0.0)", x); break;
+    case 1:  snprintf(o, n, "(1.0 - clamp(%s, 0.0, 1.0))", x); break;
+    case 2:  snprintf(o, n, "(2.0 * max(%s, 0.0) - 1.0)", x); break;
+    case 3:  snprintf(o, n, "(-2.0 * max(%s, 0.0) + 1.0)", x); break;
+    case 4:  snprintf(o, n, "(max(%s, 0.0) - 0.5)", x); break;
+    case 5:  snprintf(o, n, "(-max(%s, 0.0) + 0.5)", x); break;
+    case 6:  snprintf(o, n, "(%s)", x); break;
+    default: snprintf(o, n, "(-(%s))", x); break;
+    }
+}
+
+/* read_rgb / read_alpha of combiner input b. r0 reads zero. */
+static void gen_rgb(char *o, size_t n, uint32_t b)
+{
+    char x[32];
+    b &= 0xFFu;
+    if ((b & 15u) == 0)
+        snprintf(x, sizeof x, "vec3(0.0)");
+    else
+        snprintf(x, sizeof x, "r%u.%s", b & 15u, (b & 0x10u) ? "aaa" : "rgb");
+    gen_map_in(o, n, x, b);
+}
+
+static void gen_alpha(char *o, size_t n, uint32_t b)
+{
+    char x[32];
+    b &= 0xFFu;
+    if ((b & 15u) == 0)
+        snprintf(x, sizeof x, "0.0");
+    else
+        snprintf(x, sizeof x, "r%u.%s", b & 15u, (b & 0x10u) ? "a" : "b");
+    gen_map_in(o, n, x, b);
+}
+
+/* map_out m, then the clamp to [-1, 1], of expression x. */
+static void gen_map_out(char *o, size_t n, const char *x, uint32_t m)
+{
+    switch (m) {
+    case 0x08: snprintf(o, n, "clamp(%s - 0.5, -1.0, 1.0)", x); break;
+    case 0x10: snprintf(o, n, "clamp(%s * 2.0, -1.0, 1.0)", x); break;
+    case 0x18: snprintf(o, n, "clamp((%s - 0.5) * 2.0, -1.0, 1.0)", x); break;
+    case 0x20: snprintf(o, n, "clamp(%s * 4.0, -1.0, 1.0)", x); break;
+    case 0x30: snprintf(o, n, "clamp(%s * 0.5, -1.0, 1.0)", x); break;
+    default:   snprintf(o, n, "clamp(%s, -1.0, 1.0)", x); break;
+    }
+}
+
+/* Texture stage st's fetch into tN (stage_fetch). */
+static void gen_stage(GBuf *b, const GSpec *v, uint32_t st)
+{
+    uint32_t mode = (v->misc_w >> (st * 5u)) & 0x1Fu, inp, j;
+    if (mode == 0) {
+        gb(b, "    t%u = vec4(0.0, 0.0, 0.0, 1.0);\n", st);
+        return;
+    }
+    if (mode == 1 || mode == 2) {
+        gb(b, "    t%u = texture(t2d[%u], tc%u.xy / (tc%u.w != 0.0 ? tc%u.w : 1.0) * u.ts[%u].xy);\n",
+           st, st, st, st, st, st);
+        return;
+    }
+    if (mode == 3) {
+        if (v->tsz[st] != 0.0f)
+            gb(b, "    t%u = texture(tcube[%u], tc%u.xyz);\n", st, st, st);
+        else
+            gb(b, "    t%u = texture(t2d[%u], tc%u.xy * u.ts[%u].xy);\n", st, st, st, st);
+        return;
+    }
+    if (mode == 4) {
+        gb(b, "    t%u = clamp(tc%u, 0.0, 1.0);\n", st, st);
+        return;
+    }
+    if (mode == 5) {
+        for (j = 0; j < 4; j++)
+            gb(b, "    if (tc%u[%u] %s 0.0) discard;\n", st, j,
+               ((v->misc2[3] >> (st * 4u + j)) & 1u) ? ">=" : "<");
+        gb(b, "    t%u = vec4(0.0);\n", st);
+        return;
+    }
+    if (st == 0) {
+        gb(b, "    t0 = vec4(0.0);\n");
+        return;
+    }
+    inp = st == 1 ? 0u : st == 2 ? (v->misc3[1] >> 16) & 0xFu : (v->misc3[1] >> 20) & 0xFu;
+    if (inp > 3)
+        inp = 3;
+    if (mode == 15) {
+        gb(b, "    t%u = texture(t2d[%u], vec2(t%u.a, t%u.r));\n", st, st, inp, inp);
+        return;
+    }
+    if (mode == 16) {
+        gb(b, "    t%u = texture(t2d[%u], vec2(t%u.g, t%u.b));\n", st, st, inp, inp);
+        return;
+    }
+    if (mode == 6 || mode == 7) {
+        gb(b, "    t%u = texture(t2d[%u], (tc%u.xy + (t%u.rg * 2.0 - 1.0)) * u.ts[%u].xy);\n",
+           st, st, st, inp, st);
+        return;
+    }
+    {
+        /* dot_input: the input stage's texel as a vector, then the dot. */
+        uint32_t m = (v->misc3[2] >> ((st - 1u) * 4u)) & 0xFu;
+        gb(b, "    {\n        vec3 c = t%u.rgb;\n", inp);
+        if (m == 1)
+            gb(b, "        vec3 x = c * 255.0 - 128.0;\n"
+                  "        c = x / mix(vec3(128.0), vec3(127.0), greaterThanEqual(x, vec3(0.0)));\n");
+        else if (m == 3)
+            gb(b, "        vec3 x = floor(c * 255.0 + 0.5);\n"
+                  "        c = mix(x, x - 256.0, greaterThanEqual(x, vec3(128.0))) / 127.0;\n");
+        else if (m != 0)
+            gb(b, "        c = c * 2.0 - 1.0;\n");
+        gb(b, "        d%u = dot(tc%u.xyz, c);\n    }\n", st, st);
+    }
+    if (mode == 9) {
+        gb(b, "    t%u = texture(t2d[%u], vec2(d%u, d%u) * u.ts[%u].xy);\n", st, st, st - 1, st, st);
+        return;
+    }
+    if (st >= 2 && (mode == 11 || mode == 13 || mode == 14 || mode == 12 || mode == 18)) {
+        char N[64];
+        snprintf(N, sizeof N, st == 3 ? "vec3(d1, d2, d3)" : "vec3(d1, d2, 0.0)");
+        if (mode == 11 || mode == 13 || mode == 14) {
+            gb(b, "    t%u = texture(tcube[%u], %s);\n", st, st, N);
+            return;
+        }
+        if (!(v->misc_x & 4u)) {
+            gb(b, "    t%u = vec4(0.0);\n", st);
+            return;
+        }
+        gb(b, "    {\n        vec3 N = %s, E = %s;\n        float nn = dot(N, N);\n"
+              "        t%u = texture(tcube[%u], nn != 0.0 ? 2.0 * N * dot(N, E) / nn - E : E);\n    }\n",
+           N, mode == 12 ? "vec3(tc1.w, tc2.w, tc3.w)" : "vec3(0.0, 0.0, 1.0)", st, st);
+        return;
+    }
+    gb(b, "    t%u = vec4(0.0);\n", st);    /* 10, 17 and the rest */
+}
+
+/* One general combiner stage s (rc_stage). */
+static void gen_rc(GBuf *b, const GSpec *v, uint32_t s, uint32_t flags)
+{
+    uint32_t icw = v->cw[s][0], aicw = v->cw[s][1], ocw = v->cw[s][2], aocw = v->cw[s][3];
+    uint32_t fl = ocw >> 12, afl = aocw >> 12, d;
+    char A[96], B[96], C[96], D[96], t[160];
+    gb(b, "    {\n");
+    gb(b, "        r1 = u.f0[%u];\n        r2 = u.f1[%u];\n",
+       (flags & 0x010u) ? s : 0u, (flags & 0x100u) ? s : 0u);
+    if ((fl & 4u) || (afl & 4u))
+        gb(b, "        bool mux = %s;\n", (flags & 1u) ? "r12.a >= 0.5" : "(int(r12.a * 255.0) & 1) != 0");
+    gen_rgb(A, sizeof A, icw >> 24); gen_rgb(B, sizeof B, icw >> 16);
+    gen_rgb(C, sizeof C, icw >> 8);  gen_rgb(D, sizeof D, icw);
+    gb(b, "        vec3 A = %s, B = %s, C = %s, D = %s;\n", A, B, C, D);
+    gen_alpha(A, sizeof A, aicw >> 24); gen_alpha(B, sizeof B, aicw >> 16);
+    gen_alpha(C, sizeof C, aicw >> 8);  gen_alpha(D, sizeof D, aicw);
+    gb(b, "        float aA = %s, aB = %s, aC = %s, aD = %s;\n", A, B, C, D);
+    gb(b, "        vec3 pab = %s, pcd = %s;\n", (fl & 2u) ? "vec3(dot(A, B))" : "A * B",
+       (fl & 1u) ? "vec3(dot(C, D))" : "C * D");
+    gb(b, "        vec3 sum = %s;\n", (fl & 4u) ? "mux ? pcd : pab" : "pab + pcd");
+    gen_map_out(t, sizeof t, "pab", fl & 0x38u); gb(b, "        vec3 ab = %s;\n", t);
+    gen_map_out(t, sizeof t, "pcd", fl & 0x38u); gb(b, "        vec3 cd = %s;\n", t);
+    gen_map_out(t, sizeof t, "sum", fl & 0x38u); gb(b, "        vec3 ms = %s;\n", t);
+    gb(b, "        float apab = aA * aB, apcd = aC * aD;\n");
+    gb(b, "        float asum = %s;\n", (afl & 4u) ? "mux ? apcd : apab" : "apab + apcd");
+    gen_map_out(t, sizeof t, "apab", afl & 0x38u); gb(b, "        float aab = %s;\n", t);
+    gen_map_out(t, sizeof t, "apcd", afl & 0x38u); gb(b, "        float acd = %s;\n", t);
+    gen_map_out(t, sizeof t, "asum", afl & 0x38u); gb(b, "        float ams = %s;\n", t);
+    if ((d = (ocw >> 4) & 15u) != 0) {
+        gb(b, "        r%u.rgb = ab;\n", d);
+        if (fl & 0x80u) gb(b, "        r%u.a = ab.b;\n", d);
+    }
+    if ((d = ocw & 15u) != 0) {
+        gb(b, "        r%u.rgb = cd;\n", d);
+        if (fl & 0x40u) gb(b, "        r%u.a = cd.b;\n", d);
+    }
+    if ((d = (ocw >> 8) & 15u) != 0) gb(b, "        r%u.rgb = ms;\n", d);
+    if ((d = (aocw >> 4) & 15u) != 0) gb(b, "        r%u.a = aab;\n", d);
+    if ((d = aocw & 15u) != 0) gb(b, "        r%u.a = acd;\n", d);
+    if ((d = (aocw >> 8) & 15u) != 0) gb(b, "        r%u.a = ams;\n", d);
+    gb(b, "    }\n");
+}
+
+/* The whole program for v, as Vulkan GLSL (gl_source makes it GL's). */
+static char *spec_gen(const GSpec *v)
+{
+    GBuf b = { (char *)malloc(64 * 1024), 0, 64 * 1024 };
+    uint32_t st, s;
+    int fast = (int)v->fast;
+    float vpw = v->vpw;
+    gb(&b, "#version 450\n#include \"nv2a_common.glsl\"\n"
+           "layout(set = 0, binding = 1) uniform sampler2D t2d[4];\n"
+           "layout(set = 0, binding = 2) uniform samplerCube tcube[4];\n"
+           "layout(location = 0) in vec4 v_d0;\nlayout(location = 1) in vec4 v_d1;\n"
+           "layout(location = 2) in float v_fog;\nlayout(location = 3) in vec4 v_t0;\n"
+           "layout(location = 4) in vec4 v_t1;\nlayout(location = 5) in vec4 v_t2;\n"
+           "layout(location = 6) in vec4 v_t3;\n"
+           "layout(location = 7) noperspective in float v_zs;\n"
+           "layout(location = 0) out vec4 o_color;\n\nvoid main()\n{\n");
+    if (!fast) {
+        /* The depth, with the polygon offset, before any discard. */
+        gb(&b, "    float zs = %s / u.vp.z;\n", vpw == 0.0f ? "gl_FragCoord.z" : "v_zs");
+        gb(&b, "    float zraw = %s;\n", vpw != 0.0f ? "1.0 / gl_FragCoord.w" : "zs");
+        gb(&b, "    if (u.zoff.x != 0.0 || u.zoff.y != 0.0) {\n"
+               "        float dz = max(abs(dFdx(zs)) * u.zoff.z, abs(dFdy(zs)) * u.zoff.w);\n"
+               "        float off = u.zoff.x * dz + u.zoff.y;\n%s"
+               "        zraw = max(zraw + off, 0.0);\n    }\n",
+           vpw != 0.0f ? "        off *= zraw / max(1.0 / u.vp.z - zs, 1.0);\n" : "");
+    }
+    gb(&b, "    vec4 tc0 = v_t0, tc1 = v_t1, tc2 = v_t2, tc3 = %s;\n",
+       v->ptsz != 0.0f ? "vec4(gl_PointCoord, 1.0, 1.0)" : "v_t3");
+    gb(&b, "    vec4 t0 = vec4(0.0), t1 = vec4(0.0), t2 = vec4(0.0), t3 = vec4(0.0);\n"
+           "    float d0 = 0.0, d1 = 0.0, d2 = 0.0, d3 = 0.0;\n    vec4 outc;\n");
+    for (st = 0; st < 4; st++)
+        gen_stage(&b, v, st);
+    if (!(v->misc_x & 1u)) {
+        gb(&b, "    outc = %s;\n", (v->misc_x & 2u) ? "texture(t2d[0], v_t0.xy * u.ts[0].xy) * v_d0" : "v_d0");
+    } else {
+        uint32_t ctl = v->misc2[0], n = (ctl & 0xFFu) < 8u ? ctl & 0xFFu : 8u, flags = ctl >> 8;
+        uint32_t f0 = v->misc2[1], f1 = v->misc2[2];
+        gb(&b, "    vec4 r1 = vec4(0.0), r2 = vec4(0.0), r3 = vec4(u.fogc.rgb, v_fog), r4 = v_d0,"
+               " r5 = v_d1, r6 = vec4(0.0), r7 = vec4(0.0);\n"
+               "    vec4 r8 = t0, r9 = t1, r10 = t2, r11 = t3, r12 = vec4(0.0, 0.0, 0.0, %s),"
+               " r13 = vec4(0.0), r14 = vec4(0.0), r15 = vec4(0.0);\n",
+           (v->misc_w & 0x1Fu) ? "t0.a" : "1.0");
+        for (s = 0; s < n; s++)
+            gen_rc(&b, v, s, flags);
+        if (f0 || f1) {
+            uint32_t ff = f1 & 0xFFu;
+            char A[96], B[96], C[96], D[96], E[96], F[96];
+            gb(&b, "    {\n        r1 = u.fc0;\n        r2 = u.fc1;\n");
+            gb(&b, "        vec3 a = %s, b = %s;\n", (ff & 0x40u) ? "1.0 - r5.rgb" : "r5.rgb",
+               (ff & 0x20u) ? "1.0 - r12.rgb" : "r12.rgb");
+            gb(&b, "        r14 = vec4(%s, 0.0);\n", (ff & 0x80u) ? "clamp(a + b, 0.0, 1.0)" : "a + b");
+            gen_rgb(E, sizeof E, f1 >> 24); gen_rgb(F, sizeof F, f1 >> 16);
+            gb(&b, "        r15 = vec4(%s * %s, 0.0);\n", E, F);
+            gen_rgb(A, sizeof A, f0 >> 24); gen_rgb(B, sizeof B, f0 >> 16);
+            gen_rgb(C, sizeof C, f0 >> 8);  gen_rgb(D, sizeof D, f0);
+            gen_alpha(E, sizeof E, f1 >> 8);
+            gb(&b, "        vec3 A = %s, B = %s, C = %s, D = %s;\n", A, B, C, D);
+            gb(&b, "        outc = vec4(D + C * (1.0 - A) + B * A, %s);\n    }\n", E);
+        } else {
+            gb(&b, "    outc = r12;\n");
+        }
+    }
+    gb(&b, "    outc = clamp(outc, 0.0, 1.0);\n");
+    if (v->misc3[0]) {
+        static const char *const cmp[] = { "<", "==", "<=", ">", "!=", ">=" };
+        uint32_t f = v->misc_y;
+        if (f == 0x200)
+            gb(&b, "    discard;\n");
+        else if (f >= 0x201 && f <= 0x206)
+            gb(&b, "    if (!(int(outc.a * 255.0 + 0.5) %s int(u.misc.z & 0xFFu))) discard;\n",
+               cmp[f - 0x201]);
+    }
+    gb(&b, "    o_color = outc;\n");
+    if (!fast) {
+        if (vpw == 2.0f)
+            gb(&b, "    gl_FragDepth = min(WREV_C / max(zraw, 1e-30), 1.0);\n");
+        else if (vpw != 0.0f)
+            gb(&b, "    gl_FragDepth = zraw * u.vp.z;\n");
+        else if (v->misc3[3])
+            gb(&b, "    gl_FragDepth = roundEven(zraw) * u.vp.z;\n");
+        else
+            gb(&b, "    gl_FragDepth = (u.zoff.x != 0.0 || u.zoff.y != 0.0) ? zraw * u.vp.z"
+                   " : gl_FragCoord.z;\n");
+    }
+    gb(&b, "}\n");
+    return b.p;
+}
+
 static GLuint spec_build(const GSpec *v)
 {
     char defs[2048], *q = defs, *src;
     GLuint p;
     int i;
     q += sprintf(q, "#define NV2A_SPEC 1\n%s", v->fast ? "#define NV2A_FAST_DEPTH 1\n" : "");
+    q += sprintf(q, "#define SP_NST %u\n", (v->misc_x & 1u) ? (v->misc2[0] & 0xFFu) < 8u
+                 ? (v->misc2[0] & 0xFFu) : 8u : 0u);
+    for (i = 0; i < 4; i++)
+        q += sprintf(q, "#define SP_TEX%d %d\n", i, ((v->misc_w >> (i * 5)) & 0x1Fu) != 0);
     q += sprintf(q, "const uvec4 SP_MISC = uvec4(%uu, %uu, 0u, %uu);\n", v->misc_x, v->misc_y, v->misc_w);
     q += sprintf(q, "const uvec4 SP_MISC2 = uvec4(%uu, %uu, %uu, %uu);\n",
                  v->misc2[0], v->misc2[1], v->misc2[2], v->misc2[3]);
@@ -977,24 +1328,191 @@ static GLuint spec_build(const GSpec *v)
     q += sprintf(q, "const float SP_PTSZ = %.9g;\nconst float SP_VPW = %.9g;\n", v->ptsz, v->vpw);
     sprintf(q, "const float SP_TSZ[4] = float[4](%.9g, %.9g, %.9g, %.9g);\n",
             v->tsz[0], v->tsz[1], v->tsz[2], v->tsz[3]);
-    src = gl_source(k_nv2a_frag_src, defs);
+    {
+        static int gen = -1;
+        if (gen < 0) {
+            const char *e = getenv("RECOMP_GL_SPEC_GEN");
+            gen = !(e && strcmp(e, "0") == 0);
+        }
+        if (gen) {
+            char *g = spec_gen(v);
+            src = g ? gl_source(g, "") : NULL;
+            free(g);
+            if (src && getenv("RECOMP_GL_SHADER_DUMP"))
+                fprintf(stderr, "[GL] generated fragment program:\n%s\n", src);
+        } else {
+            src = gl_source(k_nv2a_frag_src, defs);
+        }
+    }
     p = src ? sep_program(GL_FRAGMENT_SHADER, src) : 0;
     free(src);
     return p;
+}
+
+/* Compiling off the render thread: on the Switch, Mesa takes 0.6-5 s over
+ * a specialised program, and every new combiner setup froze the game that
+ * long. A thread with its own context, sharing the render context's
+ * objects, builds them and fences each; draws use the general program until
+ * theirs has passed its fence. On the Switch the context is made through
+ * EGL with no surface (EGL lets a window surface be current on one thread
+ * only); elsewhere through SDL, on a hidden window of its own. Off on the
+ * Switch unless RECOMP_GL_SPEC_THREAD=1: nouveau is not safe with two
+ * contexts in use at once (the car select drew white, then the game
+ * exited), and sharing the cores with the game a compile took 3-4 s there.
+ * RECOMP_GL_SPEC_THREAD=0
+ * compiles on the render thread instead, a few a frame. */
+#define GL_SC_JOBS 256
+static struct {
+    int on;                         /* 1 running, 0 not (compile inline) */
+    volatile int ready;             /* the worker's start: 1 ok, -1 failed */
+    struct { GFrag *e; GSpec v; } q[GL_SC_JOBS];
+    unsigned head, tail;
+    SDL_mutex *lock;
+    SDL_cond *cond;
+#if defined(__SWITCH__)
+    EGLDisplay dpy;
+    EGLContext ctx;
+#else
+    SDL_Window *win;                /* hidden, the worker's own */
+    SDL_GLContext ctx;
+#endif
+} SC;
+
+static int sc_current(void)
+{
+#if defined(__SWITCH__)
+    return eglBindAPI(EGL_OPENGL_API) && eglMakeCurrent(SC.dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, SC.ctx);
+#else
+    return SDL_GL_MakeCurrent(SC.win, SC.ctx) == 0;
+#endif
+}
+
+static DWORD WINAPI sc_worker(LPVOID unused)
+{
+    (void)unused;
+    if (!sc_current()) {
+#if defined(__SWITCH__)
+        fprintf(stderr, "[GL] shader thread: make current failed (EGL 0x%x)\n", eglGetError());
+#else
+        fprintf(stderr, "[GL] shader thread: make current failed (%s)\n", SDL_GetError());
+#endif
+        __atomic_store_n(&SC.ready, -1, __ATOMIC_RELEASE);
+        return 0;
+    }
+    __atomic_store_n(&SC.ready, 1, __ATOMIC_RELEASE);
+    for (;;) {
+        GFrag *e;
+        GSpec v;
+        uint64_t t0;
+        SDL_LockMutex(SC.lock);
+        while (SC.head == SC.tail)
+            SDL_CondWait(SC.cond, SC.lock);
+        e = SC.q[SC.tail % GL_SC_JOBS].e;
+        v = SC.q[SC.tail % GL_SC_JOBS].v;
+        SC.tail++;
+        SDL_UnlockMutex(SC.lock);
+        t0 = now_us();
+        e->prog = spec_build(&v);
+        if (e->prog) {
+            e->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+            glFlush();
+        }
+        __atomic_add_fetch(&G.pf_spec_us, now_us() - t0, __ATOMIC_RELAXED);
+        __atomic_add_fetch(&G.pf_spec, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&e->state, e->prog ? 2 : -1, __ATOMIC_RELEASE);
+    }
+    return 0;
+}
+
+/* On the render thread, its context current: the worker's context and the
+ * worker. */
+static void sc_init(void)
+{
+    const char *env = getenv("RECOMP_GL_SPEC_THREAD");
+    HANDLE th;
+    uint64_t t0;
+#if defined(__SWITCH__)
+    if (!(env && strcmp(env, "0") != 0) || !spec_on())
+        return;
+#else
+    if ((env && strcmp(env, "0") == 0) || !spec_on())
+        return;
+#endif
+#if defined(__SWITCH__)
+    {
+        EGLint id = 0, n = 0;
+        EGLConfig cfg;
+        EGLint pick[] = { EGL_CONFIG_ID, 0, EGL_NONE };
+        static const EGLint attrs[] = {
+            EGL_CONTEXT_MAJOR_VERSION_KHR, 4, EGL_CONTEXT_MINOR_VERSION_KHR, 3,
+            EGL_CONTEXT_OPENGL_PROFILE_MASK_KHR, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT_KHR,
+            EGL_NONE };
+        EGLContext main_ctx = eglGetCurrentContext();
+        SC.dpy = eglGetCurrentDisplay();
+        if (!eglQueryContext(SC.dpy, main_ctx, EGL_CONFIG_ID, &id))
+            return;
+        pick[1] = id;
+        if (!eglChooseConfig(SC.dpy, pick, &cfg, 1, &n) || n != 1)
+            return;
+        SC.ctx = eglCreateContext(SC.dpy, cfg, main_ctx, attrs);
+        if (SC.ctx == EGL_NO_CONTEXT) {
+            fprintf(stderr, "[GL] shader thread: no context (EGL 0x%x)\n", eglGetError());
+            return;
+        }
+    }
+#else
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 1);
+    SC.win = SDL_CreateWindow("rsc2 (GL shaders)", 0, 0, 16, 16,
+                              SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN);
+    SC.ctx = SC.win ? SDL_GL_CreateContext(SC.win) : NULL;
+    SDL_GL_SetAttribute(SDL_GL_SHARE_WITH_CURRENT_CONTEXT, 0);
+    SDL_GL_MakeCurrent(G.win, G.ctx);
+    if (!SC.ctx) {
+        fprintf(stderr, "[GL] shader thread: no context (%s)\n", SDL_GetError());
+        return;
+    }
+#endif
+    SC.lock = SDL_CreateMutex();
+    SC.cond = SDL_CreateCond();
+    th = SC.lock && SC.cond ? CreateThread(NULL, 8u << 20, sc_worker, NULL, 0, NULL) : NULL;
+    if (!th)
+        return;
+    CloseHandle(th);
+    for (t0 = now_us(); !__atomic_load_n(&SC.ready, __ATOMIC_ACQUIRE) && now_us() - t0 < 2000000; )
+        SDL_Delay(1);
+    SC.on = __atomic_load_n(&SC.ready, __ATOMIC_ACQUIRE) == 1;
+    fprintf(stderr, "[GL] specialised shaders compile %s\n",
+            SC.on ? "on their own thread" : "on the render thread (no second context)");
+}
+
+static int sc_queue(GFrag *e, const GSpec *v)
+{
+    int ok = 0;
+    SDL_LockMutex(SC.lock);
+    if (SC.head - SC.tail < GL_SC_JOBS) {
+        SC.q[SC.head % GL_SC_JOBS].e = e;
+        SC.q[SC.head % GL_SC_JOBS].v = *v;
+        SC.head++;
+        e->state = 1;
+        ok = 1;
+        SDL_CondSignal(SC.cond);
+    }
+    SDL_UnlockMutex(SC.lock);
+    return ok;
 }
 
 /* The fragment program for a draw with uniforms ub. */
 static GLuint frag_get(const Nv2aVkState *st, const Nv2aVkUbo *ub)
 {
     int fast = !needs_fragdepth(st);
-    G.pf_fragz[3]++;
-    if (!fast)
-        G.pf_fragz[st->poff_factor != 0.0f || st->poff_units != 0.0f ? 0 : st->zint ? 1 : 2]++;
     GSpec v;
     GFrag *e = NULL;
     uint64_t h;
     uint32_t slot, n;
 
+    G.pf_fragz[3]++;
+    if (!fast)
+        G.pf_fragz[st->poff_factor != 0.0f || st->poff_units != 0.0f ? 0 : st->zint ? 1 : 2]++;
     if (!spec_on())
         return G.fs_gen[fast];
     spec_vals(&v, ub, fast);
@@ -1002,21 +1520,36 @@ static GLuint frag_get(const Nv2aVkState *st, const Nv2aVkUbo *ub)
     slot = (uint32_t)(h >> 7) & (GL_MAX_FRAG - 1);
     for (n = 0; n < GL_MAX_FRAG; n++) {
         GFrag *c = &G.frag[(slot + n) & (GL_MAX_FRAG - 1)];
-        if (c->h == h) {
-            if (c->prog)
-                return c->prog;
-            e = c;
-            break;
-        }
-        if (!c->h) {
+        if (c->h == h || !c->h) {
             e = c;
             break;
         }
     }
-    if (!e || e->failed || G.spec_left <= 0) {
-        G.pf_spec_gen++;
+    if (e && e->h == h) {
+        if (__atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == 2) {
+            if (e->fence) {
+                if (glClientWaitSync(e->fence, 0, 0) == GL_TIMEOUT_EXPIRED) {
+                    G.pf_spec_gen++;
+                    return G.fs_gen[fast];
+                }
+                glDeleteSync(e->fence);
+                e->fence = 0;
+            }
+            return e->prog;
+        }
+        G.pf_spec_gen++;                /* queued, or failed */
         return G.fs_gen[fast];
     }
+    G.pf_spec_gen++;
+    if (!e)
+        return G.fs_gen[fast];
+    if (SC.on) {
+        if (sc_queue(e, &v))
+            e->h = h;
+        return G.fs_gen[fast];
+    }
+    if (G.spec_left <= 0)
+        return G.fs_gen[fast];
     G.spec_left--;
     e->h = h;
     {
@@ -1026,11 +1559,8 @@ static GLuint frag_get(const Nv2aVkState *st, const Nv2aVkUbo *ub)
             G.pf_spec_us += now_us() - t0;
     }
     G.pf_spec++;
-    if (!e->prog) {
-        e->failed = 1;
-        return G.fs_gen[fast];
-    }
-    return e->prog;
+    e->state = e->prog ? 2 : -1;
+    return e->prog ? e->prog : G.fs_gen[fast];
 }
 
 static GProg *prog_get(uint32_t hash)
@@ -1102,6 +1632,16 @@ static GLuint white_tex(GLenum target)
     return t;
 }
 
+static int has_ext(const char *name)
+{
+    GLint n = 0, k;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &n);
+    for (k = 0; k < n; k++)
+        if (!strcmp((const char *)glGetStringi(GL_EXTENSIONS, (GLuint)k), name))
+            return 1;
+    return 0;
+}
+
 static int gl_init(void)
 {
     SDL_Window *win = (SDL_Window *)__atomic_load_n(&s_handed_win, __ATOMIC_ACQUIRE);
@@ -1163,8 +1703,40 @@ static int gl_init(void)
     }
     glGenBuffers(1, &G.ring);
     glBindBuffer(GL_ARRAY_BUFFER, G.ring);
-    glBufferData(GL_ARRAY_BUFFER, GL_RING_SIZE, NULL, GL_STREAM_DRAW);
+    {
+        /* Mapped once and kept mapped where the driver can
+         * (GL_ARB_buffer_storage): a map and unmap per draw was Mesa
+         * validation work on every draw. RECOMP_GL_PERSIST=0 maps per draw. */
+        typedef void (APIENTRYP storage_fn)(GLenum, GLsizeiptr, const void *, GLbitfield);
+        const char *e = getenv("RECOMP_GL_PERSIST");
+        storage_fn bs = (e && strcmp(e, "0") == 0) || !has_ext("GL_ARB_buffer_storage") ? NULL
+                      : (storage_fn)SDL_GL_GetProcAddress("glBufferStorage");
+        GLbitfield fl = GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT;
+        if (bs) {
+            bs(GL_ARRAY_BUFFER, GL_RING_SIZE, NULL, fl);
+            G.ring_map = (uint8_t *)glMapBufferRange(GL_ARRAY_BUFFER, 0, GL_RING_SIZE, fl);
+        }
+        if (!G.ring_map) {
+            if (bs) {                   /* storage is immutable: start again */
+                glDeleteBuffers(1, &G.ring);
+                glGenBuffers(1, &G.ring);
+                glBindBuffer(GL_ARRAY_BUFFER, G.ring);
+            }
+            glBufferData(GL_ARRAY_BUFFER, GL_RING_SIZE, NULL, GL_STREAM_DRAW);
+        }
+        fprintf(stderr, "[GL] draw data ring %s\n", G.ring_map ? "mapped persistently"
+                : "mapped per draw");
+    }
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, G.ring);      /* the VAO's, for good */
+    /* Every attribute a vec4 at 16 bytes a step within a vertex, from one
+     * binding whose offset and stride move per draw (glBindVertexBuffer):
+     * one call a draw instead of a glVertexAttribPointer per attribute,
+     * each making Mesa look at the vertex layout again. */
+    for (k = 0; k < 16; k++) {
+        glVertexAttribFormat((GLuint)k, 4, GL_FLOAT, GL_FALSE, (GLuint)k * 16);
+        glVertexAttribBinding((GLuint)k, 0);
+    }
+    G.b_ninputs = -1;
     G.white2d = white_tex(GL_TEXTURE_2D);
     G.whitecube = white_tex(GL_TEXTURE_CUBE_MAP);
     G.tex = (GTex *)calloc(GL_MAX_TEX, sizeof(GTex));
@@ -1182,17 +1754,19 @@ static int gl_init(void)
          * blocks as the title stored them. RECOMP_GL_BC=0 decodes them on
          * the CPU instead, as before. */
         const char *e = getenv("RECOMP_GL_BC");
-        GLint n = 0;
-        glGetIntegerv(GL_NUM_EXTENSIONS, &n);
-        for (k = 0; k < n && !(e && strcmp(e, "0") == 0); k++)
-            if (!strcmp((const char *)glGetStringi(GL_EXTENSIONS, (GLuint)k),
-                        "GL_EXT_texture_compression_s3tc"))
-                G.bc_ok = 1;
+        G.bc_ok = !(e && strcmp(e, "0") == 0) && has_ext("GL_EXT_texture_compression_s3tc");
         fprintf(stderr, "[GL] DXT textures %s\n", G.bc_ok ? "uploaded compressed"
                 : "decoded on the CPU");
     }
-    G.fs_gen[0] = frag_general(0);
-    G.fs_gen[1] = frag_general(1);
+    {
+        uint64_t t0 = now_us();
+        GLint nbin = 0;
+        G.fs_gen[0] = frag_general(0);
+        G.fs_gen[1] = frag_general(1);
+        glGetIntegerv(GL_NUM_PROGRAM_BINARY_FORMATS, &nbin);
+        fprintf(stderr, "[GL] general fragment programs built in %.0f ms; %d program binary"
+                " format(s)\n", (now_us() - t0) / 1000.0, (int)nbin);
+    }
     if (!G.fs_gen[0] || !G.fs_gen[1] || !prog_get(0)->prog) {
         fprintf(stderr, "[GL] the general programs did not build; renderer off\n");
         return 0;
@@ -1200,6 +1774,7 @@ static int gl_init(void)
     glGenProgramPipelines(1, &G.pipe);
     glBindProgramPipeline(G.pipe);
     G.spec_left = spec_per_frame();
+    sc_init();
     return 1;
 }
 
@@ -1552,6 +2127,7 @@ static void alias_resolve(GSurf *cs)
             glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, cs->tex, 0);
             glDisable(GL_SCISSOR_TEST);
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            G.state_valid = 0;
             glClearColor((float)((c >> 16) & 0xFF) / 255.0f, (float)((c >> 8) & 0xFF) / 255.0f,
                          (float)(c & 0xFF) / 255.0f, (float)(c >> 24) / 255.0f);
             glClear(GL_COLOR_BUFFER_BIT);
@@ -1695,6 +2271,7 @@ static GZeta *zeta_get(uint32_t key, uint32_t w)
     glDisable(GL_SCISSOR_TEST);
     glDepthMask(GL_TRUE);
     glStencilMask(0xFF);
+    G.state_valid = 0;
     glClearDepth(1.0);
     glClearStencil(0);
     glClear(GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -2360,6 +2937,21 @@ static void set_state(const Nv2aVkState *st)
 {
     int depth_mode = st->wbuffer ? 2 : 0;     /* float depth: the reversed w-buffer */
     float bc[4];
+    uint32_t key[24];
+
+    memset(key, 0, sizeof key);
+    key[0] = st->blend_enable;  key[1] = st->blend_sfactor; key[2] = st->blend_dfactor;
+    key[3] = st->blend_equation; key[4] = st->blend_color;  key[5] = st->color_mask;
+    key[6] = st->cull_enable;   key[7] = st->cull_face;     key[8] = st->front_face;
+    key[9] = st->depth_test;    key[10] = st->depth_func;   key[11] = st->depth_mask;
+    key[12] = st->wbuffer;      key[13] = st->st_test;      key[14] = st->st_func;
+    key[15] = st->st_ref;       key[16] = st->st_mask;      key[17] = st->st_fail;
+    key[18] = st->st_zfail;     key[19] = st->st_zpass;     key[20] = st->st_write;
+    key[21] = st->st_wmask;     key[22] = G.cur_zs != NULL;
+    if (G.state_valid && memcmp(key, G.state_key, sizeof key) == 0)
+        return;
+    memcpy(G.state_key, key, sizeof key);
+    G.state_valid = 1;
 
     if (st->blend_enable && !(st->blend_sfactor == 1 && st->blend_dfactor == 0)) {
         glEnable(GL_BLEND);
@@ -2401,6 +2993,29 @@ static void set_state(const Nv2aVkState *st)
     }
 }
 
+/* [ring_off, ring_off + total) of the persistently mapped ring, made safe
+ * to write: crossing into a quarter waits for the fence set when the writes
+ * last left it (the GPU has read what was there), and leaving one sets its
+ * fence. The ring holds several frames, so the wait is normally none. */
+static void ring_reserve(size_t total)
+{
+    size_t q = GL_RING_SIZE / 4;
+    int last = (int)((G.ring_off + total - 1) / q);
+    while (G.ring_q != last) {
+        if (G.ring_fence[G.ring_q])
+            glDeleteSync(G.ring_fence[G.ring_q]);
+        G.ring_fence[G.ring_q] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        G.ring_q = (G.ring_q + 1) & 3;
+        if (G.ring_fence[G.ring_q]) {
+            while (glClientWaitSync(G.ring_fence[G.ring_q], GL_SYNC_FLUSH_COMMANDS_BIT,
+                                    1000000000ull) == GL_TIMEOUT_EXPIRED)
+                ;
+            glDeleteSync(G.ring_fence[G.ring_q]);
+            G.ring_fence[G.ring_q] = 0;
+        }
+    }
+}
+
 static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t stride,
                        uint32_t nv, const uint32_t *idx, uint32_t nidx)
 {
@@ -2408,6 +3023,7 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
     int i, stage_on[4], zq = 0;
     uint32_t w, h, levels;
     GLuint tex2d[4], texcube[4], samp[4];
+    uint64_t pt0 = perf_on() ? now_us() : 0, pt1 = 0;
 
     /* Textures first: one may be a surface drawn earlier this frame, which
      * is copied back before it is decoded. */
@@ -2473,9 +3089,19 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
         int consts = G.const_epoch != G.epoch || G.const_serial != nv2a_vsh_const_serial();
         size_t vbytes = (size_t)nv * stride, ibytes = (size_t)nidx * 4;
         uint8_t *m;
+        /* The same uniforms as the draw before, still in this lap of the
+         * ring: bound already, so neither copied nor bound again (a
+         * constant-buffer rebind each draw is driver work, and on nouveau
+         * GPU work too). Consecutive draws mostly share them. */
+        int ub_eq = G.last_ub_valid && memcmp(&ub, &G.last_ub, sizeof ub) == 0, same = 0;
+        if (pt0) {
+            pt1 = now_us();
+            G.pf_prep_us += pt1 - pt0;
+        }
         glBindBuffer(GL_ARRAY_BUFFER, G.ring);
         for (;;) {
-            o_c = (sizeof ub + a - 1) & ~(a - 1);
+            same = ub_eq && G.last_ub_lap == G.ring_lap;
+            o_c = same ? 0 : (sizeof ub + a - 1) & ~(a - 1);
             o_v = consts ? ((o_c + NV2A_VSH_CONSTANTS * 16 + a - 1) & ~(a - 1)) : o_c;
             o_i = (o_v + vbytes + 15) & ~(size_t)15;
             total = o_i + ibytes;
@@ -2483,25 +3109,45 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
                 return 1;
             if (G.ring_off + total <= GL_RING_SIZE)
                 break;
-            /* Wrap: new storage (draws in flight keep the old), and the
-             * vertex constants with it. */
-            glBufferData(GL_ARRAY_BUFFER, GL_RING_SIZE, NULL, GL_STREAM_DRAW);
+            /* Wrap, and the vertex constants with it: mapped per draw, new
+             * storage (draws in flight keep the old); persistently, back to
+             * the start, once the GPU is past it (ring_reserve). */
+            if (!G.ring_map)
+                glBufferData(GL_ARRAY_BUFFER, GL_RING_SIZE, NULL, GL_STREAM_DRAW);
             G.ring_off = 0;
+            G.ring_lap++;
             consts = 1;
         }
-        m = (uint8_t *)glMapBufferRange(GL_ARRAY_BUFFER, (GLintptr)G.ring_off, (GLsizeiptr)total,
-                                        GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT
-                                        | GL_MAP_INVALIDATE_RANGE_BIT);
-        if (!m)
-            return 1;
-        memcpy(m, &ub, sizeof ub);
+        if (G.ring_map) {
+            ring_reserve(total);
+            m = G.ring_map + G.ring_off;
+        } else {
+            m = (uint8_t *)glMapBufferRange(GL_ARRAY_BUFFER, (GLintptr)G.ring_off,
+                                            (GLsizeiptr)total, GL_MAP_WRITE_BIT
+                                            | GL_MAP_UNSYNCHRONIZED_BIT
+                                            | GL_MAP_INVALIDATE_RANGE_BIT);
+            if (!m)
+                return 1;
+        }
+        if (!same)
+            memcpy(m, &ub, sizeof ub);
         if (consts)
             memcpy(m + o_c, nv2a_vsh_constants(), NV2A_VSH_CONSTANTS * 16);
         memcpy(m + o_v, v, vbytes);
         memcpy(m + o_i, idx, ibytes);
-        glUnmapBuffer(GL_ARRAY_BUFFER);
-        glBindBufferRange(GL_UNIFORM_BUFFER, 0, G.ring, (GLintptr)G.ring_off, sizeof ub);
+        if (!G.ring_map)
+            glUnmapBuffer(GL_ARRAY_BUFFER);
+        if (same) {
+            G.pf_ub_same++;
+        } else {
+            glBindBufferRange(GL_UNIFORM_BUFFER, 0, G.ring, (GLintptr)G.ring_off, sizeof ub);
+            G.last_ub = ub;
+            G.last_ub_off = G.ring_off;
+            G.last_ub_lap = G.ring_lap;
+            G.last_ub_valid = 1;
+        }
         if (consts) {
+            G.pf_consts++;
             glBindBufferRange(GL_UNIFORM_BUFFER, 3, G.ring, (GLintptr)(G.ring_off + o_c),
                               NV2A_VSH_CONSTANTS * 16);
             G.const_epoch = G.epoch;
@@ -2540,15 +3186,16 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
                 G.b_fs = fs;
             }
         }
-        for (i = 0; i < 16; i++) {
-            if (i < p->ninputs) {
-                glEnableVertexAttribArray((GLuint)i);
-                glVertexAttribPointer((GLuint)i, 4, GL_FLOAT, GL_FALSE, (GLsizei)stride,
-                                      (const void *)(uintptr_t)(o_v + (size_t)i * 16));
-            } else {
-                glDisableVertexAttribArray((GLuint)i);
+        if (G.b_ninputs != p->ninputs) {
+            for (i = 0; i < 16; i++) {
+                if (i < p->ninputs)
+                    glEnableVertexAttribArray((GLuint)i);
+                else
+                    glDisableVertexAttribArray((GLuint)i);
             }
+            G.b_ninputs = p->ninputs;
         }
+        glBindVertexBuffer(0, G.ring, (GLintptr)o_v, (GLsizei)stride);
         set_state(st);
         zq = G.zpass && !(gl_exp() & 1);
         if (zq && G.nq == GL_MAX_QUERIES)
@@ -2563,6 +3210,8 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
         glEndQuery(GL_SAMPLES_PASSED);
         G.nq++;
     }
+    if (pt1)
+        G.pf_glcall_us += now_us() - pt1;
     mark_drawn(st);
     if (G.cur_cs)
         G.cur_cs->clear_only = 0;
@@ -2676,6 +3325,7 @@ void nv2a_vk_clear(const Nv2aVkState *st, uint32_t flags, uint32_t argb, uint32_
             surf_settle(c);
         }
     }
+    G.state_valid = 0;                  /* masks below */
     if ((flags & 0xF0) && G.cur_cs) {
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         glClearColor((float)((argb >> 16) & 0xFF) / 255.0f, (float)((argb >> 8) & 0xFF) / 255.0f,
@@ -3031,6 +3681,7 @@ void nv2a_vk_present_queued(void)
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    G.state_valid = 0;
     glViewport(0, 0, ww, wh);
     glClearColor(0, 0, 0, 1);
     glClear(GL_COLOR_BUFFER_BIT);

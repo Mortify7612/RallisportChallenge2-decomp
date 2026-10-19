@@ -26,6 +26,7 @@
 #include <stddef.h>   /* ptrdiff_t */
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef XBOX_CONTIG_BASE
 #define XBOX_CONTIG_BASE 0x80000000u   /* physical P is at this + P */
@@ -272,7 +273,21 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 
-    words = pb_walk(start_va, end_va, 0, &jumps, &unknown, &jump_to);
+    {
+        /* RECOMP_PERF: the executor's whole time (nv2a_pb_exec.c). */
+        extern uint64_t nv2a_pb_walk_ns;
+        extern int nv2a_pb_perf_on(void);
+        struct timespec a, b;
+        int timed = nv2a_pb_perf_on();
+        if (timed)
+            clock_gettime(CLOCK_MONOTONIC, &a);
+        words = pb_walk(start_va, end_va, 0, &jumps, &unknown, &jump_to);
+        if (timed) {
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            nv2a_pb_walk_ns += (uint64_t)(b.tv_sec - a.tv_sec) * 1000000000u
+                             + (uint64_t)b.tv_nsec - (uint64_t)a.tv_nsec;
+        }
+    }
 
     s_tot_words += words;
     s_tot_unknown += unknown;

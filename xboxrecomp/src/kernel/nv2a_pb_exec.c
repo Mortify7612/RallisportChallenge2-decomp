@@ -3209,6 +3209,44 @@ static void vk_draw_batch(const Nv2aVshOutput *v, uint32_t n, Nv2aVkState *st)
  * and lets the indices share vertices; otherwise one vertex per index. */
 static uint32_t k_or_1(uint32_t kk) { return kk ? kk : 1; }
 
+/* RECOMP_PERF (on by default on the Switch): where a GPU-program batch's
+ * time goes before the renderer has it, in ns -- fetching the vertices,
+ * making the triangle list, gathering the state, the renderer's draw --
+ * summed for nv2a_gl.c's report (nv2a_pb_perf_take). */
+static uint64_t s_pf[5];
+static int pb_perf(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PERF");
+#if defined(__SWITCH__)
+        on = !(e && strcmp(e, "0") == 0);
+#else
+        on = e && strcmp(e, "0") != 0;
+#endif
+    }
+    return on;
+}
+
+static uint64_t pb_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t nv2a_pb_walk_ns;            /* nv2a_pb_scan.c: every pb_walk */
+
+int nv2a_pb_perf_on(void) { return pb_perf(); }
+
+void nv2a_pb_perf_take(uint64_t out[5])
+{
+    s_pf[4] = nv2a_pb_walk_ns;
+    nv2a_pb_walk_ns = 0;
+    memcpy(out, s_pf, sizeof s_pf);
+    memset(s_pf, 0, sizeof s_pf);
+}
+
 static int vk_program_batch(void)
 {
     static float *vin;
@@ -3217,8 +3255,11 @@ static int vk_program_batch(void)
     int got;
     Nv2aVkState st;
 
+    uint64_t t0, t1;
+
     if (!nv2a_vk_active())
         return 0;
+    t0 = pb_perf() ? pb_ns() : 0;
     h = nv2a_vsh_program_hash();
     got = nv2a_vk_program(h, ins);
     if (got < 0)
@@ -3272,10 +3313,20 @@ static int vk_program_batch(void)
                 fprintf(stderr, "[FETCHCHK] %lu batches, %lu mismatches\n", batches, bad);
         }
     }
+    if (t0) {
+        t1 = pb_ns();
+        s_pf[0] += t1 - t0;
+        t0 = t1;
+    }
     k = vk_tri_list(n);
     if (ranged)
         for (i = 0; i < k; i++)
             s_vk_idx[i] = s_gpu.idx[s_vk_idx[i]] - lo;
+    if (t0) {
+        t1 = pb_ns();
+        s_pf[1] += t1 - t0;
+        t0 = t1;
+    }
     s_gpu.batches_program++;
     s_gpu.verts_program += n;
     if (!k)
@@ -3312,8 +3363,15 @@ static int vk_program_batch(void)
         }
     }
     vk_state(&st);
+    if (t0) {
+        t1 = pb_ns();
+        s_pf[2] += t1 - t0;
+        t0 = t1;
+    }
     if (!nv2a_vk_draw_program(&st, h, vin, nv, s_vk_idx, k))
         return 0;                       /* still compiling: the CPU path draws it */
+    if (t0)
+        s_pf[3] += pb_ns() - t0;
     s_gpu.tris_drawn += k / 3;
     s_gpu.xf_drawn += k / 3;
     note_drawn();

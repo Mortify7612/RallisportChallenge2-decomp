@@ -27,6 +27,21 @@ layout(location = 0) out vec4 o_color;
  * compiler then drops every branch and loop the setup does not use -- the
  * register file R[] stops being indexed at run time, which is what made
  * this shader most of the GPU time at higher resolutions. */
+/* The specialised build may also say, for the preprocessor, how many
+ * combiner stages run (SP_NST) and which texture stages fetch (SP_TEX0-3),
+ * so the code of the others never reaches the compiler: Mesa inlines every
+ * stage before folding the unused ones away. Without them, everything is
+ * kept. */
+#ifndef SP_NST
+#define SP_NST 8
+#endif
+#ifndef SP_TEX0
+#define SP_TEX0 1
+#define SP_TEX1 1
+#define SP_TEX2 1
+#define SP_TEX3 1
+#endif
+
 #ifdef NV2A_SPEC
 #define K_MISC   uvec4(SP_MISC.x, SP_MISC.y, u.misc.z, SP_MISC.w)
 #define K_MISC2  SP_MISC2
@@ -300,10 +315,27 @@ void main()
         TC[3] = vec4(gl_PointCoord, 1.0, 1.0);
     T[0] = T[1] = T[2] = T[3] = vec4(0.0);
     D[0] = D[1] = D[2] = D[3] = 0.0;
+    /* A stage that does not fetch (mode 0) reads (0, 0, 0, 1). */
+#if SP_TEX0
     T[0] = stage_fetch(0u, t2d[0], tcube[0]);
+#else
+    T[0] = vec4(0.0, 0.0, 0.0, 1.0);
+#endif
+#if SP_TEX1
     T[1] = stage_fetch(1u, t2d[1], tcube[1]);
+#else
+    T[1] = vec4(0.0, 0.0, 0.0, 1.0);
+#endif
+#if SP_TEX2
     T[2] = stage_fetch(2u, t2d[2], tcube[2]);
+#else
+    T[2] = vec4(0.0, 0.0, 0.0, 1.0);
+#endif
+#if SP_TEX3
     T[3] = stage_fetch(3u, t2d[3], tcube[3]);
+#else
+    T[3] = vec4(0.0, 0.0, 0.0, 1.0);
+#endif
     vec4 t0 = T[0], t1 = T[1], t2 = T[2], t3 = T[3];
     vec4 outc;
 
@@ -324,14 +356,30 @@ void main()
         R[12].a = (K_MISC.w & 0x1Fu) != 0u ? t0.a : 1.0;
 
 #ifdef NV2A_SPEC
+#if SP_NST > 0
         if (n > 0u) rc_stage(0u, flags);
+#endif
+#if SP_NST > 1
         if (n > 1u) rc_stage(1u, flags);
+#endif
+#if SP_NST > 2
         if (n > 2u) rc_stage(2u, flags);
+#endif
+#if SP_NST > 3
         if (n > 3u) rc_stage(3u, flags);
+#endif
+#if SP_NST > 4
         if (n > 4u) rc_stage(4u, flags);
+#endif
+#if SP_NST > 5
         if (n > 5u) rc_stage(5u, flags);
+#endif
+#if SP_NST > 6
         if (n > 6u) rc_stage(6u, flags);
+#endif
+#if SP_NST > 7
         if (n > 7u) rc_stage(7u, flags);
+#endif
 #else
         for (uint s = 0u; s < n; s++)
             rc_stage(s, flags);
