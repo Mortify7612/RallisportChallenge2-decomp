@@ -8,7 +8,12 @@ A call that returns nothing and passes no pointer (or only a buffer offset
 dressed as one: glDrawElements' indices, glVertexAttribPointer's pointer)
 is copied into the queue and the caller goes on; anything else -- a result
 to return, memory to read or write -- waits for the GL thread to reach it
-and make it (glq_call). The queue itself is in nv2a_gl.c (glq_*)."""
+and make it (glq_call). The queue itself is in nv2a_gl.c (glq_*).
+
+A call in COPY_IN passes one pointer only to be read, of a size known from
+its other arguments: that memory is copied into the queue after the call,
+up to GLQ_COPY_MAX bytes, and the caller goes on. The fence calls in
+BY_HAND (fences, glGenTextures) are written in nv2a_gl.c."""
 import os
 import re
 import sys
@@ -17,6 +22,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, '..', 'src', 'kernel', 'nv2a_gl.c')
 OUT = os.path.join(HERE, '..', 'src', 'kernel', 'nv2a_gl_queue.h')
 OFFSET_PTR = {('glDrawElements', 'indices'), ('glVertexAttribPointer', 'pointer')}
+COPY_IN = {
+    'glCompressedTexImage2D': ('data', 'imageSize'),
+    'glCompressedTexSubImage2D': ('data', 'imageSize'),
+    'glDeleteTextures': ('textures', 'n * sizeof(GLuint)'),
+    'glDeleteSamplers': ('samplers', 'count * sizeof(GLuint)'),
+    'glDeleteQueries': ('ids', 'n * sizeof(GLuint)'),
+}
+BY_HAND = {'glFenceSync', 'glClientWaitSync', 'glDeleteSync', 'glGenTextures'}
 
 
 def gl_fns(src):
@@ -46,6 +59,9 @@ def main():
            ' * and glcorearb.h: do not edit. Each GL call the renderer makes, queued',
            ' * for the GL thread (nv2a_gl.c, glq_*) when the queue is on. */', '']
     for name in names:
+        if name in BY_HAND:
+            out.append('/* %s: by hand in nv2a_gl.c (after this header). */\n' % name)
+            continue
         ret, args = protos[name]
         sig = ', '.join('%s %s' % (t, a) for t, a in args) or 'void'
         call = ', '.join(a for _, a in args)
@@ -53,6 +69,40 @@ def main():
         queued = ret == 'void' and not ptr
         fields = ''.join('    %s %s;\n' % (t, a) for t, a in args)
         unpack = ', '.join('q->%s' % a for _, a in args)
+        if name in COPY_IN and ret == 'void':
+            ptr_arg, size_expr = COPY_IN[name]
+            others = [(t, a) for t, a in args if a != ptr_arg]
+            assert not any('*' in t for t, _ in others), name
+            fields_c = ''.join('    %s %s;\n' % (t, a) for t, a in others)
+            unpack_c = ', '.join('(const void *)(q + 1)' if a == ptr_arg else 'q->%s' % a
+                                 for _, a in args)
+            sets = ''.join('    q->%s = %s;\n' % (a, a) for _, a in others)
+            out.append('struct qa_%s {\n%s    size_t bytes_;\n};' % (name, fields_c))
+            out.append('static void qrun_%s(const void *p)\n{\n'
+                       '    const struct qa_%s *q = (const struct qa_%s *)p;\n'
+                       '    p_%s(%s);\n}' % (name, name, name, name, unpack_c))
+            sig = ', '.join('%s %s' % (t, a) for t, a in args)
+            call = ', '.join(a for _, a in args)
+            # Too big for the queue (or NULL): made on the GL thread while
+            # the caller waits, as for any call with a pointer.
+            out.append('struct qs_%s {\n%s    int unused_;\n};' % (name, fields))
+            out.append('static void qsrun_%s(void *p)\n{\n'
+                       '    struct qs_%s *q = (struct qs_%s *)p;\n'
+                       '    p_%s(%s);\n}' % (name, name, name, name, unpack))
+            body = ''.join('    s.%s = %s;\n' % (a, a) for _, a in args)
+            out.append('static inline void APIENTRY q_%s(%s)\n{\n    struct qa_%s *q;\n'
+                       '    size_t bytes = (size_t)(%s);\n'
+                       '    if (glq_direct()) {\n        p_%s(%s);\n        return;\n    }\n'
+                       '    if (!%s || bytes > GLQ_COPY_MAX) {\n        struct qs_%s s;\n%s'
+                       '        glq_call(qsrun_%s, &s, "%s");\n        return;\n    }\n'
+                       '    q = (struct qa_%s *)glq_alloc(qrun_%s, sizeof *q + bytes);\n%s'
+                       '    q->bytes_ = bytes;\n'
+                       '    memcpy(q + 1, %s, bytes);\n'
+                       '    glq_commit();\n}' % (name, sig, name, size_expr, name, call, ptr_arg,
+                                                  name, body.replace('    s.', '        s.'),
+                                                  name, name, name, name, sets, ptr_arg))
+            out.append('#undef %s\n#define %s q_%s\n' % (name, name, name))
+            continue
         if queued:
             out.append('struct qa_%s {\n%s    int unused_;\n};' % (name, fields))
             out.append('static void qrun_%s(const void *p)\n{\n'

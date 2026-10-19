@@ -634,54 +634,47 @@ static inline void APIENTRY q_glReadBuffer(GLenum src)
 #undef glReadBuffer
 #define glReadBuffer q_glReadBuffer
 
-struct qs_glGenTextures {
-    GLsizei n;
-    GLuint * textures;
-    int unused_;
-};
-static void qrun_glGenTextures(void *p)
-{
-    struct qs_glGenTextures *q = (struct qs_glGenTextures *)p;
-    (void)q;
-    p_glGenTextures(q->n, q->textures);
-}
-static inline void APIENTRY q_glGenTextures(GLsizei n, GLuint * textures)
-{
-    if (glq_direct()) {
-        p_glGenTextures(n, textures);
-        return;
-    }
-    struct qs_glGenTextures q;
-    memset(&q, 0, sizeof q);
-    q.n = n;
-    q.textures = textures;
-    glq_call(qrun_glGenTextures, &q, "glGenTextures");
-}
-#undef glGenTextures
-#define glGenTextures q_glGenTextures
+/* glGenTextures: by hand in nv2a_gl.c (after this header). */
 
+struct qa_glDeleteTextures {
+    GLsizei n;
+    size_t bytes_;
+};
+static void qrun_glDeleteTextures(const void *p)
+{
+    const struct qa_glDeleteTextures *q = (const struct qa_glDeleteTextures *)p;
+    p_glDeleteTextures(q->n, (const void *)(q + 1));
+}
 struct qs_glDeleteTextures {
     GLsizei n;
     const GLuint * textures;
     int unused_;
 };
-static void qrun_glDeleteTextures(void *p)
+static void qsrun_glDeleteTextures(void *p)
 {
     struct qs_glDeleteTextures *q = (struct qs_glDeleteTextures *)p;
-    (void)q;
     p_glDeleteTextures(q->n, q->textures);
 }
 static inline void APIENTRY q_glDeleteTextures(GLsizei n, const GLuint * textures)
 {
+    struct qa_glDeleteTextures *q;
+    size_t bytes = (size_t)(n * sizeof(GLuint));
     if (glq_direct()) {
         p_glDeleteTextures(n, textures);
         return;
     }
-    struct qs_glDeleteTextures q;
-    memset(&q, 0, sizeof q);
-    q.n = n;
-    q.textures = textures;
-    glq_call(qrun_glDeleteTextures, &q, "glDeleteTextures");
+    if (!textures || bytes > GLQ_COPY_MAX) {
+        struct qs_glDeleteTextures s;
+        s.n = n;
+        s.textures = textures;
+        glq_call(qsrun_glDeleteTextures, &s, "glDeleteTextures");
+        return;
+    }
+    q = (struct qa_glDeleteTextures *)glq_alloc(qrun_glDeleteTextures, sizeof *q + bytes);
+    q->n = n;
+    q->bytes_ = bytes;
+    memcpy(q + 1, textures, bytes);
+    glq_commit();
 }
 #undef glDeleteTextures
 #define glDeleteTextures q_glDeleteTextures
@@ -2150,6 +2143,21 @@ static inline GLuint APIENTRY q_glCreateShaderProgramv(GLenum type, GLsizei coun
 #undef glCreateShaderProgramv
 #define glCreateShaderProgramv q_glCreateShaderProgramv
 
+struct qa_glCompressedTexImage2D {
+    GLenum target;
+    GLint level;
+    GLenum internalformat;
+    GLsizei width;
+    GLsizei height;
+    GLint border;
+    GLsizei imageSize;
+    size_t bytes_;
+};
+static void qrun_glCompressedTexImage2D(const void *p)
+{
+    const struct qa_glCompressedTexImage2D *q = (const struct qa_glCompressedTexImage2D *)p;
+    p_glCompressedTexImage2D(q->target, q->level, q->internalformat, q->width, q->height, q->border, q->imageSize, (const void *)(q + 1));
+}
 struct qs_glCompressedTexImage2D {
     GLenum target;
     GLint level;
@@ -2161,29 +2169,43 @@ struct qs_glCompressedTexImage2D {
     const void * data;
     int unused_;
 };
-static void qrun_glCompressedTexImage2D(void *p)
+static void qsrun_glCompressedTexImage2D(void *p)
 {
     struct qs_glCompressedTexImage2D *q = (struct qs_glCompressedTexImage2D *)p;
-    (void)q;
     p_glCompressedTexImage2D(q->target, q->level, q->internalformat, q->width, q->height, q->border, q->imageSize, q->data);
 }
 static inline void APIENTRY q_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const void * data)
 {
+    struct qa_glCompressedTexImage2D *q;
+    size_t bytes = (size_t)(imageSize);
     if (glq_direct()) {
         p_glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
         return;
     }
-    struct qs_glCompressedTexImage2D q;
-    memset(&q, 0, sizeof q);
-    q.target = target;
-    q.level = level;
-    q.internalformat = internalformat;
-    q.width = width;
-    q.height = height;
-    q.border = border;
-    q.imageSize = imageSize;
-    q.data = data;
-    glq_call(qrun_glCompressedTexImage2D, &q, "glCompressedTexImage2D");
+    if (!data || bytes > GLQ_COPY_MAX) {
+        struct qs_glCompressedTexImage2D s;
+        s.target = target;
+        s.level = level;
+        s.internalformat = internalformat;
+        s.width = width;
+        s.height = height;
+        s.border = border;
+        s.imageSize = imageSize;
+        s.data = data;
+        glq_call(qsrun_glCompressedTexImage2D, &s, "glCompressedTexImage2D");
+        return;
+    }
+    q = (struct qa_glCompressedTexImage2D *)glq_alloc(qrun_glCompressedTexImage2D, sizeof *q + bytes);
+    q->target = target;
+    q->level = level;
+    q->internalformat = internalformat;
+    q->width = width;
+    q->height = height;
+    q->border = border;
+    q->imageSize = imageSize;
+    q->bytes_ = bytes;
+    memcpy(q + 1, data, bytes);
+    glq_commit();
 }
 #undef glCompressedTexImage2D
 #define glCompressedTexImage2D q_glCompressedTexImage2D
@@ -2512,83 +2534,11 @@ static inline void APIENTRY q_glCopyImageSubData(GLuint srcName, GLenum srcTarge
 #undef glCopyImageSubData
 #define glCopyImageSubData q_glCopyImageSubData
 
-struct qs_glFenceSync {
-    GLenum condition;
-    GLbitfield flags;
-    GLsync r_;
-    int unused_;
-};
-static void qrun_glFenceSync(void *p)
-{
-    struct qs_glFenceSync *q = (struct qs_glFenceSync *)p;
-    (void)q;
-    q->r_ = p_glFenceSync(q->condition, q->flags);
-}
-static inline GLsync APIENTRY q_glFenceSync(GLenum condition, GLbitfield flags)
-{
-    if (glq_direct())
-        return p_glFenceSync(condition, flags);
-    struct qs_glFenceSync q;
-    memset(&q, 0, sizeof q);
-    q.condition = condition;
-    q.flags = flags;
-    glq_call(qrun_glFenceSync, &q, "glFenceSync");
-    return q.r_;
-}
-#undef glFenceSync
-#define glFenceSync q_glFenceSync
+/* glFenceSync: by hand in nv2a_gl.c (after this header). */
 
-struct qs_glClientWaitSync {
-    GLsync sync;
-    GLbitfield flags;
-    GLuint64 timeout;
-    GLenum r_;
-    int unused_;
-};
-static void qrun_glClientWaitSync(void *p)
-{
-    struct qs_glClientWaitSync *q = (struct qs_glClientWaitSync *)p;
-    (void)q;
-    q->r_ = p_glClientWaitSync(q->sync, q->flags, q->timeout);
-}
-static inline GLenum APIENTRY q_glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout)
-{
-    if (glq_direct())
-        return p_glClientWaitSync(sync, flags, timeout);
-    struct qs_glClientWaitSync q;
-    memset(&q, 0, sizeof q);
-    q.sync = sync;
-    q.flags = flags;
-    q.timeout = timeout;
-    glq_call(qrun_glClientWaitSync, &q, "glClientWaitSync");
-    return q.r_;
-}
-#undef glClientWaitSync
-#define glClientWaitSync q_glClientWaitSync
+/* glClientWaitSync: by hand in nv2a_gl.c (after this header). */
 
-struct qa_glDeleteSync {
-    GLsync sync;
-    int unused_;
-};
-static void qrun_glDeleteSync(const void *p)
-{
-    const struct qa_glDeleteSync *q = (const struct qa_glDeleteSync *)p;
-    (void)q;
-    p_glDeleteSync(q->sync);
-}
-static inline void APIENTRY q_glDeleteSync(GLsync sync)
-{
-    struct qa_glDeleteSync *q;
-    if (glq_direct()) {
-        p_glDeleteSync(sync);
-        return;
-    }
-    q = (struct qa_glDeleteSync *)glq_alloc(qrun_glDeleteSync, sizeof *q);
-    q->sync = sync;
-    glq_commit();
-}
-#undef glDeleteSync
-#define glDeleteSync q_glDeleteSync
+/* glDeleteSync: by hand in nv2a_gl.c (after this header). */
 
 struct qa_glFlush {
     int unused_;

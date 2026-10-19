@@ -138,6 +138,22 @@ every busy-wait).
   stands in for `kill -QUIT` thread dumps.
 - `RSC2_FIBER_TRACE=1` traces fiber switches and first runs a coroutine
   self-test.
+- **Sampling profiler** (`RSC2_NX_PROF=1`, `platform/switch/nx_prof.c`):
+  - **Sampling:** a thread of its own pauses the push-buffer executor about
+    1000 times a second (`RSC2_NX_PROF_US`), reads where it is, and walks
+    its frame records.
+  - **Output:** every 5 s (`RSC2_NX_PROF_SECS`) the hottest addresses go
+    to the log.
+  - **More threads:** `RSC2_NX_PROF_THREADS=pb,gl` adds the GL queue's
+    thread.
+  - **Naming them:** `rsc2/switch/nx_prof.py work/nxlink.log --list`
+    shows the reports. `--skip N --reports M` picks the race, and the
+    script names the functions from `rsc2.elf`, with self and total
+    shares and the callers of the hottest.
+  - **Use the Switch's own profile:** the CPU, nouveau and the GL queue
+    put the time somewhere else than on a PC. It found the executor's
+    log lines (13% over nxlink) and the GL calls that waited for the GL
+    thread.
 
 ### Other gaps
 
@@ -149,7 +165,8 @@ every busy-wait).
   address through the GOT, got `coro_switch` instead, and every new fiber
   spun there forever.
 - **Diagnostics:** the Linux signal-based ones (`kill -QUIT` thread dumps,
-  the sampling profiler) are left out.
+  the signal-driven sampling) are left out; `RSC2_NX_PROF` (above)
+  samples instead.
 
 ## Emulator (Eden)
 

@@ -3334,8 +3334,21 @@ static int vk_program_batch(void)
                     if (a->type > 6 || !repack || repack_used + (size_t)ts * nv > repack_cap)
                         break;
                     dst = repack + repack_used;
-                    for (v = 0; v < nv; v++)
-                        memcpy(dst + (size_t)v * ts, ra[i].src + (size_t)v * a->stride, elem);
+                    /* A memcpy call per vertex of a few bytes was 3% of
+                     * the Switch executor's race; a size the compiler knows
+                     * becomes a load and a store. */
+#define REPACK(SZ) for (v = 0; v < nv; v++) \
+                        memcpy(dst + (size_t)v * ts, ra[i].src + (size_t)v * a->stride, SZ)
+                    switch (elem) {
+                    case 2:  REPACK(2);  break;
+                    case 4:  REPACK(4);  break;
+                    case 6:  REPACK(6);  break;
+                    case 8:  REPACK(8);  break;
+                    case 12: REPACK(12); break;
+                    case 16: REPACK(16); break;
+                    default: REPACK(elem); break;
+                    }
+#undef REPACK
                     repack_used += ((size_t)ts * nv + 15) & ~(size_t)15;
                     ra[i].src = dst;
                     ra[i].stride = ts;
@@ -4015,7 +4028,7 @@ static void draw_primitive(void)
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
     s_gpu.draws++;
-    if ((s_gpu.draws % 200) == 0)
+    if ((s_gpu.draws % 200) == 0 && s_gpu.draws <= 2000)   /* is it drawing at all */
         fprintf(stderr, "  [GPU] draw #%u\n", s_gpu.draws);
     s_gpu.verts += s_gpu.idx_count;
 

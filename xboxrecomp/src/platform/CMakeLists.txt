@@ -32,7 +32,7 @@ else()
     if(NINTENDO_SWITCH)
         # Switch homebrew (libnx): memory mapping, the fault path and the
         # POSIX headers newlib lacks (sys/mman.h, dlfcn.h, ...).
-        target_sources(platform PRIVATE switch/nx_host.c switch/nx_memcheck.c)
+        target_sources(platform PRIVATE switch/nx_host.c switch/nx_memcheck.c switch/nx_prof.c)
         target_include_directories(platform SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/switch/include)
     endif()
     if(NOT ANDROID AND NOT APPLE)

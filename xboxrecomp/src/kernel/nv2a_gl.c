@@ -506,6 +506,7 @@ static struct {
  * about 25 us a draw, most of the executor's time in a race, while the
  * game's thread waited on the executor. */
 #define GLQ_SIZE (4u << 20)
+#define GLQ_COPY_MAX (1u << 20)        /* data a queued call may carry (a DXT texture level) */
 typedef struct { void (*run)(const void *); uint32_t size, pad; } GlqHead;
 static struct {
     volatile int on;
@@ -604,6 +605,12 @@ static DWORD WINAPI glq_thread(LPVOID unused)
     unsigned spins = 0;
     (void)unused;
     t_gl_direct = 1;
+#if defined(__SWITCH__)
+    {   /* RSC2_NX_PROF_THREADS=gl: the sampling profiler (nx_prof.c) */
+        extern void nx_prof_register(const char *name);
+        nx_prof_register("gl");
+    }
+#endif
     if (SDL_GL_MakeCurrent(G.win, G.ctx) != 0) {
         fprintf(stderr, "[GL] GL thread: make current failed (%s)\n", SDL_GetError());
         __atomic_store_n(&s_glq_ready, -1, __ATOMIC_RELEASE);
@@ -637,6 +644,152 @@ static DWORD WINAPI glq_thread(LPVOID unused)
 }
 
 #include "nv2a_gl_queue.h"
+
+/* The calls the generator leaves to this file: ones that hand back
+ * something the caller keeps, made so the caller need not wait.
+ *
+ * Fences: glFenceSync gives a placeholder from Qf at once and the GL thread
+ * puts the real fence in it; the wait and the delete look through it. Made
+ * at once it waited for the GL thread to catch up, 1.6% of the Switch
+ * executor's time in a race. A fence made on a thread with its own context
+ * (direct) is a real one, and the wait and delete take either. */
+#define GLQ_FENCES 64
+typedef struct { GLsync s; volatile int used; } GlqFence;
+static GlqFence Qf[GLQ_FENCES];
+
+static GlqFence *qf_box(GLsync f)
+{
+    uintptr_t a = (uintptr_t)f;
+    return a >= (uintptr_t)&Qf[0] && a < (uintptr_t)&Qf[GLQ_FENCES] ? (GlqFence *)f : NULL;
+}
+
+struct qa_fence { GlqFence *box; GLenum cond; GLbitfield flags; };
+static void qrun_fence(const void *p)
+{
+    const struct qa_fence *q = (const struct qa_fence *)p;
+    q->box->s = p_glFenceSync(q->cond, q->flags);
+}
+
+struct qs_fence { GLenum cond; GLbitfield flags; GLsync r_; };
+static void qsrun_fence(void *p)
+{
+    struct qs_fence *q = (struct qs_fence *)p;
+    q->r_ = p_glFenceSync(q->cond, q->flags);
+}
+
+static inline GLsync APIENTRY q_glFenceSync(GLenum condition, GLbitfield flags)
+{
+    struct qa_fence *q;
+    int i;
+    if (glq_direct())
+        return p_glFenceSync(condition, flags);
+    for (i = 0; i < GLQ_FENCES && __atomic_load_n(&Qf[i].used, __ATOMIC_ACQUIRE); i++)
+        ;
+    if (i == GLQ_FENCES) {              /* none free: a real one, waited for */
+        struct qs_fence s = { condition, flags, 0 };
+        glq_call(qsrun_fence, &s, "glFenceSync");
+        return s.r_;
+    }
+    Qf[i].used = 1;
+    Qf[i].s = 0;
+    q = (struct qa_fence *)glq_alloc(qrun_fence, sizeof *q);
+    q->box = &Qf[i];
+    q->cond = condition;
+    q->flags = flags;
+    glq_commit();
+    return (GLsync)&Qf[i];
+}
+
+struct qs_wait { GLsync f; GLbitfield flags; GLuint64 timeout; GLenum r_; };
+static void qsrun_wait(void *p)
+{
+    struct qs_wait *q = (struct qs_wait *)p;
+    GlqFence *b = qf_box(q->f);
+    q->r_ = p_glClientWaitSync(b ? b->s : q->f, q->flags, q->timeout);
+}
+
+static inline GLenum APIENTRY q_glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout)
+{
+    struct qs_wait s;
+    if (glq_direct()) {
+        GlqFence *b = qf_box(sync);
+        return p_glClientWaitSync(b ? b->s : sync, flags, timeout);
+    }
+    s.f = sync;
+    s.flags = flags;
+    s.timeout = timeout;
+    s.r_ = 0;
+    glq_call(qsrun_wait, &s, "glClientWaitSync");
+    return s.r_;
+}
+
+struct qa_delsync { GLsync f; };
+static void qrun_delsync(const void *p)
+{
+    GLsync f = ((const struct qa_delsync *)p)->f;
+    GlqFence *b = qf_box(f);
+    p_glDeleteSync(b ? b->s : f);
+    if (b) {
+        b->s = 0;
+        __atomic_store_n(&b->used, 0, __ATOMIC_RELEASE);
+    }
+}
+
+static inline void APIENTRY q_glDeleteSync(GLsync sync)
+{
+    struct qa_delsync *q;
+    if (glq_direct()) {
+        struct qa_delsync d = { sync };
+        qrun_delsync(&d);
+        return;
+    }
+    q = (struct qa_delsync *)glq_alloc(qrun_delsync, sizeof *q);
+    q->f = sync;
+    glq_commit();
+}
+
+/* Texture names: 32 at a time into a pool, so making a texture does not
+ * wait for the GL thread each time (glDeleteTextures is queued, with its
+ * names copied). */
+struct qs_gentex { GLsizei n; GLuint *t; };
+static void qsrun_gentex(void *p)
+{
+    struct qs_gentex *q = (struct qs_gentex *)p;
+    p_glGenTextures(q->n, q->t);
+}
+
+static inline void APIENTRY q_glGenTextures(GLsizei n, GLuint *textures)
+{
+    static GLuint pool[32];
+    static int left;
+    struct qs_gentex s;
+    if (glq_direct()) {
+        p_glGenTextures(n, textures);
+        return;
+    }
+    if (n != 1) {
+        s.n = n;
+        s.t = textures;
+        glq_call(qsrun_gentex, &s, "glGenTextures");
+        return;
+    }
+    if (!left) {
+        s.n = 32;
+        s.t = pool;
+        glq_call(qsrun_gentex, &s, "glGenTextures");
+        left = 32;
+    }
+    *textures = pool[--left];
+}
+
+#undef glFenceSync
+#define glFenceSync q_glFenceSync
+#undef glClientWaitSync
+#define glClientWaitSync q_glClientWaitSync
+#undef glDeleteSync
+#define glDeleteSync q_glDeleteSync
+#undef glGenTextures
+#define glGenTextures q_glGenTextures
 
 static void qrun_swap(const void *p)
 {
