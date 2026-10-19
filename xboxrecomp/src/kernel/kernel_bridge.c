@@ -602,7 +602,7 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
 }
 
 static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
-                                  uint32_t ctx2, uint32_t stack_top)
+                                  uint32_t ctx2, uint32_t stack_top, int suspended)
 {
     struct bridge_thread_start *s = malloc(sizeof(*s));
     HANDLE th;
@@ -613,7 +613,7 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     s->obj = guest_thread_obj_new();
     obj = s->obj;
 
-    th = CreateThread(NULL, 0, bridge_thread_main, s, 0, NULL);
+    th = CreateThread(NULL, 0, bridge_thread_main, s, suspended ? CREATE_SUSPENDED : 0, NULL);
     if (!th) {
         free(s);
     } else {
@@ -647,6 +647,7 @@ static void bridge_PsCreateSystemThreadEx(void)
     uint32_t xbox_handle_ptr = STACK_ARG(0);
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
+    uint32_t create_suspended = STACK_ARG(7) & 0xFFu;
     uint32_t start_routine   = STACK_ARG(9);
     /* In SPAWN mode there is no privileged "first call": every thread is real,
      * so the entry can return. In INLINE mode the first call runs the game. */
@@ -728,11 +729,26 @@ static void bridge_PsCreateSystemThreadEx(void)
                     fflush(stderr);
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
-                    HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                    /* CreateSuspended: the thread waits for NtResumeThread.
+                     * Started at once, RSC2's movie worker (0x0034A350)
+                     * could run before its creator had made the two events
+                     * it waits on (0x0034A498, 0x0034A4A8) and wait on
+                     * whatever the heap held there -- a crash at the first
+                     * intro movie on the Switch, once the timing shifted.
+                     * RECOMP_THREAD_SUSPENDED=0 starts every thread at once,
+                     * as before. */
+                    static int honour = -1;
+                    HANDLE th;
+                    if (honour < 0) {
+                        const char *e = getenv("RECOMP_THREAD_SUSPENDED");
+                        honour = !e || strcmp(e, "0") != 0;
+                    }
+                    th = bridge_spawn_thread(fn, start_context1, start_context2, stack_top,
+                                             honour && create_suspended);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
-                            "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
-                            start_routine, start_context1, stack_top);
+                            "worker 0x%08X (ctx=0x%08X, stack top 0x%08X%s)\n",
+                            start_routine, start_context1, stack_top,
+                            honour && create_suspended ? ", suspended" : "");
                     fflush(stderr);
                     if (xbox_handle_ptr && th) {
                         bridge_write_handle(xbox_handle_ptr, th);
@@ -8075,7 +8091,7 @@ static void bridge_PsCreateSystemThread(void)
                     bridge_run_thread_inline(fn, start_context1, start_context2);
                 } else {
                     HANDLE th = bridge_spawn_thread(fn, start_context1,
-                                                    start_context2, stack_top);
+                                                    start_context2, stack_top, 0);
                     if (xbox_handle_ptr && th)
                         bridge_write_handle(xbox_handle_ptr, th);
                 }
