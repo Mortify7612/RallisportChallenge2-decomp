@@ -70,14 +70,25 @@
 #define PCRTC_INTR_0     0x600100u
 #define PCRTC_INTR_EN_0  0x600140u
 
+/* PGRAPH, for the notify a NO_OPERATION with a parameter raises (xemu's
+ * pgraph.c and nv2a_regs.h). */
+#define PG_PGRAPH        0x400000u
+#define PMC_INTR_PGRAPH  (1u << 12)
+#define PGRAPH_INTR      0x400100u
+#define PGRAPH_INTR_ERROR (1u << 20)
+#define PGRAPH_NSOURCE   0x400108u
+#define PGRAPH_INTR_EN   0x400140u
+#define PGRAPH_TRAPPED_ADDR 0x400704u
+#define PGRAPH_TRAPPED_DATA 0x400708u
+
 /* The NV2A's core clock, which PTIMER counts in before the numerator and
  * denominator scale it -- xemu's default for the retail PLL setting. */
 #define NV2A_CORE_HZ     233333324ull
 
 static int s_enabled;
 static int s_pfb;                       /* PFB page trapped too */
-static uint8_t s_store[4][PAGE];        /* backing for everything else */
-static volatile uint32_t s_pcrtc_intr, s_ptimer_intr;
+static uint8_t s_store[5][PAGE];        /* backing for everything else */
+static volatile uint32_t s_pcrtc_intr, s_ptimer_intr, s_pgraph_intr;
 static volatile uint32_t s_alarm, s_alarm_armed;
 static struct timespec s_t0;
 
@@ -88,6 +99,7 @@ static int page_index(uint32_t off)
     case PG_PTIMER: return 1;
     case PG_PCRTC:  return 2;
     case PG_PFB:    return s_pfb ? 3 : -1;
+    case PG_PGRAPH: return s_pfb ? 4 : -1;
     default:        return -1;
     }
 }
@@ -131,6 +143,7 @@ static uint32_t pmc_pending(void)
     uint32_t v = 0;
     if (s_pcrtc_intr & store_rd(PCRTC_INTR_EN_0))   v |= PMC_INTR_PCRTC;
     if (s_ptimer_intr & store_rd(PTIMER_INTR_EN_0)) v |= PMC_INTR_PTIMER;
+    if (s_pgraph_intr & store_rd(PGRAPH_INTR_EN))   v |= PMC_INTR_PGRAPH;
     return v;
 }
 
@@ -165,6 +178,7 @@ static uint64_t reg_read_model(void *dev, uint32_t off, int size)
     case PCRTC_INTR_0:   v = s_pcrtc_intr; break;
     case PTIMER_INTR_0:  v = s_ptimer_intr; break;
     case PTIMER_TIME_0:  v = ptimer_time0(); break;
+    case PGRAPH_INTR:    v = s_pgraph_intr; break;
     case PTIMER_TIME_1:  v = (uint32_t)((ptimer_clock() >> 27) & 0x1FFFFFFFull); break;
     default:             v = store_rd(off); break;
     }
@@ -208,6 +222,7 @@ static void reg_write(void *dev, uint32_t off, uint64_t val, int size)
     case PMC_INTR_0:     break;                              /* read-only */
     case PCRTC_INTR_0:   __atomic_and_fetch(&s_pcrtc_intr, ~v, __ATOMIC_SEQ_CST); break;
     case PTIMER_INTR_0:  __atomic_and_fetch(&s_ptimer_intr, ~v, __ATOMIC_SEQ_CST); break;
+    case PGRAPH_INTR:    __atomic_and_fetch(&s_pgraph_intr, ~v, __ATOMIC_SEQ_CST); break;
     case PFB_WBC:
         /* The flush is done the moment it is asked for. D3D's kick sets the
          * bit and spins until it clears; when the ack thread cleared it, the
@@ -217,13 +232,13 @@ static void reg_write(void *dev, uint32_t off, uint64_t val, int size)
          * holds the title back when it gets ahead, as on hardware. */
         store_wr(off, v & ~PFB_WBC_FLUSH);
         break;
-        /* Opt-in (RECOMP_NV2A_PFB_ASYNC), because it is not yet safe:
-         * RalliSport Challenge 2's D3D patches methods into pushbuffer space
-         * the GPU has not reached (0x00368002) and then waits for a
-         * semaphore those methods release; with the flush no longer pacing
-         * the title the release never came and it hung on the first race
-         * load. Worth ~2x when it works -- the game and the software GPU
-         * would overlap. */
+        /* Opt-in (RECOMP_NV2A_PFB_ASYNC). RalliSport Challenge 2's D3D,
+         * once it is ahead of the GPU and short of push-buffer room,
+         * patches a NO_OPERATION with a parameter into space the GPU has
+         * not reached (0x00368002) and waits for the notify interrupt it
+         * raises (xbox_Nv2aIrqNotify); it also polls PGRAPH PATT_COLOR0,
+         * its progress counter, which the executor writes. Without those
+         * it hung on the first race load. */
     case PTIMER_ALARM_0:
         store_wr(off, v);
         s_alarm = v;
@@ -267,6 +282,46 @@ uint32_t xbox_Nv2aIrqPeek(uint32_t off)
     return (uint32_t)reg_read(NULL, off, 4);
 }
 
+/* A PGRAPH register the executor sets (PATT_COLOR0): into the model's
+ * page when it serves PGRAPH, else 0 (the caller writes plain memory). */
+int xbox_Nv2aIrqPoke(uint32_t off, uint32_t v)
+{
+    if (!s_enabled || page_index(off) < 0)
+        return 0;
+    store_wr(off, v);
+    return 1;
+}
+
+/* The executor met a NO_OPERATION whose parameter is not 0: on the NV2A a
+ * notify, trapped for the CPU -- PGRAPH_INTR's ERROR with NSOURCE
+ * NOTIFICATION and the method and parameter in TRAPPED_ADDR / DATA_LOW --
+ * and the GPU waits until the ISR clears it (xemu's pgraph.c). Here the
+ * executor waits, up to half a second. 0 when PGRAPH is not modelled
+ * (RECOMP_NV2A_PFB_ASYNC). */
+int xbox_Nv2aIrqNotify(uint32_t subch, uint32_t method, uint32_t param)
+{
+    struct timespec t0, now;
+    if (!s_enabled || !s_pfb)
+        return 0;
+    store_wr(PGRAPH_TRAPPED_ADDR, (method & 0x1FFFu) | ((subch & 7u) << 16));
+    store_wr(PGRAPH_TRAPPED_DATA, param);
+    store_wr(PGRAPH_NSOURCE, 1u);
+    __atomic_or_fetch(&s_pgraph_intr, PGRAPH_INTR_ERROR, __ATOMIC_SEQ_CST);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (__atomic_load_n(&s_pgraph_intr, __ATOMIC_SEQ_CST) & PGRAPH_INTR_ERROR) {
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if ((now.tv_sec - t0.tv_sec) * 1000 + (now.tv_nsec - t0.tv_nsec) / 1000000 > 500) {
+            static int shown;
+            if (shown++ < 5)
+                fprintf(stderr, "  [NV2A-IRQ] notify %08X not acknowledged in 500 ms\n", param);
+            __atomic_and_fetch(&s_pgraph_intr, ~PGRAPH_INTR_ERROR, __ATOMIC_SEQ_CST);
+            break;
+        }
+        Sleep(0);
+    }
+    return 1;
+}
+
 void xbox_Nv2aIrqRaiseVblank(void)
 {
     __atomic_or_fetch(&s_pcrtc_intr, 1u, __ATOMIC_SEQ_CST);
@@ -288,14 +343,14 @@ int xbox_Nv2aIrqTick(void)
 
 void xbox_Nv2aIrqInit(void)
 {
-    static const uint32_t pages[4] = { PG_PMC, PG_PTIMER, PG_PCRTC, PG_PFB };
+    static const uint32_t pages[5] = { PG_PMC, PG_PTIMER, PG_PCRTC, PG_PFB, PG_PGRAPH };
     ptrdiff_t off = xbox_GetMemoryOffset();
     int i, npages;
 
     if (s_enabled || !getenv("RECOMP_NV2A_IRQ"))
         return;
-    s_pfb = getenv("RECOMP_NV2A_PFB_ASYNC") != NULL;
-    npages = s_pfb ? 4 : 3;
+    s_pfb = getenv("RECOMP_NV2A_PFB_ASYNC") && strcmp(getenv("RECOMP_NV2A_PFB_ASYNC"), "0") != 0;
+    npages = s_pfb ? 5 : 3;
     if (!off) {
         fprintf(stderr, "  NV2A-IRQ: guest memory not mapped yet; disabled\n");
         return;
@@ -323,5 +378,5 @@ void xbox_Nv2aIrqInit(void)
         }
     }
     fprintf(stderr, "  NV2A-IRQ: PMC, PTIMER and PCRTC interrupt registers modelled%s\n",
-            npages > 3 ? " (and the PFB flush)" : "");
+            npages > 3 ? " (and the PFB flush and PGRAPH's notify)" : "");
 }

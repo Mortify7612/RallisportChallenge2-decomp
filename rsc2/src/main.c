@@ -1069,6 +1069,11 @@ static void switch_setup(int argc, char **argv)
     setenv("RSC2_LAUNCHER", "0", 0);
     setenv("RECOMP_FULLSCREEN", "1", 0);
     setenv("RECOMP_WIDESCREEN", "1", 0);
+    /* The PFB flush done at once, and PGRAPH's notify and progress counter
+     * modelled (nv2a_irq.c), so the game builds the next frame while the
+     * executor draws this one: the race 28 -> 38 fps in Eden. =0 in
+     * rsc2.env: the game waits for the executor at every kick, as before. */
+    setenv("RECOMP_NV2A_PFB_ASYNC", "1", 0);
 }
 #endif
 

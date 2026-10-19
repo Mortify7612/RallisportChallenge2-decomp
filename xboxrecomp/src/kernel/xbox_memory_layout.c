@@ -1028,6 +1028,18 @@ static int ack_idle_on(void)
     return on;
 }
 
+/* PGRAPH PATT_COLOR0 from the executor (nv2a_pb_exec.c, method 0x0310 of
+ * the pattern object): D3D's GPU progress counter. */
+void xbox_Nv2aPatternColor0(uint32_t v)
+{
+    extern int xbox_Nv2aIrqPoke(uint32_t off, uint32_t v);
+    if (xbox_Nv2aIrqPoke(0x400B10, v))
+        return;
+    if (g_nv2a_memory)
+        __atomic_store_n((volatile uint32_t *)((char *)g_nv2a_memory + 0x400B10), v,
+                         __ATOMIC_RELEASE);
+}
+
 void xbox_Nv2aKick(uint32_t va)
 {
     switch (va - 0xFD000000u) {

@@ -4655,10 +4655,28 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        if (method == 0x0310) {
+            /* The pattern object's SET_MONOCHROME_COLOR0 lands in PGRAPH's
+             * PATT_COLOR0 (0x400B10), and D3D uses that as the GPU's
+             * progress counter: it queues the colour in the stream and
+             * polls the register while waiting for push-buffer space.
+             * Written in stream order, as the GPU would. */
+            extern void xbox_Nv2aPatternColor0(uint32_t v);
+            xbox_Nv2aPatternColor0(param);
+            return;
+        }
         note_unhandled(method, param);
         return;
     }
     switch (method) {
+    case 0x0100:                            /* NO_OPERATION */
+        if (param) {
+            /* A notify for the CPU (nv2a_irq.c, with RECOMP_NV2A_PFB_ASYNC):
+             * D3D patches one in when it waits for push-buffer room. */
+            extern int xbox_Nv2aIrqNotify(uint32_t subch, uint32_t method, uint32_t param);
+            xbox_Nv2aIrqNotify(subch, method, param);
+        }
+        return;
     case NV097_SET_SEMAPHORE_OFFSET:
         s_sem_offset = param;
         return;
