@@ -3284,7 +3284,17 @@ static int vk_program_batch(void)
     if (ranged && kk && kk <= 16) {
         Nv2aVkRawAttr ra[16];
         const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+        static uint8_t *repack;
+        static size_t repack_cap;
+        size_t repack_used = 0;
         int r;
+        if (repack_cap < (size_t)kk * nv * 16) {
+            free(repack);
+            repack_cap = (size_t)kk * nv * 16 + 65536;
+            repack = (uint8_t *)malloc(repack_cap);
+            if (!repack)
+                repack_cap = 0;
+        }
         for (i = 0; i < kk; i++) {
             const VertexAttr *a = &s_gpu.attr[ins[i]];
             size_t first = (size_t)lo * a->stride;
@@ -3310,12 +3320,26 @@ static int vk_program_batch(void)
             ra[i].type = a->type;
             ra[i].size = a->size;
             {
-                /* What the renderer would refuse, refused here, before the
-                 * triangle list is made: elements off their components'
-                 * alignment (RSC2 packs floats 2 bytes apart in places). */
+                /* Elements off their components' alignment (RSC2 packs
+                 * floats 2 bytes apart in places) cannot be read by the GPU
+                 * where they are: they are copied, as they are, into an
+                 * aligned array of their own -- a copy per vertex, where
+                 * the float path converted every component. */
                 uint32_t comp = a->type == 4 ? 1 : a->type == 1 || a->type == 5 ? 2 : 4;
-                if (a->type != 6 && (a->stride % comp || (uintptr_t)ra[i].src % comp))
-                    break;
+                if (a->type != 6 && (a->stride % comp || (uintptr_t)ra[i].src % comp)) {
+                    uint32_t elem = a->type == 0 || a->type == 6 ? 4 : a->type == 2 ? 4 * a->size
+                                  : a->type == 4 ? a->size : 2 * a->size;
+                    uint32_t ts = (elem + 3u) & ~3u, v;
+                    uint8_t *dst;
+                    if (a->type > 6 || !repack || repack_used + (size_t)ts * nv > repack_cap)
+                        break;
+                    dst = repack + repack_used;
+                    for (v = 0; v < nv; v++)
+                        memcpy(dst + (size_t)v * ts, ra[i].src + (size_t)v * a->stride, elem);
+                    repack_used += ((size_t)ts * nv + 15) & ~(size_t)15;
+                    ra[i].src = dst;
+                    ra[i].stride = ts;
+                }
             }
         }
         if (i == kk) {

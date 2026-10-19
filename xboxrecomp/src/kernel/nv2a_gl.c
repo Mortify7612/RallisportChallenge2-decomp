@@ -359,6 +359,7 @@ typedef struct GTex_ {
     uint64_t hash, shash;           /* of the bytes uploaded: full, sparse */
     uint32_t hash_ep;               /* the epoch they were last checked */
     uint32_t full_ep;               /* ... in full */
+    uint32_t changed_ep;            /* the epoch it was last uploaded or touched */
     GLuint tex;
     uint32_t levels, last_use;
 } GTex;
@@ -2113,7 +2114,20 @@ static uint8_t *scratch(size_t n)
 }
 
 static int tex_hash_sparse(void);
-#define GL_TEX_SPARSE_MIN   (64u << 10)
+/* From this size a check is sparse (with RECOMP_GL_TEX_HASH sparse):
+ * RECOMP_GL_TEX_SPARSE_KB, default 64. 16 on the Switch, with settled
+ * textures checked every 8th epoch (RECOMP_GL_TEX_STABLE=8), saved little
+ * there and made the road flash: a change was seen late. */
+static size_t tex_sparse_min(void)
+{
+    static long kb = -1;
+    if (kb < 0) {
+        const char *e = getenv("RECOMP_GL_TEX_SPARSE_KB");
+        kb = e ? atol(e) : 64;
+    }
+    return (size_t)kb << 10;
+}
+#define GL_TEX_SPARSE_MIN   tex_sparse_min()
 #define GL_TEX_FULL_EPOCHS  30u
 
 /* The texture now matches guest RAM: remember what guest RAM holds. */
@@ -2751,11 +2765,34 @@ static uint64_t tex_hash_part(const Nv2aVkTex *d, uint32_t bytes)
     return h;
 }
 
+/* RECOMP_GL_TEX_STABLE=<n> (default 1: every epoch): a texture unchanged
+ * for GL_TEX_STABLE_AFTER epochs is checked only every n-th, staggered
+ * across the textures. One the title rewrites (a movie) never settles; one
+ * that changes after settling is seen up to n epochs late -- which made
+ * RSC2's road flash on the Switch, for little gain, so it is off. */
+#define GL_TEX_STABLE_AFTER 120u
+static uint32_t tex_stable_every(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("RECOMP_GL_TEX_STABLE");
+        n = e ? atoi(e) : 1;
+        if (n < 1)
+            n = 1;
+    }
+    return (uint32_t)n;
+}
+
 /* 1 while guest RAM still holds what entry c was made from. */
 static int tex_unchanged(GTex *c, uint32_t bytes)
 {
     if (c->hash_ep == G.epoch)
         return 1;
+    if (tex_stable_every() > 1 && G.epoch - c->changed_ep >= GL_TEX_STABLE_AFTER
+            && (G.epoch + (uint32_t)(c - G.tex)) % tex_stable_every() != 0) {
+        c->hash_ep = G.epoch;           /* settled: looked at again in a few epochs */
+        return 1;
+    }
     if (tex_hash_sparse() && bytes >= GL_TEX_SPARSE_MIN && G.epoch - c->full_ep < GL_TEX_FULL_EPOCHS
             && (G.epoch + (uint32_t)(c - G.tex)) % GL_TEX_FULL_EPOCHS != 0) {
         if (tex_hash_part(&c->d, bytes) != c->shash)
@@ -2780,7 +2817,7 @@ static void tex_touch(uint32_t va, size_t bytes)
         GTex *c = &G.tex[i];
         if (c->used && c->hash_ep && va < c->d.offset + nv2a_pb_tex_bytes(&c->d)
                 && c->d.offset < va + bytes)
-            c->hash_ep = c->full_ep = 0;
+            c->hash_ep = c->full_ep = 0, c->changed_ep = G.epoch;
     }
 }
 
@@ -3111,7 +3148,7 @@ static GLuint tex_upload_bc(const Nv2aVkTex *d, uint32_t bytes, GTex *e, uint64_
     e->d = *d;
     e->hash = h;
     e->shash = tex_hash_part(d, bytes);
-    e->hash_ep = e->full_ep = G.epoch;
+    e->hash_ep = e->full_ep = e->changed_ep = G.epoch;
     e->levels = levels;
     e->last_use = G.frame;
     *levels_out = levels;
@@ -3155,7 +3192,7 @@ static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, GTex *e, uint64_t 
         e->d = d;
         e->hash = h;
         e->shash = tex_hash_part(&d, bytes);
-        e->hash_ep = e->full_ep = G.epoch;
+        e->hash_ep = e->full_ep = e->changed_ep = G.epoch;
         e->levels = 1;
         e->last_use = G.frame;
         *levels_out = 1;
@@ -3186,7 +3223,7 @@ static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, GTex *e, uint64_t 
     e->d = d;
     e->hash = h;
     e->shash = tex_hash_part(&d, bytes);
-    e->hash_ep = e->full_ep = G.epoch;
+    e->hash_ep = e->full_ep = e->changed_ep = G.epoch;
     e->levels = levels;
     e->last_use = G.frame;
     *levels_out = levels;
