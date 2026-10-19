@@ -151,6 +151,42 @@ every busy-wait).
 - **Diagnostics:** the Linux signal-based ones (`kill -QUIT` thread dumps,
   the sampling profiler) are left out.
 
+## Emulator (Eden)
+
+Eden (a yuzu fork, v0.2.1 tested) runs the `.nro` with the OpenGL
+renderer, and runs the homebrew's own Mesa: shader compile failures, GL
+errors, crashes and wrong frames show up there as on the console. It is
+not a guide to speed: its GPU is the PC's.
+
+Setup, once:
+- the AppImage in `work/eden`, extracted there with
+  `./Eden.AppImage --appimage-extract` (gives `AppDir/bin/eden-cli`);
+- `prod.keys` from your own console in `~/.local/share/eden/keys/`;
+- the game in `~/.local/share/eden/sdmc/switch/rsc2/game/`. Symlinks to
+  your copy are fine, but make `UDATA` and `TDATA` real copies, so a test
+  never writes to your saves.
+
+`rsc2/switch/eden_test.sh` runs the current build there with no window
+(`eden-cli` in Xvfb), replaying recorded input (`work/my_run2.xi` by
+default, which reaches a race):
+
+```
+rsc2/switch/eden_test.sh -t 100 -d 300,600,900 -o work/eden-runs/base
+rsc2/switch/eden_test.sh -t 100 -d 300,600,900 -r work/eden-runs/base RECOMP_GL_SPEC=0
+```
+
+Each run leaves the game's log, Eden's log, the dumped frames and a
+`summary.txt` (crashes, stalls, the last `[PERF]` reports, differing
+pixels against `-r`) in its folder, and exits 1 if the game crashed.
+Settings go into `rsc2.env` on Eden's SD card for the run (`eden-cli -p`
+does not reach homebrew); the file is put back afterwards. Two runs of
+the same build agree to within about 1000 pixels a frame. Compare against
+references made in Eden: its saves differ from a PC's, and so do the
+menus the replay walks through.
+
+Eden shares the console's `svc` limits: `MapPhysicalMemory` fails (system
+resource 0) and `svcSetMemoryPermission` returns 0xd401.
+
 ## Emulator (Ryujinx)
 
 To run it on a PC:
