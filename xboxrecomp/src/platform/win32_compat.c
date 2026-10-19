@@ -1078,6 +1078,13 @@ HANDLE CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stackSize,
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
+#if defined(__SWITCH__)
+    /* libnx gives a thread a small stack unless asked, and the renderer's
+     * GL calls run on these threads: Mesa compiling a specialised fragment
+     * program overflowed one (a fault in malloc's prologue). */
+    if (stackSize < 4u * 1024 * 1024)
+        stackSize = 4u * 1024 * 1024;
+#endif
     if (stackSize)
         pthread_attr_setstacksize(&attr, stackSize < 65536 ? 65536 : stackSize);
 

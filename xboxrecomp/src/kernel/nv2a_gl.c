@@ -116,6 +116,7 @@ extern uint32_t nv2a_pb_presented_frames(void);
     X(PFNGLGETSHADERIVPROC, glGetShaderiv) \
     X(PFNGLGETSHADERINFOLOGPROC, glGetShaderInfoLog) \
     X(PFNGLDELETESHADERPROC, glDeleteShader) \
+    X(PFNGLDELETEPROGRAMPROC, glDeleteProgram) \
     X(PFNGLCREATEPROGRAMPROC, glCreateProgram) \
     X(PFNGLATTACHSHADERPROC, glAttachShader) \
     X(PFNGLLINKPROGRAMPROC, glLinkProgram) \
@@ -132,6 +133,13 @@ extern uint32_t nv2a_pb_presented_frames(void);
     X(PFNGLBEGINQUERYPROC, glBeginQuery) \
     X(PFNGLENDQUERYPROC, glEndQuery) \
     X(PFNGLGETQUERYOBJECTUIVPROC, glGetQueryObjectuiv) \
+    X(PFNGLQUERYCOUNTERPROC, glQueryCounter) \
+    X(PFNGLGETQUERYOBJECTUI64VPROC, glGetQueryObjectui64v) \
+    X(PFNGLGETINTEGER64VPROC, glGetInteger64v) \
+    X(PFNGLCREATESHADERPROGRAMVPROC, glCreateShaderProgramv) \
+    X(PFNGLGENPROGRAMPIPELINESPROC, glGenProgramPipelines) \
+    X(PFNGLBINDPROGRAMPIPELINEPROC, glBindProgramPipeline) \
+    X(PFNGLUSEPROGRAMSTAGESPROC, glUseProgramStages) \
     X(PFNGLMAPBUFFERRANGEPROC, glMapBufferRange) \
     X(PFNGLUNMAPBUFFERPROC, glUnmapBuffer) \
     X(PFNGLCOPYIMAGESUBDATAPROC, glCopyImageSubData) \
@@ -203,6 +211,7 @@ GL_FNS(GL_DECL)
 #define glGetShaderiv p_glGetShaderiv
 #define glGetShaderInfoLog p_glGetShaderInfoLog
 #define glDeleteShader p_glDeleteShader
+#define glDeleteProgram p_glDeleteProgram
 #define glCreateProgram p_glCreateProgram
 #define glAttachShader p_glAttachShader
 #define glLinkProgram p_glLinkProgram
@@ -219,6 +228,13 @@ GL_FNS(GL_DECL)
 #define glBeginQuery p_glBeginQuery
 #define glEndQuery p_glEndQuery
 #define glGetQueryObjectuiv p_glGetQueryObjectuiv
+#define glQueryCounter p_glQueryCounter
+#define glGetQueryObjectui64v p_glGetQueryObjectui64v
+#define glGetInteger64v p_glGetInteger64v
+#define glCreateShaderProgramv p_glCreateShaderProgramv
+#define glGenProgramPipelines p_glGenProgramPipelines
+#define glBindProgramPipeline p_glBindProgramPipeline
+#define glUseProgramStages p_glUseProgramStages
 #define glMapBufferRange p_glMapBufferRange
 #define glUnmapBuffer p_glUnmapBuffer
 #define glCopyImageSubData p_glCopyImageSubData
@@ -249,6 +265,9 @@ static int gl_load(void)
 #define GL_MAX_REPORTS 256
 #define GL_MAX_QUERIES 4096
 #define GL_RING_SIZE   (32u << 20)
+#define GL_MAX_FRAG    1024         /* specialised fragment programs */
+#define GL_MAX_GT      512          /* GPU time stamps in a frame */
+#define GL_MAX_GT_STATS 48
 
 typedef struct {
     uint32_t va, pitch, bpp, w, h, fmt;
@@ -260,6 +279,11 @@ typedef struct {
     uint32_t up_epoch;              /* the epoch it last came from guest RAM */
     uint32_t last_use;
     uint32_t gen;                   /* bumped whenever its contents change */
+    /* Guest RAM under it when it last became dirty (flip_writeback() off):
+     * if the title writes there afterwards, the GPU's pixels are out of
+     * date and never copied back (surf_writeback). */
+    uint64_t dref;
+    int dref_valid;
     /* What guest RAM held when the texture last matched it (an upload, a
      * write-back): the next upload waits until that changes. */
     uint64_t ref, sref;
@@ -316,10 +340,26 @@ typedef struct GTex_ {
 
 typedef struct {
     uint32_t hash;                  /* 0: the CPU-vertex program */
-    GLuint prog;
+    GLuint prog;                    /* the vertex stage, separable */
     int ninputs, failed;
     uint8_t inputs[16];
 } GProg;
+
+/* What a specialised fragment program is built for (nv2a.frag NV2A_SPEC),
+ * as nv2a_vk.c's SpecVals. */
+typedef struct {
+    uint32_t misc_x, misc_y, misc_w;
+    uint32_t misc2[4], misc3[4];
+    uint32_t cw[8][4];
+    float ptsz, tsz[4], vpw;
+    uint32_t fast;
+} GSpec;
+
+typedef struct {
+    uint64_t h;                     /* 0: free */
+    GLuint prog;
+    int failed;
+} GFrag;
 
 static struct {
     int state;                      /* 0 not tried, 1 up, -1 off */
@@ -334,7 +374,7 @@ static struct {
     size_t ring_off, ubo_align;
     /* What draw_common last bound, so unchanged binds are skipped; any other
      * glBindTexture (bind_other) forgets it. */
-    GLuint b_tex[8], b_samp[4], b_prog;
+    GLuint b_tex[8], b_samp[4], b_vs, b_fs;
     int b_valid;
     GLuint white2d, whitecube;
     GSurf surf[GL_MAX_SURF];
@@ -346,6 +386,14 @@ static struct {
     GTex *tex;
     GProg prog[GL_MAX_PROG];
     int nprog;
+    /* The fragment stage: the general nv2a.frag (with and without its depth
+     * write) and the specialised ones; one program pipeline holds a draw's
+     * two stages. */
+    GLuint pipe, fs_gen[2];
+    GFrag frag[GL_MAX_FRAG];
+    int spec_left;                  /* specialised compiles left this frame */
+    uint32_t pf_spec, pf_spec_gen;  /* compiled; draws on the general shader */
+    uint64_t pf_spec_us;
     struct { uint64_t key; GLuint s; } samp[GL_MAX_SAMP];
     int nsamp;
     uint32_t epoch, frame;
@@ -469,6 +517,215 @@ static int perf_on(void)
     return on;
 }
 
+/* RECOMP_GL_GPU_TIME=1 (on with RECOMP_PERF on the Switch): where the
+ * GPU's time goes, after the [PERF] line. A timestamp is taken whenever the
+ * work changes -- another render target, texture or surface uploads, the
+ * reflection's cube copies, copy-backs, the present -- and the span to the
+ * next is charged to what began it. A flipped frame's stamps are read when
+ * it lands (pend_retire), after its fence, so they never wait. A span also
+ * holds any time the GPU waited for the CPU to send it work, so the parts
+ * add up to the frame time unless the GPU is the bottleneck; how much
+ * further the GPU falls behind the CPU between a frame's first stamp and
+ * its last tells the two apart (only the change: the Switch's
+ * glGetInteger64v(GL_TIMESTAMP) is not on the queries' clock). Pipelined
+ * flips only. */
+enum { GT_TARGET, GT_DEPTH, GT_TEX, GT_SURF, GT_CUBE, GT_RT, GT_READ, GT_PRESENT, GT_OTHER };
+typedef struct { uint32_t va; uint16_t w, h; uint8_t kind, swz, pad[2]; } GtLabel;
+typedef struct {
+    GLuint q[GL_MAX_GT + 1];
+    uint64_t cpu[GL_MAX_GT + 1];    /* now_us() at each stamp */
+    GtLabel l[GL_MAX_GT];
+    int n;
+} GtFrame;
+static struct {
+    int on;
+    GtFrame fr[2];
+    int cur;                        /* the frame being recorded */
+    int pend;                       /* 1 + the flipped frame's, 0: none */
+    GtLabel top;                    /* what the GPU is being given now */
+    struct { GtLabel l; uint64_t ns; } st[GL_MAX_GT_STATS];
+    int nst;
+    uint32_t frames;
+    int64_t off_ns;                 /* GPU clock - CPU clock */
+    int64_t lag0_ns, lag1_ns;       /* summed lag at frames' first and last stamps */
+} GT;
+
+static int pipelined(void);
+
+/* Ties the GPU's clock to now_us(). */
+static void gt_sync_clock(void)
+{
+    GLint64 g = 0;
+    uint64_t c = now_us();
+    glGetInteger64v(GL_TIMESTAMP, &g);
+    GT.off_ns = (int64_t)g - (int64_t)((c + now_us()) / 2 * 1000);
+}
+
+static void gt_init(void)
+{
+    const char *e = getenv("RECOMP_GL_GPU_TIME");
+#if defined(__SWITCH__)
+    GT.on = e ? strcmp(e, "0") != 0 : 1;
+#else
+    GT.on = e && strcmp(e, "0") != 0;
+#endif
+    GT.on = GT.on && perf_on() && pipelined();
+    if (GT.on) {
+        glGenQueries(GL_MAX_GT + 1, GT.fr[0].q);
+        glGenQueries(GL_MAX_GT + 1, GT.fr[1].q);
+        gt_sync_clock();
+    }
+}
+
+static GtLabel gt_label(int kind, uint32_t va, uint32_t w, uint32_t h, int swz)
+{
+    GtLabel l;
+    memset(&l, 0, sizeof l);
+    l.kind = (uint8_t)kind;
+    l.va = va;
+    l.w = (uint16_t)w;
+    l.h = (uint16_t)h;
+    l.swz = (uint8_t)swz;
+    return l;
+}
+
+/* The GPU's work from here on is l. */
+static void gt_mark(GtLabel l)
+{
+    GtFrame *f = &GT.fr[GT.cur];
+    if (!GT.on)
+        return;
+    GT.top = l;
+    if ((f->n && memcmp(&f->l[f->n - 1], &l, sizeof l) == 0) || f->n == GL_MAX_GT)
+        return;
+    f->l[f->n] = l;
+    f->cpu[f->n] = now_us();
+    glQueryCounter(f->q[f->n], GL_TIMESTAMP);
+    f->n++;
+}
+
+/* Work of another kind in the middle of a target's: gt_pop(gt_push(k)). */
+static GtLabel gt_push(int kind)
+{
+    GtLabel prev = GT.top;
+    gt_mark(gt_label(kind, 0, 0, 0, 0));
+    return prev;
+}
+
+static void gt_pop(GtLabel prev)
+{
+    gt_mark(prev);
+}
+
+/* At the flip, before its fence: the frame's last stamp. */
+static void gt_flip(void)
+{
+    GtFrame *f = &GT.fr[GT.cur];
+    if (!GT.on)
+        return;
+    GT.pend = 0;
+    if (f->n) {
+        f->cpu[f->n] = now_us();
+        glQueryCounter(f->q[f->n], GL_TIMESTAMP);
+        GT.pend = GT.cur + 1;
+    }
+    GT.cur ^= 1;
+    GT.fr[GT.cur].n = 0;
+}
+
+/* The flipped frame's spans, once its fence has passed. */
+static void gt_land(void)
+{
+    GtFrame *f;
+    GLuint64 t0 = 0, t1 = 0;
+    int i, k;
+    if (!GT.pend)
+        return;
+    f = &GT.fr[GT.pend - 1];
+    GT.pend = 0;
+    glGetQueryObjectui64v(f->q[0], GL_QUERY_RESULT, &t0);
+    GT.lag0_ns += (int64_t)t0 - (int64_t)(f->cpu[0] * 1000) - GT.off_ns;
+    for (i = 0; i < f->n; i++, t0 = t1) {
+        GtLabel l = f->l[i];
+        glGetQueryObjectui64v(f->q[i + 1], GL_QUERY_RESULT, &t1);
+        if (t1 <= t0)
+            continue;
+        for (k = 0; k < GT.nst; k++)
+            if (memcmp(&GT.st[k].l, &l, sizeof l) == 0)
+                break;
+        if (k == GT.nst) {
+            if (GT.nst == GL_MAX_GT_STATS) {
+                k = GT.nst - 1;
+                GT.st[k].l = gt_label(GT_OTHER, 0, 0, 0, 0);
+            } else {
+                GT.nst++;
+                GT.st[k].l = l;
+                GT.st[k].ns = 0;
+            }
+        }
+        GT.st[k].ns += t1 - t0;
+    }
+    GT.lag1_ns += (int64_t)t0 - (int64_t)(f->cpu[f->n] * 1000) - GT.off_ns;
+    GT.frames++;
+}
+
+static void gt_report(void)
+{
+    static const char *names[] = { "", "", "texture uploads", "surface uploads",
+        "reflection cube copies", "render-target copies", "copy-backs", "present", "other" };
+    int order[GL_MAX_GT_STATS], i, j;
+    uint64_t sum = 0;
+    double f;
+    if (!GT.on || !GT.frames)
+        return;
+    f = (double)GT.frames * 1e6;
+    for (i = 0; i < GT.nst; i++) {
+        sum += GT.st[i].ns;
+        for (j = i; j > 0 && GT.st[order[j - 1]].ns < GT.st[i].ns; j--)
+            order[j] = order[j - 1];
+        order[j] = i;
+    }
+    fprintf(stderr, "[PERF]   GPU %.1f ms a frame (%u frames timed), falling %.1f ms further"
+            " behind the CPU across one:\n", (double)sum / f, GT.frames,
+            (double)(GT.lag1_ns - GT.lag0_ns) / f);
+    for (i = 0; i < GT.nst && i < 10; i++) {
+        const GtLabel *l = &GT.st[order[i]].l;
+        char what[64];
+        if (l->kind == GT_TARGET && l->swz)
+            snprintf(what, sizeof what, "swizzled %08X %ux%u", l->va, l->w, l->h);
+        else if (l->kind == GT_TARGET)
+            snprintf(what, sizeof what, "surface %08X %u wide%s", l->va, l->w,
+                     l->va == G.present_va || l->va == G.prev_present_va ? " (shown)" : "");
+        else if (l->kind == GT_DEPTH)
+            snprintf(what, sizeof what, "depth only %08X", l->va);
+        else
+            snprintf(what, sizeof what, "%s", names[l->kind]);
+        fprintf(stderr, "[PERF]     %-36s %6.1f ms\n", what, (double)GT.st[order[i]].ns / f);
+    }
+    GT.nst = 0;
+    GT.frames = 0;
+    GT.lag0_ns = GT.lag1_ns = 0;
+    gt_sync_clock();
+}
+
+/* RECOMP_GL_EXP=<n>|cycle (a measurement, not for playing): 1 skips the
+ * occlusion queries (reports then see nothing drawn), 2 discards every
+ * primitive before rasterizing (no pixel work; the screen goes wrong), 3
+ * both. "cycle" steps through 0-3 at each [PERF] report. */
+static int s_exp = -1, s_exp_cycle;
+
+static int gl_exp(void)
+{
+    if (s_exp < 0) {
+        const char *e = getenv("RECOMP_GL_EXP");
+        s_exp_cycle = e && strcmp(e, "cycle") == 0;
+        s_exp = e && !s_exp_cycle ? atoi(e) & 3 : 0;
+        if (s_exp & 2)
+            glEnable(GL_RASTERIZER_DISCARD);
+    }
+    return s_exp;
+}
+
 static void perf_report(void)
 {
     extern void xbox_thread_perf_report(double secs);
@@ -492,7 +749,23 @@ static void perf_report(void)
             G.pf_wb_us / f / 1000.0, G.pf_flush_us / f / 1000.0, G.pf_wait_us / f / 1000.0,
             G.pf_queue_us / f / 1000.0,
             G.pf_present_us / f / 1000.0);
+    if (G.pf_spec || G.pf_spec_gen)
+        fprintf(stderr, "[PERF]   shaders: %u specialised built (%.1f ms), %.0f draws a frame"
+                " waiting on the general one\n", G.pf_spec, G.pf_spec_us / 1000.0,
+                G.pf_spec_gen / f);
+    G.pf_spec = G.pf_spec_gen = 0;
+    G.pf_spec_us = 0;
+    if (s_exp_cycle || s_exp > 0)
+        fprintf(stderr, "[PERF]   experiment %d (RECOMP_GL_EXP)\n", gl_exp());
+    gt_report();
     xbox_thread_perf_report(secs);
+    if (s_exp_cycle) {
+        s_exp = (s_exp + 1) & 3;
+        if (s_exp & 2)
+            glEnable(GL_RASTERIZER_DISCARD);
+        else
+            glDisable(GL_RASTERIZER_DISCARD);
+    }
     G.pf_draw_us = G.pf_tex_us = G.pf_flush_us = G.pf_present_us = 0;
     G.pf_wait_us = G.pf_wb_us = G.pf_queue_us = 0;
     G.pf_draws = G.pf_tex_up = G.pf_tex_kb = G.pf_surf_up = G.pf_wb = G.pf_frames = 0;
@@ -558,52 +831,188 @@ static char *gl_source(const char *src, const char *defines)
     return out;
 }
 
-static GLuint compile(GLenum type, const char *src)
+/* One stage as a separable program: a draw pairs its vertex program with
+ * the fragment program its combiner setup picks (frag_get) in G.pipe. */
+static GLuint sep_program(GLenum type, const char *src)
 {
-    GLuint s = glCreateShader(type);
+    GLuint p = glCreateShaderProgramv(type, 1, &src);
     GLint ok = 0;
-    glShaderSource(s, 1, &src, NULL);
-    glCompileShader(s);
-    glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[4096];
-        glGetShaderInfoLog(s, sizeof log, NULL, log);
-        fprintf(stderr, "[GL] %s shader failed:\n%s\n", type == GL_VERTEX_SHADER ? "vertex"
-                : "fragment", log);
-        if (getenv("RECOMP_GL_SHADER_DUMP"))
-            fprintf(stderr, "%s\n", src);
-        glDeleteShader(s);
+    if (!p)
         return 0;
-    }
-    return s;
-}
-
-static GLuint link(const char *vs_src, const char *fs_src)
-{
-    GLuint vs = compile(GL_VERTEX_SHADER, vs_src), fs = vs ? compile(GL_FRAGMENT_SHADER, fs_src) : 0;
-    GLuint p;
-    GLint ok = 0;
-    if (!vs || !fs) {
-        if (vs) glDeleteShader(vs);
-        return 0;
-    }
-    p = glCreateProgram();
-    glAttachShader(p, vs);
-    glAttachShader(p, fs);
-    glLinkProgram(p);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
     glGetProgramiv(p, GL_LINK_STATUS, &ok);
     if (!ok) {
         char log[4096];
         glGetProgramInfoLog(p, sizeof log, NULL, log);
-        fprintf(stderr, "[GL] link failed:\n%s\n", log);
+        fprintf(stderr, "[GL] %s program failed:\n%s\n", type == GL_VERTEX_SHADER ? "vertex"
+                : "fragment", log);
+        if (getenv("RECOMP_GL_SHADER_DUMP"))
+            fprintf(stderr, "%s\n", src);
+        glDeleteProgram(p);
         return 0;
     }
     return p;
 }
 
-static char *s_frag_gl;             /* nv2a.frag for GL, made once */
+/* nv2a.frag's general program: it reads the combiner setup from the
+ * uniforms. `fast`: built without its gl_FragDepth write. */
+static GLuint frag_general(int fast)
+{
+    char *src = gl_source(k_nv2a_frag_src, fast ? "#define NV2A_FAST_DEPTH 1\n" : "");
+    GLuint p = src ? sep_program(GL_FRAGMENT_SHADER, src) : 0;
+    free(src);
+    return p;
+}
+
+/* ---- specialised fragment programs -------------------------------------
+ *
+ * The general nv2a.frag reads the combiner setup from the uniforms, so every
+ * pixel walks all of it with its register file R[] indexed at run time, and
+ * it writes gl_FragDepth, which turns off the early depth test. On the
+ * Switch that made the race's 640x480 scene about 135 ms of GPU time a
+ * frame. As in the Vulkan renderer, a draw's setup is compiled again with
+ * those values as constants (NV2A_SPEC), and without the depth write when
+ * the draw does not need it (NV2A_FAST_DEPTH). Compiling is on this thread,
+ * a few a frame (RECOMP_GL_SPEC_PER_FRAME, default 2, 1 on the Switch, where
+ * Mesa takes most of a second over each); draws use the
+ * general program until theirs is built. RECOMP_GL_SPEC=0 keeps every draw
+ * on the general program; RECOMP_GL_FAST_DEPTH=0 keeps the depth write. */
+static int spec_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GL_SPEC");
+        on = !(e && strcmp(e, "0") == 0);
+    }
+    return on;
+}
+
+static int spec_per_frame(void)
+{
+    static int n = -1;
+    if (n < 0) {
+        const char *e = getenv("RECOMP_GL_SPEC_PER_FRAME");
+#if defined(__SWITCH__)
+        n = e ? atoi(e) : 1;        /* about 0.9 s each there */
+#else
+        n = e ? atoi(e) : 2;
+#endif
+        if (n < 1)
+            n = 1;
+    }
+    return n;
+}
+
+/* Whether the fragment shader has to write the depth itself: the polygon
+ * offset, or the z-buffer's integer rounding (the GL renderer always keeps
+ * the w-buffer reversed, which the rasteriser produces). As nv2a_vk.c. */
+static int needs_fragdepth(const Nv2aVkState *st)
+{
+    static int fast = -1;
+    if (fast < 0) {
+        const char *e = getenv("RECOMP_GL_FAST_DEPTH");
+        fast = !(e && strcmp(e, "0") == 0);
+    }
+    if (!fast)
+        return 1;
+    if (!G.cur_zs || !st->depth_test)
+        return 0;
+    if (st->poff_factor != 0.0f || st->poff_units != 0.0f)
+        return 1;
+    return st->wbuffer ? 0 : (int)st->zint;
+}
+
+static void spec_vals(GSpec *v, const Nv2aVkUbo *ub, int fast)
+{
+    uint32_t i, n = (ub->misc[0] & 1u) ? (ub->misc2[0] & 0xFFu) : 0;
+    memset(v, 0, sizeof *v);
+    v->misc_x = ub->misc[0];
+    v->misc_y = ub->misc3[0] ? ub->misc[1] : 0;     /* alpha func, if tested */
+    v->misc_w = ub->misc[3];
+    memcpy(v->misc2, ub->misc2, sizeof v->misc2);
+    memcpy(v->misc3, ub->misc3, sizeof v->misc3);
+    if (fast)
+        v->misc3[3] = 0;                            /* zint: depth path only */
+    if (n > 8)
+        n = 8;
+    for (i = 0; i < n; i++)
+        memcpy(v->cw[i], ub->cw[i], sizeof v->cw[i]);
+    v->ptsz = ub->pts[2];
+    for (i = 0; i < 4; i++)
+        v->tsz[i] = ub->ts[i][2];
+    v->vpw = ub->vp[3];
+    v->fast = (uint32_t)fast;
+}
+
+static GLuint spec_build(const GSpec *v)
+{
+    char defs[2048], *q = defs, *src;
+    GLuint p;
+    int i;
+    q += sprintf(q, "#define NV2A_SPEC 1\n%s", v->fast ? "#define NV2A_FAST_DEPTH 1\n" : "");
+    q += sprintf(q, "const uvec4 SP_MISC = uvec4(%uu, %uu, 0u, %uu);\n", v->misc_x, v->misc_y, v->misc_w);
+    q += sprintf(q, "const uvec4 SP_MISC2 = uvec4(%uu, %uu, %uu, %uu);\n",
+                 v->misc2[0], v->misc2[1], v->misc2[2], v->misc2[3]);
+    q += sprintf(q, "const uvec4 SP_MISC3 = uvec4(%uu, %uu, %uu, %uu);\n",
+                 v->misc3[0], v->misc3[1], v->misc3[2], v->misc3[3]);
+    q += sprintf(q, "const uvec4 SP_CW[8] = uvec4[8](");
+    for (i = 0; i < 8; i++)
+        q += sprintf(q, "uvec4(%uu, %uu, %uu, %uu)%s", v->cw[i][0], v->cw[i][1], v->cw[i][2],
+                     v->cw[i][3], i < 7 ? ", " : ");\n");
+    q += sprintf(q, "const float SP_PTSZ = %.9g;\nconst float SP_VPW = %.9g;\n", v->ptsz, v->vpw);
+    sprintf(q, "const float SP_TSZ[4] = float[4](%.9g, %.9g, %.9g, %.9g);\n",
+            v->tsz[0], v->tsz[1], v->tsz[2], v->tsz[3]);
+    src = gl_source(k_nv2a_frag_src, defs);
+    p = src ? sep_program(GL_FRAGMENT_SHADER, src) : 0;
+    free(src);
+    return p;
+}
+
+/* The fragment program for a draw with uniforms ub. */
+static GLuint frag_get(const Nv2aVkState *st, const Nv2aVkUbo *ub)
+{
+    int fast = !needs_fragdepth(st);
+    GSpec v;
+    GFrag *e = NULL;
+    uint64_t h;
+    uint32_t slot, n;
+
+    if (!spec_on())
+        return G.fs_gen[fast];
+    spec_vals(&v, ub, fast);
+    h = hash_bytes((const uint8_t *)&v, sizeof v) | 1;
+    slot = (uint32_t)(h >> 7) & (GL_MAX_FRAG - 1);
+    for (n = 0; n < GL_MAX_FRAG; n++) {
+        GFrag *c = &G.frag[(slot + n) & (GL_MAX_FRAG - 1)];
+        if (c->h == h) {
+            if (c->prog)
+                return c->prog;
+            e = c;
+            break;
+        }
+        if (!c->h) {
+            e = c;
+            break;
+        }
+    }
+    if (!e || e->failed || G.spec_left <= 0) {
+        G.pf_spec_gen++;
+        return G.fs_gen[fast];
+    }
+    G.spec_left--;
+    e->h = h;
+    {
+        uint64_t t0 = perf_on() ? now_us() : 0;
+        e->prog = spec_build(&v);
+        if (t0)
+            G.pf_spec_us += now_us() - t0;
+    }
+    G.pf_spec++;
+    if (!e->prog) {
+        e->failed = 1;
+        return G.fs_gen[fast];
+    }
+    return e->prog;
+}
 
 static GProg *prog_get(uint32_t hash)
 {
@@ -618,11 +1027,9 @@ static GProg *prog_get(uint32_t hash)
     memset(p, 0, sizeof *p);
     p->hash = hash;
     step("program", hash, 0);
-    if (!s_frag_gl)
-        s_frag_gl = gl_source(k_nv2a_frag_src, "");
     if (hash == 0) {
         char *vs = gl_source(k_nv2a_vert_src, "");
-        p->prog = vs && s_frag_gl ? link(vs, s_frag_gl) : 0;
+        p->prog = vs ? sep_program(GL_VERTEX_SHADER, vs) : 0;
         p->ninputs = 8;
         free(vs);
     } else {
@@ -649,7 +1056,7 @@ static GProg *prog_get(uint32_t hash)
         sprintf(q, "%s%s%s", nv2a_prog_main, body, nv2a_prog_tail);
         gl = gl_source(src, "");
         free(src);
-        p->prog = gl && s_frag_gl ? link(gl, s_frag_gl) : 0;
+        p->prog = gl ? sep_program(GL_VERTEX_SHADER, gl) : 0;
         free(gl);
     }
     if (!p->prog)
@@ -748,12 +1155,18 @@ static int gl_init(void)
     }
     G.queries = G.qpool[0];
     glGenBuffers(1, &G.pend.pbo);
+    gt_init();
     G.clear_q = -1;
     G.epoch = 1;
-    if (!prog_get(0)->prog) {
-        fprintf(stderr, "[GL] the CPU-vertex program did not build; renderer off\n");
+    G.fs_gen[0] = frag_general(0);
+    G.fs_gen[1] = frag_general(1);
+    if (!G.fs_gen[0] || !G.fs_gen[1] || !prog_get(0)->prog) {
+        fprintf(stderr, "[GL] the general programs did not build; renderer off\n");
         return 0;
     }
+    glGenProgramPipelines(1, &G.pipe);
+    glBindProgramPipeline(G.pipe);
+    G.spec_left = spec_per_frame();
     return 1;
 }
 
@@ -908,8 +1321,12 @@ static void surf_upload(GSurf *s)
                     s->ref_valid);
     }
     step("upload", s->va, s->fmt);
-    bind_other(GL_TEXTURE_2D, s->tex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)s->w, (GLsizei)rows, fmt, type, lin);
+    {
+        GtLabel prev = gt_push(GT_SURF);
+        bind_other(GL_TEXTURE_2D, s->tex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, (GLsizei)s->w, (GLsizei)rows, fmt, type, lin);
+        gt_pop(prev);
+    }
     surf_ref(s);
 }
 
@@ -918,6 +1335,26 @@ static GLuint tex_upload(const Nv2aVkTex *dp, uint32_t bytes, struct GTex_ *e, u
                          uint32_t *levels_out);
 static void reports_resolve(void);
 static void flush_pipelined(void);
+
+/* RECOMP_GL_FLIP_WRITEBACK=0 (the Switch's default): surfaces never shown
+ * (shadow maps, the reflection's faces) are not copied back at flips
+ * (flush_pipelined): they stay dirty, and a texture over them still has
+ * them copied back when it is drawn with. Only a CPU read of them would
+ * miss it. The Switch's Mesa reads pixels into a buffer on the CPU, waiting
+ * for the frame: a third of a second a frame in a race. */
+static int flip_writeback(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_GL_FLIP_WRITEBACK");
+#if defined(__SWITCH__)
+        on = e && strcmp(e, "0") != 0;
+#else
+        on = !(e && strcmp(e, "0") == 0);
+#endif
+    }
+    return on;
+}
 
 /* The surface's texture into guest RAM. */
 static const char *wb_why = "?";
@@ -952,10 +1389,14 @@ static void surf_readpix(GSurf *s, uint32_t rows, size_t off)
             fprintf(stderr, "[GL] F%u write-back (%s) surface %08X %ux%u bpp %u%s rows %u\n",
                     G.frame, wb_why, s->va, s->w, s->h, s->bpp, s->swz ? " swizzled" : "", rows);
     }
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, G.rfbo);
-    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
-    glReadBuffer(GL_COLOR_ATTACHMENT0);
-    glReadPixels(0, 0, (GLsizei)s->w, (GLsizei)rows, fmt, type, (void *)(uintptr_t)off);
+    {
+        GtLabel prev = gt_push(GT_READ);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, G.rfbo);
+        glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, s->tex, 0);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(0, 0, (GLsizei)s->w, (GLsizei)rows, fmt, type, (void *)(uintptr_t)off);
+        gt_pop(prev);
+    }
 }
 
 /* Read-back pixels of s (rows of w * bpp bytes) into guest RAM. `clean`:
@@ -1011,6 +1452,17 @@ static void surf_writeback(GSurf *s)
     }
     if (!s->dirty || !rows)
         return;
+    /* Kept dirty across flips, and since then the title has written over
+     * its memory -- freed it and loaded something else there (the menu's
+     * targets under the track's tables at Start Race): the title's bytes
+     * win, as they would on the console. */
+    if (s->dref_valid && hash_sparse(guest(s->va), surf_bytes(s)) != s->dref) {
+        s->dirty = 0;
+        s->clear_only = 0;
+        s->ref_valid = 0;
+        s->dref_valid = 0;
+        return;
+    }
     n = (size_t)s->w * rows * s->bpp;
     lin = scratch(n);
     if (!lin)
@@ -1261,6 +1713,8 @@ static int begin_target(const Nv2aVkState *st, int colour)
     }
     G.cur_cs = cs;
     G.cur_zs = zs;
+    gt_mark(cs ? gt_label(GT_TARGET, cs->va, cs->w, cs->swz ? cs->h : 0, cs->swz)
+               : gt_label(GT_DEPTH, zs->key, zs->w, 0, 0));
     return 1;
 }
 
@@ -1290,6 +1744,10 @@ static void mark_drawn(const Nv2aVkState *st)
 {
     if (G.cur_cs) {
         uint32_t rows = st->clip_y + st->clip_h;
+        if (!G.cur_cs->dirty && !flip_writeback()) {
+            G.cur_cs->dref = hash_sparse(guest(G.cur_cs->va), surf_bytes(G.cur_cs));
+            G.cur_cs->dref_valid = 1;
+        }
         G.cur_cs->dirty = 1;
         G.cur_cs->gen++;
         if (rows > G.cur_cs->h)
@@ -1482,7 +1940,8 @@ static GLuint rt_cube(const Nv2aVkTex *d, uint32_t bytes, uint32_t *levels_out)
     GSurf *face[6];
     GRtTex *e;
     uint32_t fbytes = bytes / 6, f;
-    int i, x8;
+    int i, x8, copied = 0;
+    GtLabel prev;
 
     if (d->color == 0x06) x8 = 0;
     else if (d->color == 0x07) x8 = 1;
@@ -1515,11 +1974,15 @@ static GLuint rt_cube(const Nv2aVkTex *d, uint32_t bytes, uint32_t *levels_out)
     for (f = 0; f < 6; f++) {
         if (e->fgen[f] == face[f]->gen + 1)
             continue;
+        if (!copied++)
+            prev = gt_push(GT_CUBE);
         glCopyImageSubData(face[f]->tex, GL_TEXTURE_2D, 0, 0, 0, 0,
                            e->tex, GL_TEXTURE_CUBE_MAP, 0, 0, 0, (GLint)f,
                            (GLsizei)d->width, (GLsizei)d->height, 1);
         e->fgen[f] = face[f]->gen + 1;
     }
+    if (copied)
+        gt_pop(prev);
     *levels_out = 1;
     return e->tex;
 }
@@ -1569,9 +2032,11 @@ static GLuint rt_tex(const Nv2aVkTex *d, uint32_t bytes, uint32_t *levels_out)
         return 0;
     e = rt_slot(q->va, d->width, d->height, x8, 0);
     if (e->fgen[0] != q->gen + 1) {
+        GtLabel prev = gt_push(GT_RT);
         glCopyImageSubData(q->tex, GL_TEXTURE_2D, 0, 0, 0, 0,
                            e->tex, GL_TEXTURE_2D, 0, 0, 0, 0,
                            (GLsizei)e->w, (GLsizei)e->h, 1);
+        gt_pop(prev);
         e->fgen[0] = q->gen + 1;
     }
     *levels_out = 1;
@@ -1647,7 +2112,9 @@ static GLuint tex_get(const Nv2aVkTex *t, uint32_t *levels_out)
     }
     {
         uint64_t t0 = perf_on() ? now_us() : 0;
+        GtLabel prev = gt_push(GT_TEX);
         GLuint r = tex_upload(&d, bytes, e, h, levels_out);
+        gt_pop(prev);
         if (t0)
             G.pf_tex_us += now_us() - t0;
         G.pf_tex_up++;
@@ -1842,7 +2309,7 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
                        uint32_t nv, const uint32_t *idx, uint32_t nidx)
 {
     Nv2aVkUbo ub;
-    int i, stage_on[4];
+    int i, stage_on[4], zq = 0;
     uint32_t w, h, levels;
     GLuint tex2d[4], texcube[4], samp[4];
 
@@ -1966,9 +2433,16 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
             }
         }
         G.b_valid = 1;
-        if (G.b_prog != p->prog) {
-            glUseProgram(p->prog);
-            G.b_prog = p->prog;
+        {
+            GLuint fs = frag_get(st, &ub);
+            if (G.b_vs != p->prog) {
+                glUseProgramStages(G.pipe, GL_VERTEX_SHADER_BIT, p->prog);
+                G.b_vs = p->prog;
+            }
+            if (G.b_fs != fs) {
+                glUseProgramStages(G.pipe, GL_FRAGMENT_SHADER_BIT, fs);
+                G.b_fs = fs;
+            }
         }
         for (i = 0; i < 16; i++) {
             if (i < p->ninputs) {
@@ -1980,15 +2454,16 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const void *v, uint32_t 
             }
         }
         set_state(st);
-        if (G.zpass && G.nq == GL_MAX_QUERIES)
+        zq = G.zpass && !(gl_exp() & 1);
+        if (zq && G.nq == GL_MAX_QUERIES)
             reports_resolve();
-        if (G.zpass)
+        if (zq)
             glBeginQuery(GL_SAMPLES_PASSED, G.queries[G.nq]);
         step("draw", p->hash, st->color_va);
         glDrawElements(st->topology == 2 ? GL_POINTS : st->topology == 1 ? GL_LINES : GL_TRIANGLES,
                        (GLsizei)nidx, GL_UNSIGNED_INT, (const void *)(uintptr_t)o_i);
     }
-    if (G.zpass) {
+    if (zq) {
         glEndQuery(GL_SAMPLES_PASSED);
         G.nq++;
     }
@@ -2227,6 +2702,7 @@ void nv2a_vk_flush(void)
     }
     G.epoch++;
     G.frame++;
+    G.spec_left = spec_per_frame();
     G.cur_cs = NULL;
     G.cur_zs = NULL;
     if (t0) {
@@ -2300,8 +2776,12 @@ static void pend_retire_inner(void)
         ;
     glDeleteSync(p->fence);
     p->fence = 0;
-    if (t0)
-        G.pf_wait_us += now_us() - t0;
+    if (t0) {
+        uint64_t t = now_us();
+        G.pf_wait_us += t - t0;
+        t0 = t;                     /* write-back time is the landing alone */
+    }
+    gt_land();
     reports_write(p->queries, p->nq, p->clear_q, p->reps, p->nreps);
     if (p->nwb) {
         size_t total = p->wb[p->nwb - 1].off + (size_t)p->wb[p->nwb - 1].s->w
@@ -2334,26 +2814,11 @@ static void pend_retire_inner(void)
  * so the next frame is recorded while the GPU draws this one. */
 static void flush_pipelined(void)
 {
-    static int offscreen_wb = -1;
     GPend *p = &G.pend;
     size_t total = 0;
     uint64_t t0;
     int i;
 
-    /* RECOMP_GL_FLIP_WRITEBACK=0 (the Switch's default): surfaces never
-     * shown (shadow maps, the reflection's faces) are not copied back at
-     * flips: they stay dirty, and a texture over them still has them copied
-     * back when it is drawn with. Only a CPU read of them would miss it.
-     * The Switch's Mesa reads pixels into a buffer on the CPU, waiting for
-     * the frame: a third of a second a frame in a race. */
-    if (offscreen_wb < 0) {
-        const char *e = getenv("RECOMP_GL_FLIP_WRITEBACK");
-#if defined(__SWITCH__)
-        offscreen_wb = e && strcmp(e, "0") != 0;
-#else
-        offscreen_wb = !(e && strcmp(e, "0") == 0);
-#endif
-    }
     pend_retire();
     t0 = perf_on() ? now_us() : 0;
     p->nwb = 0;
@@ -2362,7 +2827,7 @@ static void flush_pipelined(void)
         uint32_t rows = surf_wb_rows(s);
         if (s->dirty != 1 || !rows || !writeback_needed(s))
             continue;
-        if (!offscreen_wb && s->va != G.present_va && s->va != G.prev_present_va)
+        if (!flip_writeback() && s->va != G.present_va && s->va != G.prev_present_va)
             continue;
         p->wb[p->nwb].s = s;
         p->wb[p->nwb].tex = s->tex;
@@ -2394,6 +2859,7 @@ static void flush_pipelined(void)
     G.nq = 0;
     G.nreps = 0;
     G.clear_q = -1;
+    gt_flip();
     p->fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
     p->active = 1;
     glFlush();
@@ -2461,6 +2927,7 @@ void nv2a_vk_present_queued(void)
     }
     ox = (ww - dw) / 2;
     oy = (wh - dh) / 2;
+    gt_mark(gt_label(GT_PRESENT, 0, 0, 0, 0));
     /* The surface was just copied back from (or uploaded to) its texture,
      * which holds the frame: row 0 is the top, so the blit turns it over. */
     glBindFramebuffer(GL_READ_FRAMEBUFFER, G.rfbo);
