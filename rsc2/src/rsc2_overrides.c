@@ -274,6 +274,7 @@ void sub_0030FD2A(void)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -921,4 +922,57 @@ void sub_00365590(void)
 #undef eax
 #undef ecx
 #undef edx
+#undef esp
+
+/* ── D3D's push-buffer flush and wait (0x003683A0) ──────────────────────
+ *
+ * Sets PFB register 0x100410's flush bit (0x10000) and spins until the GPU
+ * clears it, which the executor does once it has carried out everything
+ * submitted (xbox_memory_layout.c). The title does this every frame, and
+ * at a 60 fps cap the executor spends most of that time asleep at the
+ * flip: the spin kept the game's thread at 100% of a core. Here it spins
+ * for 0.2 ms, then sleeps until the executor says it cleared the bit
+ * (xbox_Nv2aFlushWait). With no frame-rate limit it spins as before: the
+ * wake-up cost 2-3% there. With RECOMP_NV2A_PFB_ASYNC the write is answered
+ * at once and nothing waits. RSC2_FLUSH_SPIN=1/0 forces spinning/sleeping.
+ */
+extern void xbox_Nv2aFlushWait(void);
+
+#define eax g_eax
+#define ecx g_ecx
+#define esp g_esp
+void sub_003683A0(void)
+{
+    static int spin = -1;
+    uint32_t regs = MEM32(MEM32(0x375418u) + 0x1C28u);
+    uint64_t t0 = 0;
+    int i;
+
+    if (spin < 0) {
+        /* Without a frame-rate limit (RECOMP_FLIP_HZ=0) the wait is short
+         * and every microsecond is frames: spin, as the original does. */
+        const char *e = getenv("RSC2_FLUSH_SPIN"), *hz = getenv("RECOMP_FLIP_HZ");
+        spin = e ? strcmp(e, "0") != 0 : (hz && atoi(hz) == 0);
+    }
+    ecx = MEM32(regs + 0x100410u) | 0x10000u;
+    MEM32(regs + 0x100410u) = ecx;
+    /* Spin the first 0.2 ms: most flushes are done by then when the frame
+     * rate is not capped, and a sleeper's wake-up cost ~4% there. */
+    for (i = 0; MEM32(regs + 0x100410u) & 0x10000u; i++) {
+        struct timespec ts;
+        uint64_t now;
+        if (spin || i < 1000 || (i & 63))
+            continue;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now = (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+        if (!t0)
+            t0 = now;
+        else if (now - t0 > 200000u)
+            xbox_Nv2aFlushWait();
+    }
+    eax = regs;
+    esp += 4; /* ret */
+}
+#undef eax
+#undef ecx
 #undef esp

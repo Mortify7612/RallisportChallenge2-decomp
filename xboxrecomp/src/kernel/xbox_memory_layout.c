@@ -999,6 +999,21 @@ static void framebuffer_probe_tick(void)
 static uint64_t s_ack_loops, s_ack_clears, s_ack_scan_us;
 static int s_ack_stats;
 
+/* Set when the loop below clears the PFB flush: D3D's wait for it
+ * (rsc2_overrides.c, sub_003683A0) sleeps on this rather than spinning.
+ * The title flushes and waits for the executor to drain at every frame,
+ * and at a 60 fps cap the executor spends most of it asleep at the flip:
+ * the spin held a core at 100% for nothing. */
+static HANDLE s_flush_event;
+
+void xbox_Nv2aFlushWait(void)
+{
+    if (s_flush_event)
+        WaitForSingleObject(s_flush_event, 1);
+    else
+        Sleep(0);
+}
+
 /* DMA_GET from the executor as it goes (nv2a_pb_scan.c): the physical
  * address of the next word it will read, as the GPU reports it. */
 void xbox_Nv2aProgressGet(uint32_t va)
@@ -1248,6 +1263,8 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 if (*r & NV2A_ACK[0].busy_mask) {
                     *r &= ~NV2A_ACK[0].busy_mask;
                     s_ack_clears++;
+                    if (s_flush_event)
+                        SetEvent(s_flush_event);
                 }
             }
             for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
@@ -1296,6 +1313,7 @@ static void xbox_Nv2aAckStart(void)
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;
+    s_flush_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {
