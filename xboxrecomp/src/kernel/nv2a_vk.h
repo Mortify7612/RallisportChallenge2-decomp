@@ -96,6 +96,8 @@ enum {
     NV2A_VF_SN16 = 8,           /* signed short, normalised */
     NV2A_VF_SS16 = 12,          /* signed short, as is */
     NV2A_VF_BGRA8 = 16,         /* D3DCOLOR */
+    NV2A_VF_CMP = 17,           /* the packed 11:11:10 normal, decoded by the
+                                 * program's variant (Nv2aVkVerts.cmp) */
     NV2A_VF_COUNT
 };
 enum { NV2A_VS_RAW, NV2A_VS_CONV, NV2A_VS_NONE };
@@ -107,6 +109,7 @@ typedef struct {
     uint8_t src[16];            /* per input, NV2A_VS_* */
     uint8_t fmt[16];            /* NV2A_VS_RAW: NV2A_VF_* */
     uint16_t off[16];           /* RAW: byte offset in a vertex; CONV: its slot */
+    uint16_t cmp;               /* v-registers read as NV2A_VF_CMP, by bit */
 } Nv2aVkVerts;
 
 /* 1 when a triangle strip can be drawn as one (topology 3) rather than
@@ -116,6 +119,10 @@ int nv2a_vk_strips(void);
 /* 1 when nv2a_vk_draw_program_raw can be used, and for which formats. */
 int nv2a_vk_raw_verts(void);
 int nv2a_vk_vfmt_ok(int fmt);
+/* The program `hash` built to decode the packed normals in the v-registers
+ * of `cmp` itself: 1 when it is ready (it is built on the worker when
+ * first asked for; meanwhile they are converted on the CPU). */
+int nv2a_vk_program_cmp(uint32_t hash, uint16_t cmp);
 int nv2a_vk_draw_program_raw(const Nv2aVkState *s, uint32_t hash, const Nv2aVkVerts *vx,
                              uint32_t nv, const uint32_t *idx, uint32_t nidx);
 

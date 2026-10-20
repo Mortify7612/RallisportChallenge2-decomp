@@ -64,6 +64,7 @@ int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
 int nv2a_vk_raw_verts(void) { return 0; }
 int nv2a_vk_strips(void) { return 0; }
 int nv2a_vk_vfmt_ok(int fmt) { (void)fmt; return 0; }
+int nv2a_vk_program_cmp(uint32_t hash, uint16_t cmp) { (void)hash; (void)cmp; return 0; }
 int nv2a_vk_draw_program_raw(const Nv2aVkState *s, uint32_t hash, const Nv2aVkVerts *vx,
                              uint32_t nv, const uint32_t *idx, uint32_t nidx)
 { (void)s; (void)hash; (void)vx; (void)nv; (void)idx; (void)nidx; return 0; }
@@ -271,14 +272,24 @@ typedef struct {
     int failed;
 } Pipe;
 
-/* A title vertex program, compiled to a Vulkan vertex shader. */
+/* A title vertex program, compiled to a Vulkan vertex shader. `cmp`: the
+ * v-registers it reads as packed normals (NV2A_VF_CMP) and decodes itself;
+ * such a variant is a program of its own, `hash` (its id: the pipelines',
+ * the disk cache's) prog_id(base, cmp). */
 typedef struct {
     uint32_t hash;
     volatile int state;         /* 0 empty, 1 compiled, 2 compiling (worker), -1 failed */
     VkShaderModule vs;
     uint32_t ninputs;
     uint8_t inputs[16];
+    uint32_t base;
+    uint16_t cmp;
 } Prog;
+
+static uint32_t prog_id(uint32_t base, uint16_t cmp)
+{
+    return cmp ? base ^ (((uint32_t)cmp * 0x85EBCA77u) | 1u) : base;
+}
 
 typedef struct {
     uint64_t key;
@@ -589,7 +600,10 @@ static VkFormat vfmt_vk(int f)
         VK_FORMAT_R16G16B16_SNORM, VK_FORMAT_R16G16B16A16_SNORM,
         VK_FORMAT_R16_SSCALED, VK_FORMAT_R16G16_SSCALED,
         VK_FORMAT_R16G16B16_SSCALED, VK_FORMAT_R16G16B16A16_SSCALED,
-        VK_FORMAT_B8G8R8A8_UNORM,
+        /* The packed normal as two halves: a vertex's 32 bits need only
+         * be 2-byte aligned that way, and the title's strides are not
+         * multiples of 4. */
+        VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_R16G16_UINT,
     };
     return f >= 0 && f < NV2A_VF_COUNT ? t[f] : VK_FORMAT_UNDEFINED;
 }
@@ -5613,8 +5627,10 @@ static VkShaderModule module_file(const char *path, size_t skip, uint32_t *ninpu
     size_t n = 0;
     uint8_t *f = (uint8_t *)file_read(path, &n);
     if (f && n > skip && ((n - skip) & 3) == 0 && (!skip || !memcmp(f, "NVP1", 4))) {
-        if (ninputs)
+        if (ninputs) {
             memcpy(ninputs, f + 4, 4);
+            *ninputs &= 0xFFFF;         /* the top half: Prog.cmp */
+        }
         ci.codeSize = n - skip;
         ci.pCode = (const uint32_t *)(f + skip);
         if (vkCreateShaderModule(V.dev, &ci, NULL, &m) != VK_SUCCESS)
@@ -6908,7 +6924,13 @@ static int prog_load_cached(Prog *p)
         f = (uint8_t *)file_read(path, &n);
     }
     if (f && n > 24 && !memcmp(f, "NVP1", 4) && ((n - 24) & 3) == 0) {
-        memcpy(&p->ninputs, f + 4, 4);
+        uint32_t w;
+        memcpy(&w, f + 4, 4);
+        if ((w >> 16) != p->cmp) {      /* another's id, by a fluke */
+            free(f);
+            return 0;
+        }
+        p->ninputs = w & 0xFFFF;
         memcpy(p->inputs, f + 8, 16);
         ci.codeSize = n - 24;
         ci.pCode = (const uint32_t *)(f + 24);
@@ -6936,9 +6958,20 @@ static char *prog_source(Prog *p)
         return NULL;
     q = src;
     q += sprintf(q, "%s", k_prog_head);
+    if (p->cmp)
+        q += sprintf(q, "vec4 cmp_decode(uint u) {\n"
+                        "    return vec4(float(int(u << 21) >> 21) / 1023.0,\n"
+                        "                float(int(u << 10) >> 21) / 1023.0,\n"
+                        "                float(int(u) >> 22) / 511.0, 1.0);\n"
+                        "}\n");
     for (i = 0, j = 0; i < 16; i++)
         if (inmask & (1u << i)) {
-            q += sprintf(q, "layout(location = %u) in vec4 v%u;\n", j, i);
+            if (p->cmp & (1u << i))
+                q += sprintf(q, "layout(location = %u) in uvec2 v%u_p;\n"
+                                "#define v%u cmp_decode(v%u_p.x | (v%u_p.y << 16))\n",
+                             j, i, i, i, i);
+            else
+                q += sprintf(q, "layout(location = %u) in vec4 v%u;\n", j, i);
             p->inputs[j++] = (uint8_t)i;
         }
     p->ninputs = j;
@@ -6967,8 +7000,9 @@ static void prog_build(Prog *p, char *src)
             if (dir) {
                 char path[1100];
                 uint8_t hdr[24];
+                uint32_t w = p->ninputs | (uint32_t)p->cmp << 16;
                 memcpy(hdr, "NVP1", 4);
-                memcpy(hdr + 4, &p->ninputs, 4);
+                memcpy(hdr + 4, &w, 4);
                 memcpy(hdr + 8, p->inputs, 16);
                 snprintf(path, sizeof path, "%s/prog_v%u_%08X.spv", dir, VK_PROG_VERSION, p->hash);
                 file_write(path, hdr, sizeof hdr, ci.pCode, ci.codeSize);
@@ -6984,8 +7018,9 @@ static void prog_build(Prog *p, char *src)
 /* The program `hash`, the one loaded now: from the disk cache at once, or
  * compiled on the worker (state 2 until then; nv2a_vk_program says -1 and
  * the executor runs it on the CPU meanwhile). */
-static Prog *prog_get(uint32_t hash)
+static Prog *prog_get_cmp(uint32_t base, uint16_t cmp)
 {
+    uint32_t hash = prog_id(base, cmp);
     uint32_t slot = (hash * 2654435761u) & (VK_MAX_PROGS - 1), n;
     for (n = 0; n < VK_MAX_PROGS; n++) {
         Prog *p = &V.progs[(slot + n) & (VK_MAX_PROGS - 1)];
@@ -6993,6 +7028,8 @@ static Prog *prog_get(uint32_t hash)
             double t0 = now_ms();
             char *src;
             p->hash = hash;
+            p->base = base;
+            p->cmp = cmp;
             if (prog_load_cached(p)) {
                 p->state = 1;
             } else if (!(src = prog_source(p))) {
@@ -7011,10 +7048,24 @@ static Prog *prog_get(uint32_t hash)
             V.st_compiles++;
             return p;
         }
-        if (p->hash == hash)
+        if (p->hash == hash && p->base == base && p->cmp == cmp)
             return p;
     }
     return NULL;
+}
+
+static Prog *prog_get(uint32_t hash)
+{
+    return prog_get_cmp(hash, 0);
+}
+
+int nv2a_vk_program_cmp(uint32_t hash, uint16_t cmp)
+{
+    Prog *p;
+    if (!nv2a_vk_active() || !V.vi_dyn || !V.vf_ok[NV2A_VF_CMP])
+        return 0;
+    p = prog_get_cmp(hash, cmp);
+    return p && __atomic_load_n(&p->state, __ATOMIC_ACQUIRE) == 1;
 }
 
 int nv2a_vk_program(uint32_t hash, uint8_t inputs[16])
@@ -7070,10 +7121,10 @@ int nv2a_vk_draw_program_raw(const Nv2aVkState *st, uint32_t hash, const Nv2aVkV
     Prog *p;
     if (!nidx || !nv || !nv2a_vk_active())
         return 1;
-    p = prog_get(hash);
+    p = prog_get_cmp(hash, vx->cmp);
     if (!p || __atomic_load_n(&p->state, __ATOMIC_ACQUIRE) != 1)
         return 0;
-    return draw_common(st, p->vs, hash, p->ninputs ? p->ninputs : 1, NULL, vx, nv, idx, nidx);
+    return draw_common(st, p->vs, p->hash, p->ninputs ? p->ninputs : 1, NULL, vx, nv, idx, nidx);
 }
 
 

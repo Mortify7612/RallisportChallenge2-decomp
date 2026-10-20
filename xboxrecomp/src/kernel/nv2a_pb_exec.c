@@ -3220,11 +3220,13 @@ static void vk_draw_batch(const Nv2aVshOutput *v, uint32_t n, Nv2aVkState *st)
 static uint32_t k_or_1(uint32_t kk) { return kk ? kk : 1; }
 
 /* An attribute's format as the GPU can read it (NV2A_VF_*), and the size
- * of its components; -1 for one it cannot (the packed normal). */
-static int vk_vfmt(const VertexAttr *a, uint32_t *csize)
+ * of its components; -1 for one it cannot (the packed normal, unless the
+ * program's variant decodes it: `cmp`). */
+static int vk_vfmt(const VertexAttr *a, uint32_t *csize, int cmp)
 {
     uint32_t n = a->size < 4 ? a->size : 4;
     switch (a->type) {
+    case 6: *csize = 2; return cmp ? NV2A_VF_CMP : -1;   /* as two halves */
     case 0: *csize = 1; return a->size == 4 ? NV2A_VF_BGRA8 : -1;
     case 2: *csize = 4; return NV2A_VF_F32 + (int)n - 1;
     case 4: *csize = 1; return NV2A_VF_UN8 + (int)n - 1;
@@ -3238,17 +3240,33 @@ static int vk_vfmt(const VertexAttr *a, uint32_t *csize)
  * out (nv2a_vk_draw_program_raw): those in one interleaved stream, in a
  * format the GPU reads, go as the stream's bytes; the rest are converted
  * here into `conv`. 0 when nothing would be gained: draw it the old way. */
-static int vk_raw_verts(const uint8_t *ins, uint32_t kk, uint32_t lo, uint32_t nv,
+static int vk_raw_verts(uint32_t h, const uint8_t *ins, uint32_t kk, uint32_t lo, uint32_t nv,
                         float *conv, Nv2aVkVerts *vx)
 {
     const uint8_t *base;
     uint32_t i, st0 = 0, bo = 0xFFFFFFFFu, end = 0, nraw = 0, nnone = 0, cs;
-    int f[16];
+    int f[16], cmp_ok = 0;
+    uint16_t cmp = 0;
 
     memset(vx, 0, sizeof *vx);
     if (!kk) {
         vx->src[0] = NV2A_VS_NONE;
         return 1;
+    }
+    /* Packed normals: read as they are by the program's variant that
+     * decodes them, once it is built (RECOMP_VK_CMP=0: never). */
+    {
+        static int on = -1;
+        if (on < 0) {
+            const char *e = getenv("RECOMP_VK_CMP");
+            on = !(e && strcmp(e, "0") == 0);
+        }
+        for (i = 0; on && i < kk; i++) {
+            const VertexAttr *a = &s_gpu.attr[ins[i]];
+            if (a->type == 6 && a->size && a->stride && (s_gpu.inline_active || a->offset))
+                cmp |= (uint16_t)(1u << ins[i]);
+        }
+        cmp_ok = cmp && nv2a_vk_program_cmp(h, cmp);
     }
     for (i = 0; i < kk; i++) {
         const VertexAttr *a = &s_gpu.attr[ins[i]];
@@ -3259,7 +3277,7 @@ static int vk_raw_verts(const uint8_t *ins, uint32_t kk, uint32_t lo, uint32_t n
             continue;
         }
         vx->src[i] = NV2A_VS_CONV;
-        f[i] = vk_vfmt(a, &cs);
+        f[i] = vk_vfmt(a, &cs, cmp_ok);
         if (f[i] < 0 || !nv2a_vk_vfmt_ok(f[i]) || (a->stride % cs)) {
             f[i] = -1;
             continue;
@@ -3275,10 +3293,11 @@ static int vk_raw_verts(const uint8_t *ins, uint32_t kk, uint32_t lo, uint32_t n
         uint32_t e;
         if (f[i] < 0 || a->stride != st0 || a->offset - bo >= st0)
             continue;
-        (void)vk_vfmt(a, &cs);
+        (void)vk_vfmt(a, &cs, cmp_ok);
         if ((a->offset - bo) % cs)
             continue;
-        e = a->offset - bo + (f[i] == NV2A_VF_BGRA8 ? 4 : (a->size < 4 ? a->size : 4) * cs);
+        e = a->offset - bo + (f[i] == NV2A_VF_BGRA8 || f[i] == NV2A_VF_CMP ? 4
+                              : (a->size < 4 ? a->size : 4) * cs);
         if (e > end)
             end = e;
         vx->src[i] = NV2A_VS_RAW;
@@ -3303,6 +3322,23 @@ static int vk_raw_verts(const uint8_t *ins, uint32_t kk, uint32_t lo, uint32_t n
             base = (const uint8_t *)xbox_GetMemoryOffset();
         }
         vx->raw = base + bo + (size_t)lo * st0;
+    }
+    if (cmp_ok) {
+        /* The variant reads every one of its packed inputs from the stream:
+         * if one did not make it there, convert them all instead. */
+        uint16_t got = 0;
+        for (i = 0; i < kk; i++)
+            if (vx->src[i] == NV2A_VS_RAW && vx->fmt[i] == NV2A_VF_CMP)
+                got |= (uint16_t)(1u << ins[i]);
+        if (got != cmp) {
+            for (i = 0; i < kk; i++)
+                if (vx->src[i] == NV2A_VS_RAW && vx->fmt[i] == NV2A_VF_CMP) {
+                    vx->src[i] = NV2A_VS_CONV;
+                    nraw--;
+                }
+            got = 0;
+        }
+        vx->cmp = got;
     }
     if (!nraw && !nnone)
         return 0;
@@ -3351,7 +3387,7 @@ static int vk_program_batch(void)
     /* The title's vertices handed over as they are, when the GPU can take
      * them (RECOMP_VK_RAW_VERTS=0 not): the paused race's executor spent a
      * quarter of its time making floats of them. */
-    raw = ranged && nv2a_vk_raw_verts() && vk_raw_verts(ins, kk, lo, nv, vin, &vx);
+    raw = ranged && nv2a_vk_raw_verts() && vk_raw_verts(h, ins, kk, lo, nv, vin, &vx);
     if (!raw && !kk)
         for (j = 0; j < nv; j++) {
             float *o = vin + (size_t)j * 4;
