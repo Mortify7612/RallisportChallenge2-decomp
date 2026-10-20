@@ -556,6 +556,24 @@ static void se_frame(MCPXAPUState *d)
 static void *mcpx_apu_frame_thread(void *arg)
 {
     MCPXAPUState *d = MCPX_APU_DEVICE(arg);
+#if defined(__SWITCH__)
+    {
+        /* RSC2_NX_PROF_THREADS=apu: this thread in the sampling profiler. */
+        extern void nx_prof_register(const char *name);
+        extern void nx_thread_priority(int prio);
+        const char *e = getenv("RSC2_APU_PRIO");
+        nx_prof_register("apu");
+        /* One step above the game's threads (0x3B). Horizon does not
+         * time-slice threads of one priority: in a race the yield at the
+         * end of each frame (below) left this thread waiting for a busy
+         * thread to give its core back -- 31% of its time -- and it fell a
+         * quarter behind real time, which was the crackle. It sleeps most
+         * of the rest. The title still gets d->lock: a Horizon mutex is
+         * handed to its waiter on unlock. RSC2_APU_PRIO=<n> sets another
+         * (0x3B: as the others). */
+        nx_thread_priority(e ? (int)strtol(e, NULL, 0) : 0x3A);
+    }
+#endif
     qemu_mutex_lock(&d->lock);
 
     while (!qatomic_read(&d->exiting)) {

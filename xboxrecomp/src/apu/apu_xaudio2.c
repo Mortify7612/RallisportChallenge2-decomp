@@ -264,15 +264,54 @@ int xa2_is_active(void)
     return g_xa2_initialized;
 }
 
+/* RECOMP_PERF: every 5 s, how the output queue fared -- blocks sent, blocks
+ * dropped because it was full (the mixer ahead of real time), and sends
+ * that found it empty (behind: the device ran dry, a click), with the least
+ * it held. Crackle is one or the other. */
+static void xa2_stats(uint32_t queued, int dropped)
+{
+    static int on = -1;
+    static uint32_t sent, drops, dry, low = 0xFFFFFFFFu, t0;
+    uint32_t now;
+    if (on < 0)
+        on = getenv("RECOMP_PERF") != NULL;
+    if (!on)
+        return;
+    now = SDL_GetTicks();
+    if (!t0)
+        t0 = now;
+    if (dropped)
+        drops++;
+    else
+        sent++;
+    if (queued == 0)
+        dry++;
+    if (queued < low)
+        low = queued;
+    if (now - t0 >= 5000) {
+        fprintf(stderr, "[XA2] %.1f s: %u blocks sent, %u dropped (queue full), %u found it"
+                " empty; at least %.1f ms queued\n", (now - t0) / 1000.0, sent, drops, dry,
+                low / (double)(XA2_CHANNELS * sizeof(int16_t)) * 1000.0 / XA2_SAMPLE_RATE);
+        sent = drops = dry = 0;
+        low = 0xFFFFFFFFu;
+        t0 = now;
+    }
+}
+
 int xa2_submit_samples(const int16_t *samples, int num_samples)
 {
-    uint32_t bytes;
+    uint32_t bytes, queued = 0;
     if (!g_xa2_initialized) return 0;
     if (num_samples > XA2_BUF_SAMPLES) num_samples = XA2_BUF_SAMPLES;
     bytes = (uint32_t)num_samples * XA2_CHANNELS * sizeof(int16_t);
-    if (g_dev && SDL_GetQueuedAudioSize(g_dev) >= XA2_NUM_BUFS * XA2_BUF_SAMPLES
-                                                 * XA2_CHANNELS * sizeof(int16_t))
+    if (g_dev)
+        queued = SDL_GetQueuedAudioSize(g_dev);
+    if (g_dev && queued >= XA2_NUM_BUFS * XA2_BUF_SAMPLES
+                                                 * XA2_CHANNELS * sizeof(int16_t)) {
+        xa2_stats(queued, 1);
         return 0;
+    }
+    xa2_stats(queued, 0);
     if (g_dev && SDL_QueueAudio(g_dev, samples, bytes) != 0)
         return 0;
     if (g_wav) {

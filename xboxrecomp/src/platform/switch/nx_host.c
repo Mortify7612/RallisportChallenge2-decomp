@@ -662,6 +662,16 @@ void nx_thread_place(int guest)
         fprintf(stderr, "[nx] thread placement: core mask 0x%x, priority 0x%x\n", rc, rp);
 }
 
+/* The calling thread's priority (lower is more urgent; the game's threads
+ * run at 0x3B, nx_thread_place). For a thread that has to keep real time
+ * against them: the audio mixer. */
+void nx_thread_priority(int prio)
+{
+    Result rp = svcSetThreadPriority(CUR_THREAD_HANDLE, prio);
+    if (R_FAILED(rp))
+        fprintf(stderr, "[nx] thread priority 0x%x: 0x%x\n", prio, rp);
+}
+
 int nx_log_open(const char *path)
 {
     pthread_t t;
