@@ -173,6 +173,9 @@ static int s_scan_enabled = -1;
 uint32_t g_nv2a_cmd_va;
 static uint32_t s_call_site;
 
+extern void xbox_Nv2aProgressGet(uint32_t va);
+static int s_get_progress;
+
 static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                         uint32_t *jumps, uint32_t *unknown, uint32_t *jump_to)
 {
@@ -249,6 +252,14 @@ static uint32_t pb_walk(uint32_t va, uint32_t end_va, int in_call,
                 va += 4;
                 words++;
             }
+            /* GET where the GPU's would be: past what has been executed.
+             * D3D, running ahead of the GPU (RECOMP_NV2A_PFB_ASYNC), patches
+             * a notify into push-buffer space it believes the GPU has not
+             * reached; with GET moved only at the segment's end, that could
+             * be space the executor had already read, the notify never
+             * came, and the title waited for it for good. */
+            if (!in_call && s_get_progress)
+                xbox_Nv2aProgressGet(va);
             continue;
         }
         (*unknown)++;
@@ -268,6 +279,13 @@ uint32_t nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         s_scan_enabled = getenv("RECOMP_PB_SCAN") != NULL;
     if (!(s_scan_enabled || s_exec_enabled) || end_va <= start_va)
         return 0;
+    {
+        extern int xbox_Nv2aIrqAsync(void);
+        static int env = -1;
+        if (env < 0)
+            env = !(getenv("RECOMP_PB_GET_PROGRESS") && strcmp(getenv("RECOMP_PB_GET_PROGRESS"), "0") == 0);
+        s_get_progress = env && s_exec_enabled && xbox_Nv2aIrqAsync();
+    }
     if (end_va - start_va > 0x400000u)        /* a sane single-frame bound */
         end_va = start_va + 0x400000u;
 

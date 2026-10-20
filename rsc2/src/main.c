@@ -527,7 +527,17 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
      *   RECOMP_KEYBOARD      keyboard as pad 0, merged over a real pad:
      *                        arrows d-pad, Enter START, Backspace BACK,
      *                        Z X A S = A B X Y, Q E = white black, 1 3 =
-     *                        triggers, numpad 8/2/4/6 left stick, IJKL right. */
+     *                        triggers, numpad 8/2/4/6 left stick, IJKL right.
+     *   RECOMP_NV2A_PFB_ASYNC the PFB flush done at once and PGRAPH's notify
+     *                        and progress counter modelled (nv2a_irq.c), so
+     *                        the game builds the next frame while the
+     *                        executor draws this one: the paused race
+     *                        230 -> 255 fps uncapped (first found on the
+     *                        Switch port, where it was 28 -> 38). Not on
+     *                        by default until it has been raced live.
+     *   RECOMP_NV2A_IRQ_WAKE those notifies delivered at once rather than at
+     *                        the timer thread's next 2 ms tick (with the
+     *                        above). */
     {
         static const char *const defaults[][2] = {
             { "RECOMP_VBLANK",        "1" },
