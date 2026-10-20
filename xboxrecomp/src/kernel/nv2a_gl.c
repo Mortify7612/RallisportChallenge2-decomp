@@ -528,6 +528,24 @@ static struct {
 } Q;
 static __thread int t_gl_direct;    /* the GL thread, or one with its own context */
 static size_t q_need;
+/* The executor's own head: what it has written, published to the GL thread
+ * (Q.head) at the end of a draw, every GLQ_PUBLISH_EVERY calls, and before
+ * any wait. Each publish is a store-release, which on the A57 waits for
+ * every store before it (the vertices just copied into the ring among
+ * them): one a call was 3.5% of the Switch executor's time. */
+static size_t q_head;
+static unsigned q_unpublished;
+#define GLQ_PUBLISH_EVERY 16
+
+static void glq_publish(void)
+{
+    if (!Q.on || t_gl_direct || !q_unpublished)
+        return;
+    q_unpublished = 0;
+    __atomic_store_n(&Q.head, q_head, __ATOMIC_RELEASE);
+    if (__atomic_load_n(&Q.sleeping, __ATOMIC_ACQUIRE))
+        SetEvent(Q.work);
+}
 
 static int glq_direct(void)
 {
@@ -540,21 +558,23 @@ static void *glq_alloc(void (*run)(const void *), size_t size)
 {
     size_t need = (sizeof(GlqHead) + size + 15) & ~(size_t)15, at;
     for (;;) {
-        size_t head = Q.head, tail = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE);
+        size_t head = q_head, tail = __atomic_load_n(&Q.tail, __ATOMIC_ACQUIRE);
         size_t room = GLQ_SIZE - (head - tail);
         at = head % GLQ_SIZE;
         if (at + need > GLQ_SIZE) {
             if (room >= GLQ_SIZE - at + need) {
                 ((GlqHead *)(Q.buf + at))->run = NULL;
-                __atomic_store_n(&Q.head, head + (GLQ_SIZE - at), __ATOMIC_RELEASE);
+                q_head = head + (GLQ_SIZE - at);
+                q_unpublished++;
                 continue;
             }
         } else if (room >= need) {
             break;
         }
+        glq_publish();                  /* full: the GL thread is behind */
         if (Q.sleeping)
             SetEvent(Q.work);
-        Sleep(0);                       /* full: the GL thread is behind */
+        Sleep(0);
     }
     ((GlqHead *)(Q.buf + at))->run = run;
     ((GlqHead *)(Q.buf + at))->size = (uint32_t)need;
@@ -564,9 +584,9 @@ static void *glq_alloc(void (*run)(const void *), size_t size)
 
 static void glq_commit(void)
 {
-    __atomic_store_n(&Q.head, Q.head + q_need, __ATOMIC_RELEASE);
-    if (__atomic_load_n(&Q.sleeping, __ATOMIC_ACQUIRE))
-        SetEvent(Q.work);
+    q_head += q_need;
+    if (++q_unpublished >= GLQ_PUBLISH_EVERY)
+        glq_publish();
 }
 
 static void qrun_sync(const void *p)
@@ -589,6 +609,7 @@ static void glq_call(void (*fn)(void *), void *arg, const char *name)
     Q.sync_done = 0;
     glq_alloc(qrun_sync, 0);
     glq_commit();
+    glq_publish();
     while (!__atomic_load_n(&Q.sync_done, __ATOMIC_ACQUIRE))
         WaitForSingleObject(Q.done, 1);
     clock_gettime(CLOCK_MONOTONIC, &b);
@@ -3904,8 +3925,11 @@ static int draw_common(const Nv2aVkState *st, GProg *p, const GVtx *vx,
         if (zq)
             glBeginQuery(GL_SAMPLES_PASSED, G.queries[G.nq]);
         step("draw", p->hash, st->color_va);
-        glDrawElements(st->topology == 2 ? GL_POINTS : st->topology == 1 ? GL_LINES : GL_TRIANGLES,
+        glDrawElements(st->topology == 2 ? GL_POINTS : st->topology == 1 ? GL_LINES
+                       : st->topology == 3 ? GL_TRIANGLE_STRIP     /* nv2a_pb_exec.c: as the title drew it */
+                       : st->topology == 4 ? GL_TRIANGLE_FAN : GL_TRIANGLES,
                        (GLsizei)nidx, GL_UNSIGNED_INT, (const void *)(uintptr_t)o_i);
+        glq_publish();
     }
     if (zq) {
         glEndQuery(GL_SAMPLES_PASSED);
@@ -4583,6 +4607,7 @@ void nv2a_vk_present_queued(void)
         } else {
             glq_alloc(qrun_swap, 0);
             glq_commit();
+            glq_publish();
         }
         if (t0)
             G.pf_present_us += now_us() - t0;

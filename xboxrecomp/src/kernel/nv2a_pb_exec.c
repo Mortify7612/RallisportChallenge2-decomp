@@ -3361,9 +3361,32 @@ static int vk_program_batch(void)
                 s_pf[0] += t1 - t0;
                 t0 = t1;
             }
-            k = vk_tri_list(n);
-            for (i = 0; i < k; i++)
-                s_vk_idx[i] = s_gpu.idx[s_vk_idx[i]] - lo;
+            {
+                /* Strips and fans go to GL as they are (topology 3, 4):
+                 * GL alternates a strip's winding as the NV2A does. Made
+                 * into a list here they were three indices a triangle and
+                 * a second pass through the title's, about 6% of the
+                 * Switch executor. RECOMP_GL_NATIVE_STRIPS=0: lists. */
+                static int native = -1;
+                uint32_t prim = s_gpu.prim;
+                if (native < 0) {
+                    const char *e = getenv("RECOMP_GL_NATIVE_STRIPS");
+                    native = !e || strcmp(e, "0") != 0;
+                }
+                if (native && (prim == NV_PRIM_TRIANGLES || prim == NV_PRIM_TRIANGLE_STRIP
+                               || prim == NV_PRIM_TRIANGLE_FAN || prim == NV_PRIM_POLYGON)) {
+                    const uint32_t *gi = s_gpu.idx;
+                    k = prim == NV_PRIM_TRIANGLES ? n - n % 3 : n >= 3 ? n : 0;
+                    for (i = 0; i < k; i++)
+                        s_vk_idx[i] = gi[i] - lo;
+                    s_vk_topo = prim == NV_PRIM_TRIANGLE_STRIP ? 3
+                              : prim == NV_PRIM_TRIANGLES ? 0 : 4;
+                } else {
+                    k = vk_tri_list(n);
+                    for (i = 0; i < k; i++)
+                        s_vk_idx[i] = s_gpu.idx[s_vk_idx[i]] - lo;
+                }
+            }
             if (t0) {
                 t1 = pb_ns();
                 s_pf[1] += t1 - t0;
@@ -3388,8 +3411,11 @@ static int vk_program_batch(void)
             if (r > 0) {
                 s_gpu.batches_program++;
                 s_gpu.verts_program += n;
-                s_gpu.tris_drawn += k / 3;
-                s_gpu.xf_drawn += k / 3;
+                {
+                    uint32_t tris = s_vk_topo >= 3 ? k - 2 : k / 3;
+                    s_gpu.tris_drawn += tris;
+                    s_gpu.xf_drawn += tris;
+                }
                 note_drawn();
                 return 1;
             }
