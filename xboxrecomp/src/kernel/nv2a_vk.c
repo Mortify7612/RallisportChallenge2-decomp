@@ -498,6 +498,18 @@ static struct {
         uint32_t cull, ff, dt, dw, dco, ste, sop[4], scm, swm, sref;
     } dyn;
     int dyn_valid, idx_bound;
+    /* Descriptor sets made this pool's lifetime, by their images and
+     * samplers: draws alternate between a few, and making one (allocate,
+     * write) for every change was 4% of the executor. `dsc_gen` moves on
+     * whenever the pool is reset or swapped, emptying it; the views a set
+     * holds are destroyed only then (retire). RECOMP_VK_DSET_CACHE=0: off. */
+    struct {
+        VkImageView views[8];
+        VkSampler samps[8];
+        VkDescriptorSet set;
+        uint32_t gen;
+    } dsc[256];
+    uint32_t dsc_gen;
     PFN_vkCmdSetVertexInputEXT set_vi;
     uint8_t vf_ok[NV2A_VF_COUNT];
     uint32_t vi_key[2 + 3 + 16 * 3];
@@ -1965,6 +1977,7 @@ static void slot_use(int i)
     memcpy(V.kfence, sl->kfence, sizeof V.kfence);
     V.fence = sl->fence;
     V.dpool = sl->dpool;
+    V.dsc_gen++;
     V.tspool = sl->tspool;
     V.qpool = sl->qpool;
     V.sem_acq = sl->sem_acq;
@@ -2013,6 +2026,8 @@ static void pend_retire(Pend *p)
             V.rep_acc += delta;
     }
     vkResetDescriptorPool(V.dev, sl->dpool, 0);
+    if (sl->dpool == V.dpool)
+        V.dsc_gen++;
     destroy_list(p->retired, p->nretired);
     p->nretired = 0;
 }
@@ -2138,6 +2153,7 @@ static void vk_sync_inner(int readback)
     V.vtx.used = V.idx.used = V.ubo.used = V.stage.used = V.rb.used = 0;
     vkResetDescriptorPool(V.dev, V.dpool, 0);
     V.sets_used = 0;
+    V.dsc_gen++;
     V.last_set = VK_NULL_HANDLE;
     destroy_retired();
     V.epoch++;
@@ -2186,6 +2202,7 @@ static void vk_flip(void)
     pend_retire(&V.pend[nxt]);
     slot_use(nxt);
     V.sets_used = 0;
+    V.dsc_gen++;
     V.last_set = VK_NULL_HANDLE;
     V.epoch++;
 }
@@ -6054,6 +6071,30 @@ static void aux_frame_end(void)
     V.aux_used = 0;
 }
 
+/* The dsc slot for these images and samplers: theirs if it is there (its
+ * gen then V.dsc_gen + 1), else the one to fill. NULL with the cache off. */
+static __typeof__(&V.dsc[0]) dset_find(const VkImageView *views, const VkSampler *samps)
+{
+    static int on = -1;
+    uint64_t h = 0;
+    __typeof__(&V.dsc[0]) e;
+    int i;
+    if (on < 0) {
+        const char *ev = getenv("RECOMP_VK_DSET_CACHE");
+        on = !(ev && strcmp(ev, "0") == 0);
+    }
+    if (!on)
+        return NULL;
+    for (i = 0; i < 8; i++)
+        h = (h ^ (uint64_t)(uintptr_t)views[i] ^ ((uint64_t)(uintptr_t)samps[i] << 7))
+            * 0x9E3779B97F4A7C15ull;
+    e = &V.dsc[(h >> 56) & 255];
+    if (e->gen == V.dsc_gen + 1 && (memcmp(e->views, views, sizeof e->views)
+                                     || memcmp(e->samps, samps, sizeof e->samps)))
+        e->gen = 0;                 /* another's: replaced */
+    return e;
+}
+
 static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                         uint32_t ninputs, const void *v, const Nv2aVkVerts *vx, uint32_t nv,
                         const uint32_t *idx, uint32_t nidx)
@@ -6069,6 +6110,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     VtxBind vb;
     uint32_t fi = 0;
     void *vp, *ip;
+    __typeof__(&V.dsc[0]) dsc = NULL;
     Nv2aVkUbo *ub, *ubm, ubl;
     VkPipeline pipe;
     VkDescriptorSet set;
@@ -6338,10 +6380,16 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     }
     memcpy(ubm, ub, sizeof *ub);
 
-    /* Descriptor set: reused while the images and samplers stay put. */
+    /* Descriptor set: reused while the images and samplers stay put, or
+     * found among this pool's (dsc). */
     if (V.last_set && !memcmp(views, V.last_views, sizeof views)
         && !memcmp(samps, V.last_samps, sizeof samps)) {
         set = V.last_set;
+    } else if ((dsc = dset_find(views, samps)) != NULL && dsc->gen == V.dsc_gen + 1) {
+        set = dsc->set;
+        V.last_set = set;
+        memcpy(V.last_views, views, sizeof views);
+        memcpy(V.last_samps, samps, sizeof samps);
     } else {
         VkDescriptorSetAllocateInfo ai = { VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
         VkDescriptorImageInfo ii[8];
@@ -6386,6 +6434,12 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         V.last_set = set;
         memcpy(V.last_views, views, sizeof views);
         memcpy(V.last_samps, samps, sizeof samps);
+        if (dsc) {
+            memcpy(dsc->views, views, sizeof views);
+            memcpy(dsc->samps, samps, sizeof samps);
+            dsc->set = set;
+            dsc->gen = V.dsc_gen + 1;
+        }
     }
 
     {
