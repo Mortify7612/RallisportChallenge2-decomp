@@ -487,6 +487,17 @@ static struct {
     /* The primitive topology last set (dynamic in every pipe_build
      * pipeline, so a strip shares a list's pipelines), -1 when unknown. */
     int topo_set;
+    /* The dynamic state draw_common last set (dyn_valid 0: unknown), and
+     * whether the index ring is bound at offset 0 (draws then start at
+     * firstIndex): most draws change little of it, and each call costs
+     * the driver. */
+    struct {
+        VkViewport vp;
+        VkRect2D sc;
+        float bc[4];
+        uint32_t cull, ff, dt, dw, dco, ste, sop[4], scm, swm, sref;
+    } dyn;
+    int dyn_valid, idx_bound;
     PFN_vkCmdSetVertexInputEXT set_vi;
     uint8_t vf_ok[NV2A_VF_COUNT];
     uint32_t vi_key[2 + 3 + 16 * 3];
@@ -643,6 +654,15 @@ static void vtx_bind(const VtxBind *b)
     }
     memcpy(V.vi_key, key, sizeof key);
     V.vi_valid = 1;
+}
+
+/* After anything that sets dynamic state behind draw_common's back. */
+static void dyn_forget(void)
+{
+    V.vi_valid = 0;
+    V.topo_set = -1;
+    V.dyn_valid = 0;
+    V.idx_bound = 0;
 }
 
 /* The draw's topology (Nv2aVkState.topology), unless it is already set. */
@@ -1002,8 +1022,7 @@ static void segment_begin(void)
     vkBeginCommandBuffer(V.ucb, &bi);
     vkBeginCommandBuffer(V.dcb, &bi);
     V.bound_pipe = VK_NULL_HANDLE;
-    V.vi_valid = 0;
-    V.topo_set = -1;
+    dyn_forget();
     V.recording = 1;
     V.seg_draws = 0;
     if (V.tspool && V.nts + 2 <= 2 * (VK_KICKS + 2))
@@ -4541,8 +4560,7 @@ static void ms_refresh(Surf *cs)
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.up_pipe);
     V.bound_pipe = VK_NULL_HANDLE;
-    V.vi_valid = 0;                 /* a static vertex layout */
-    V.topo_set = -1;
+    dyn_forget();                   /* a static vertex layout, its own state */
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     vkCmdEndRendering(V.dcb);
@@ -4807,8 +4825,7 @@ static void ao_pass(VkImageView target, VkImageView resolve, uint32_t w, uint32_
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     V.bound_pipe = VK_NULL_HANDLE;
-    V.vi_valid = 0;                 /* a static vertex layout */
-    V.topo_set = -1;
+    dyn_forget();                   /* a static vertex layout, its own state */
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pcsize, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
@@ -6013,6 +6030,7 @@ static void aux_flush(void)
         vkCmdSetFrontFace(V.dcb, a->ff);
         vkCmdDrawIndexed(V.dcb, a->nidx, 1, 0, 0, 0);
     }
+    dyn_forget();
     vkCmdEndRendering(V.dcb);
     V.last_set = VK_NULL_HANDLE;
 }
@@ -6049,6 +6067,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     VkDeviceSize cbytes = vx ? (VkDeviceSize)nv * vx->nconv * 16 : 0;
     VkDeviceSize vbytes = vx ? rbytes + cbytes + 16 : (VkDeviceSize)nv * ninputs * 16;
     VtxBind vb;
+    uint32_t fi = 0;
     void *vp, *ip;
     Nv2aVkUbo *ub, *ubm, ubl;
     VkPipeline pipe;
@@ -6398,16 +6417,42 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     doff[1] = (uint32_t)coff;
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
                             &set, 2, doff);
+    {
+        /* RECOMP_VK_DYN_CACHE=0: every state set again at every draw. */
+        static int cache = -1;
+        if (cache < 0) {
+            const char *e = getenv("RECOMP_VK_DYN_CACHE");
+            cache = !(e && strcmp(e, "0") == 0);
+        }
+        if (!cache)
+            dyn_forget();
+    }
     vtx_bind(&vb);
     topo_set(st->topology);
-    vkCmdBindIndexBuffer(V.dcb, V.idx.buf, ioff, VK_INDEX_TYPE_UINT32);
-    vkCmdSetViewport(V.dcb, 0, 1, &vpt);
+    if (!V.idx_bound) {
+        vkCmdBindIndexBuffer(V.dcb, V.idx.buf, 0, VK_INDEX_TYPE_UINT32);
+        V.idx_bound = 1;
+    }
+    fi = (uint32_t)(ioff / 4);
     sc = clip_rect(st);
     if (!sc.extent.width || !sc.extent.height)
         return 1;
-    vkCmdSetScissor(V.dcb, 0, 1, &sc);
     nv2a_rc_unpack(st->blend_color, bc);
-    vkCmdSetBlendConstants(V.dcb, bc);
+#define DYN_SET(field, val, call) do { \
+        if (!V.dyn_valid || V.dyn.field != (val)) { call; V.dyn.field = (val); } \
+    } while (0)
+    if (!V.dyn_valid || memcmp(&V.dyn.vp, &vpt, sizeof vpt)) {
+        vkCmdSetViewport(V.dcb, 0, 1, &vpt);
+        V.dyn.vp = vpt;
+    }
+    if (!V.dyn_valid || memcmp(&V.dyn.sc, &sc, sizeof sc)) {
+        vkCmdSetScissor(V.dcb, 0, 1, &sc);
+        V.dyn.sc = sc;
+    }
+    if (!V.dyn_valid || memcmp(V.dyn.bc, bc, sizeof bc)) {
+        vkCmdSetBlendConstants(V.dcb, bc);
+        memcpy(V.dyn.bc, bc, sizeof bc);
+    }
     {
         /* RECOMP_VK_CULL=0 draws both faces whatever the title asks;
          * RECOMP_VK_FLIP_FRONT swaps the winding meaning. */
@@ -6426,22 +6471,39 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         }
         if (flip)
             ccw = !ccw;
-        vkCmdSetCullMode(V.dcb, cm);
-        vkCmdSetFrontFace(V.dcb, ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE
-                                     : VK_FRONT_FACE_CLOCKWISE);
+        DYN_SET(cull, (uint32_t)cm, vkCmdSetCullMode(V.dcb, cm));
+        DYN_SET(ff, (uint32_t)ccw, vkCmdSetFrontFace(V.dcb, ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE
+                                                               : VK_FRONT_FACE_CLOCKWISE));
     }
-    vkCmdSetDepthTestEnable(V.dcb, V.cur_zs && st->depth_test);
-    vkCmdSetDepthWriteEnable(V.dcb, V.cur_zs && st->depth_test && st->depth_mask);
-    vkCmdSetDepthCompareOp(V.dcb, compare_op(depth_mode(st) == 2 ? depth_func_rev(st->depth_func)
-                                                                  : st->depth_func));
-    vkCmdSetStencilTestEnable(V.dcb, V.cur_zs && st->st_test);
-    vkCmdSetStencilOp(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, stencil_op(st->st_fail),
-                      stencil_op(st->st_zpass), stencil_op(st->st_zfail),
-                      compare_op(st->st_func));
-    vkCmdSetStencilCompareMask(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_mask & 0xFF);
-    vkCmdSetStencilWriteMask(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK,
-                             st->st_write ? (st->st_wmask & 0xFF) : 0);
-    vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_ref & 0xFF);
+    {
+        uint32_t dt = V.cur_zs && st->depth_test, dw = dt && st->depth_mask;
+        VkCompareOp dco = compare_op(depth_mode(st) == 2 ? depth_func_rev(st->depth_func)
+                                                         : st->depth_func);
+        uint32_t ste = V.cur_zs && st->st_test;
+        VkStencilOp sf = stencil_op(st->st_fail), sp = stencil_op(st->st_zpass);
+        VkStencilOp sz = stencil_op(st->st_zfail);
+        VkCompareOp sfn = compare_op(st->st_func);
+        uint32_t swm = st->st_write ? (st->st_wmask & 0xFF) : 0;
+        DYN_SET(dt, dt, vkCmdSetDepthTestEnable(V.dcb, dt));
+        DYN_SET(dw, dw, vkCmdSetDepthWriteEnable(V.dcb, dw));
+        DYN_SET(dco, (uint32_t)dco, vkCmdSetDepthCompareOp(V.dcb, dco));
+        DYN_SET(ste, ste, vkCmdSetStencilTestEnable(V.dcb, ste));
+        if (!V.dyn_valid || V.dyn.sop[0] != (uint32_t)sf || V.dyn.sop[1] != (uint32_t)sp
+                || V.dyn.sop[2] != (uint32_t)sz || V.dyn.sop[3] != (uint32_t)sfn) {
+            vkCmdSetStencilOp(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, sf, sp, sz, sfn);
+            V.dyn.sop[0] = (uint32_t)sf;
+            V.dyn.sop[1] = (uint32_t)sp;
+            V.dyn.sop[2] = (uint32_t)sz;
+            V.dyn.sop[3] = (uint32_t)sfn;
+        }
+        DYN_SET(scm, st->st_mask & 0xFF,
+                vkCmdSetStencilCompareMask(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_mask & 0xFF));
+        DYN_SET(swm, swm, vkCmdSetStencilWriteMask(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, swm));
+        DYN_SET(sref, st->st_ref & 0xFF,
+                vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_ref & 0xFF));
+        V.dyn_valid = 1;
+    }
+#undef DYN_SET
     if (zpass_trace() && V.cur_zs && st->st_test && st->st_write && (st->st_wmask & 0xFF)
             && !V.zpass && V.cur_cs && V.cur_cs->w == 640)
         fprintf(stderr, "[ZPASS] F%u stencil-write prog %08X nidx %u depth %u %X st func %X ref %X mask %X"
@@ -6460,7 +6522,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                     st->st_test, st->st_func, st->st_ref, st->st_mask, st->color_mask, st->alpha_test,
                     st->alpha_func, st->alpha_ref, st->clip_x, st->clip_y, st->clip_w, st->clip_h);
         vkCmdBeginQuery(V.dcb, V.qpool, q, V.precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
-        vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+        vkCmdDrawIndexed(V.dcb, nidx, 1, fi, 0, 0);
         vkCmdEndQuery(V.dcb, V.qpool, q);
         if (zpass_trace() && getenv("RECOMP_VK_ZPASS_PROBE") && st->st_test && st->st_func == 0x202) {
             /* Which stencil values lie under this test: the same draw
@@ -6485,13 +6547,13 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                 vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1, &set, 2, doff);
             }
             vtx_bind(&vb);
-            vkCmdBindIndexBuffer(V.dcb, V.idx.buf, ioff, VK_INDEX_TYPE_UINT32);
+            vkCmdBindIndexBuffer(V.dcb, V.idx.buf, 0, VK_INDEX_TYPE_UINT32);
             vkCmdSetViewport(V.dcb, 0, 1, &vpt);
             vkCmdSetScissor(V.dcb, 0, 1, &sc);
             for (k = 0; k < 6; k++) {
                 vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, refs[k]);
                 vkCmdBeginQuery(V.dcb, dq, (uint32_t)k, 0);
-                vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+                vkCmdDrawIndexed(V.dcb, nidx, 1, fi, 0, 0);
                 vkCmdEndQuery(V.dcb, dq, (uint32_t)k);
             }
             vkCmdSetStencilReference(V.dcb, VK_STENCIL_FACE_FRONT_AND_BACK, st->st_ref & 0xFF);
@@ -6508,7 +6570,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, vp2);
                     V.bound_pipe = VK_NULL_HANDLE;
                     vkCmdSetStencilTestEnable(V.dcb, VK_FALSE);
-                    vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+                    vkCmdDrawIndexed(V.dcb, nidx, 1, fi, 0, 0);
                     mark_drawn(st);
                 }
             }
@@ -6554,6 +6616,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                 fprintf(stderr, "[ZPASS] stencil under the test: 00:%llu 01:%llu 14:%llu C8:%llu C9:%llu FF:%llu\n",
                         (unsigned long long)res[0], (unsigned long long)res[1], (unsigned long long)res[2],
                         (unsigned long long)res[3], (unsigned long long)res[4], (unsigned long long)res[5]);
+            dyn_forget();
             return 1;
         }
     } else if (s_flight > 0 && s_dlog && V.fqpool && V.nfq < VK_MAX_QUERIES) {
@@ -6563,10 +6626,10 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         V.fq_frame[q] = nv2a_pb_presented_frames();
         V.fq_seq[q] = s_dlog_seq - 1;
         vkCmdBeginQuery(V.dcb, V.fqpool, q, V.precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
-        vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+        vkCmdDrawIndexed(V.dcb, nidx, 1, fi, 0, 0);
         vkCmdEndQuery(V.dcb, V.fqpool, q);
     } else {
-        vkCmdDrawIndexed(V.dcb, nidx, 1, 0, 0, 0);
+        vkCmdDrawIndexed(V.dcb, nidx, 1, fi, 0, 0);
     }
     if (V.cur_cs && V.cur_cs->w >= 640 && !V.cur_cs->swz && s_probe_nq < 4096
         && probe_active()) {
@@ -7600,8 +7663,7 @@ static void touch_pass(VkImageView view)
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.touch_pipe);
     V.bound_pipe = VK_NULL_HANDLE;
-    V.vi_valid = 0;                 /* a static vertex layout */
-    V.topo_set = -1;
+    dyn_forget();                   /* a static vertex layout, its own state */
     vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     vkCmdEndRendering(V.dcb);
@@ -7720,8 +7782,7 @@ static void hdr_pass(VkImageView target, VkImageLayout layout, VkPipeline pipe, 
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     V.bound_pipe = VK_NULL_HANDLE;
-    V.vi_valid = 0;                 /* a static vertex layout */
-    V.topo_set = -1;
+    dyn_forget();                   /* a static vertex layout, its own state */
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     pc[0] = (float)ox;
     pc[1] = (float)oy;
