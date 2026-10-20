@@ -61,6 +61,11 @@ int nv2a_vk_program(uint32_t hash, uint8_t inputs[16])
 int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
                          uint32_t nv, const uint32_t *idx, uint32_t nidx)
 { (void)s; (void)hash; (void)vin; (void)nv; (void)idx; (void)nidx; return 0; }
+int nv2a_vk_raw_verts(void) { return 0; }
+int nv2a_vk_vfmt_ok(int fmt) { (void)fmt; return 0; }
+int nv2a_vk_draw_program_raw(const Nv2aVkState *s, uint32_t hash, const Nv2aVkVerts *vx,
+                             uint32_t nv, const uint32_t *idx, uint32_t nidx)
+{ (void)s; (void)hash; (void)vx; (void)nv; (void)idx; (void)nidx; return 0; }
 
 #else
 
@@ -469,6 +474,16 @@ static struct {
     WlcDesc wl_desc;            /* mode 3: what the window was told */
     float hdr_paper, hdr_peak, hdr_strength, hdr_glow, hdr_knee;
     int has_colorspace_ext, has_hdr_meta;
+    /* VK_EXT_vertex_input_dynamic_state (RECOMP_VK_RAW_VERTS=0 leaves it
+     * off): every pipeline built by pipe_build takes its vertex layout at
+     * the draw, so a program draw can hand the title's vertices over as
+     * they are (nv2a_vk_draw_program_raw). `vf_ok` the formats the device
+     * reads; `vi_key` the layout last set, `vi_valid` 0 after anything
+     * that may have replaced it. */
+    int vi_dyn, vi_valid;
+    PFN_vkCmdSetVertexInputEXT set_vi;
+    uint8_t vf_ok[NV2A_VF_COUNT];
+    uint32_t vi_key[2 + 3 + 16 * 3];
     VkImageView sc_view[8];
     int sc_attach;              /* the images can be drawn into (touch controls) */
     VkPipeline touch_pipe;      /* the on-screen touch controls, for touch_fmt */
@@ -532,6 +547,97 @@ static struct {
     uint32_t st_pipes_async;    /* general pipelines handed to the worker */
     double st_compile_ms, st_pipe_ms;
 } V;
+
+/* NV2A_VF_* as Vulkan formats. */
+static VkFormat vfmt_vk(int f)
+{
+    static const VkFormat t[NV2A_VF_COUNT] = {
+        VK_FORMAT_R32_SFLOAT, VK_FORMAT_R32G32_SFLOAT,
+        VK_FORMAT_R32G32B32_SFLOAT, VK_FORMAT_R32G32B32A32_SFLOAT,
+        VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM,
+        VK_FORMAT_R8G8B8_UNORM, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_FORMAT_R16_SNORM, VK_FORMAT_R16G16_SNORM,
+        VK_FORMAT_R16G16B16_SNORM, VK_FORMAT_R16G16B16A16_SNORM,
+        VK_FORMAT_R16_SSCALED, VK_FORMAT_R16G16_SSCALED,
+        VK_FORMAT_R16G16B16_SSCALED, VK_FORMAT_R16G16B16A16_SSCALED,
+        VK_FORMAT_B8G8R8A8_UNORM,
+    };
+    return f >= 0 && f < NV2A_VF_COUNT ? t[f] : VK_FORMAT_UNDEFINED;
+}
+
+/* A draw's vertex buffers and layout: up to three bindings (the title's
+ * bytes, the inputs converted on the CPU, the (0, 0, 0, 1) of an absent
+ * input) and per input its binding, format and offset. Without dynamic
+ * vertex input, only the float layout pipe_build bakes in is used. */
+typedef struct {
+    uint32_t n, nb;
+    uint32_t stride[3];
+    uint8_t bind[16];
+    VkFormat fmt[16];
+    uint32_t off[16];
+    VkDeviceSize boff[3];
+} VtxBind;
+
+static void vtx_float(VtxBind *b, uint32_t ninputs, VkDeviceSize voff)
+{
+    uint32_t i;
+    b->n = ninputs;
+    b->nb = 1;
+    b->stride[0] = 16 * ninputs;
+    b->boff[0] = voff;
+    for (i = 0; i < ninputs; i++) {
+        b->bind[i] = 0;
+        b->fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
+        b->off[i] = 16 * i;
+    }
+}
+
+/* Bind `b`'s buffers and, with dynamic vertex input, set its layout --
+ * unless it is the one already set. */
+static void vtx_bind(const VtxBind *b)
+{
+    VkBuffer bufs[3];
+    uint32_t key[2 + 3 + 16 * 3], i, k = 0;
+    bufs[0] = bufs[1] = bufs[2] = V.vtx.buf;
+    vkCmdBindVertexBuffers(V.dcb, 0, b->nb, bufs, b->boff);
+    if (!V.vi_dyn)
+        return;
+    memset(key, 0, sizeof key);
+    key[k++] = b->n;
+    key[k++] = b->nb;
+    for (i = 0; i < 3; i++)
+        key[k++] = i < b->nb ? b->stride[i] : 0;
+    for (i = 0; i < b->n; i++) {
+        key[k++] = b->bind[i];
+        key[k++] = (uint32_t)b->fmt[i];
+        key[k++] = b->off[i];
+    }
+    if (V.vi_valid && !memcmp(key, V.vi_key, sizeof key))
+        return;
+    {
+        VkVertexInputBindingDescription2EXT bd[3];
+        VkVertexInputAttributeDescription2EXT ad[16];
+        for (i = 0; i < b->nb; i++) {
+            memset(&bd[i], 0, sizeof bd[i]);
+            bd[i].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT;
+            bd[i].binding = i;
+            bd[i].stride = b->stride[i];
+            bd[i].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            bd[i].divisor = 1;
+        }
+        for (i = 0; i < b->n; i++) {
+            memset(&ad[i], 0, sizeof ad[i]);
+            ad[i].sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT;
+            ad[i].location = i;
+            ad[i].binding = b->bind[i];
+            ad[i].format = b->fmt[i];
+            ad[i].offset = b->off[i];
+        }
+        V.set_vi(V.dcb, b->nb, bd, b->n, ad);
+    }
+    memcpy(V.vi_key, key, sizeof key);
+    V.vi_valid = 1;
+}
 
 static double now_ms(void)
 {
@@ -877,6 +983,7 @@ static void segment_begin(void)
     vkBeginCommandBuffer(V.ucb, &bi);
     vkBeginCommandBuffer(V.dcb, &bi);
     V.bound_pipe = VK_NULL_HANDLE;
+    V.vi_valid = 0;
     V.recording = 1;
     V.seg_draws = 0;
     if (V.tspool && V.nts + 2 <= 2 * (VK_KICKS + 2))
@@ -2525,8 +2632,8 @@ static int vk_init(void)
         }
         dci.pNext = &f2;
         {
-            static const char *swext[4];
-            int has_pid = 0, has_pw = 0, nx = 0;
+            static const char *swext[6];
+            int has_pid = 0, has_pw = 0, has_vi = 0, nx = 0;
             const char *ft = getenv("RECOMP_FRAME_TIMES");
             VkExtensionProperties ep[512];
             uint32_t ne = 512, k;
@@ -2540,6 +2647,24 @@ static int vk_init(void)
                     has_pid = 1;
                 if (!strcmp(ep[k].extensionName, "VK_KHR_present_wait"))
                     has_pw = 1;
+                if (!strcmp(ep[k].extensionName, "VK_EXT_vertex_input_dynamic_state"))
+                    has_vi = 1;
+            }
+            {
+                static VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT fvi = {
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT };
+                VkPhysicalDeviceFeatures2 q2 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+                const char *e = getenv("RECOMP_VK_RAW_VERTS");
+                if (has_vi && !(e && strcmp(e, "0") == 0)) {
+                    q2.pNext = &fvi;
+                    vkGetPhysicalDeviceFeatures2(V.pd, &q2);
+                    if (fvi.vertexInputDynamicState) {
+                        fvi.pNext = f2.pNext;
+                        f2.pNext = &fvi;
+                        swext[nx++] = "VK_EXT_vertex_input_dynamic_state";
+                        V.vi_dyn = 1;
+                    }
+                }
             }
             if (V.has_swapchain_ext) {
                 swext[nx++] = "VK_KHR_swapchain";
@@ -2554,11 +2679,11 @@ static int vk_init(void)
                     f12.pNext = &fpid;
                     V.has_pwait = 1;
                 }
-                dci.enabledExtensionCount = (uint32_t)nx;
-                dci.ppEnabledExtensionNames = swext;
             } else {
                 V.has_hdr_meta = 0;
             }
+            dci.enabledExtensionCount = (uint32_t)nx;
+            dci.ppEnabledExtensionNames = nx ? swext : NULL;
         }
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
@@ -2574,6 +2699,24 @@ static int vk_init(void)
             return vk_fail("vkGetDeviceProcAddr", VK_ERROR_INITIALIZATION_FAILED);
 #endif
         vkGetDeviceQueue(V.dev, V.qf, 0, &V.q);
+        if (V.vi_dyn) {
+            V.set_vi = (PFN_vkCmdSetVertexInputEXT)vkGetDeviceProcAddr(V.dev, "vkCmdSetVertexInputEXT");
+            if (!V.set_vi)
+                V.vi_dyn = 0;
+        }
+        if (V.vi_dyn) {
+            /* Formats the title's vertices come in. The three-component
+             * 8- and 16-bit ones are optional in Vulkan. */
+            int f, n = 0;
+            for (f = 0; f < NV2A_VF_COUNT; f++) {
+                VkFormatProperties fp;
+                vkGetPhysicalDeviceFormatProperties(V.pd, vfmt_vk(f), &fp);
+                V.vf_ok[f] = (fp.bufferFeatures & VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) != 0;
+                n += V.vf_ok[f];
+            }
+            fprintf(stderr, "  [VK] title vertices read as they are (%d of %d formats)\n",
+                    n, NV2A_VF_COUNT);
+        }
     }
     {
         VkCommandPoolCreateInfo pci = { VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
@@ -2926,7 +3069,7 @@ static VkPipeline pipe_build(const PipeDesc *d, int count)
         VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
         VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
-        VK_DYNAMIC_STATE_STENCIL_OP,
+        VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT,
     };
     VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
@@ -2980,7 +3123,8 @@ static VkPipeline pipe_build(const PipeDesc *d, int count)
     ba.colorWriteMask = d->cm;
     bs.attachmentCount = d->cfmt != VK_FORMAT_UNDEFINED ? 1 : 0;
     bs.pAttachments = &ba;
-    dy.dynamicStateCount = sizeof dyn / sizeof dyn[0];
+    /* The last, the vertex layout, only with dynamic vertex input. */
+    dy.dynamicStateCount = sizeof dyn / sizeof dyn[0] - (V.vi_dyn ? 0 : 1);
     dy.pDynamicStates = dyn;
     ri.colorAttachmentCount = d->cfmt != VK_FORMAT_UNDEFINED ? 1 : 0;
     ri.pColorAttachmentFormats = &d->cfmt;
@@ -2989,7 +3133,7 @@ static VkPipeline pipe_build(const PipeDesc *d, int count)
     gp.pNext = &ri;
     gp.stageCount = 2;
     gp.pStages = st;
-    gp.pVertexInputState = &vi;
+    gp.pVertexInputState = V.vi_dyn ? NULL : &vi;
     gp.pInputAssemblyState = &ia;
     gp.pViewportState = &vps;
     gp.pRasterizationState = &rs;
@@ -4270,6 +4414,7 @@ static void ms_refresh(Surf *cs)
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.up_pipe);
     V.bound_pipe = VK_NULL_HANDLE;
+    V.vi_valid = 0;                 /* a static vertex layout */
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     vkCmdEndRendering(V.dcb);
@@ -4534,6 +4679,7 @@ static void ao_pass(VkImageView target, VkImageView resolve, uint32_t w, uint32_
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     V.bound_pipe = VK_NULL_HANDLE;
+    V.vi_valid = 0;                 /* a static vertex layout */
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pcsize, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
@@ -5552,7 +5698,8 @@ typedef struct {
     VkPipeline pipe;
     VkDescriptorSet set;
     uint32_t doff[2];
-    VkDeviceSize voff, ioff;
+    VtxBind vb;
+    VkDeviceSize ioff;
     uint32_t nidx;
     VkViewport vp;
     VkRect2D sc;
@@ -5631,7 +5778,7 @@ static VkPipeline aux_pipeline(const Nv2aVkState *st, int kind, VkShaderModule v
 
 static void aux_record(const Nv2aVkState *st, int kind, VkShaderModule vs, uint32_t prog,
                        uint32_t ninputs, VkDescriptorSet set, const uint32_t *doff,
-                       VkDeviceSize voff, VkDeviceSize ioff, uint32_t nidx,
+                       const VtxBind *vb, VkDeviceSize ioff, uint32_t nidx,
                        const VkViewport *vp, const VkRect2D *sc, VkCullModeFlags cull,
                        VkFrontFace ff, const float *bc)
 {
@@ -5648,7 +5795,7 @@ static void aux_record(const Nv2aVkState *st, int kind, VkShaderModule vs, uint3
     a->set = set;
     a->doff[0] = doff[0];
     a->doff[1] = doff[1];
-    a->voff = voff;
+    a->vb = *vb;
     a->ioff = ioff;
     a->nidx = nidx;
     a->vp = *vp;
@@ -5725,7 +5872,7 @@ static void aux_flush(void)
         V.bound_pipe = VK_NULL_HANDLE;
         vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
                                 &a->set, 2, a->doff);
-        vkCmdBindVertexBuffers(V.dcb, 0, 1, &V.vtx.buf, &a->voff);
+        vtx_bind(&a->vb);
         vkCmdBindIndexBuffer(V.dcb, V.idx.buf, a->ioff, VK_INDEX_TYPE_UINT32);
         vkCmdSetViewport(V.dcb, 0, 1, &a->vp);
         vkCmdSetScissor(V.dcb, 0, 1, &a->sc);
@@ -5758,13 +5905,18 @@ static void aux_frame_end(void)
 }
 
 static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
-                        uint32_t ninputs, const void *v, uint32_t nv,
+                        uint32_t ninputs, const void *v, const Nv2aVkVerts *vx, uint32_t nv,
                         const uint32_t *idx, uint32_t nidx)
 {
     VkImageView views[8];
     VkSampler samps[8];
     VkDeviceSize voff = 0, ioff = 0, uoff = 0, coff = 0;
-    VkDeviceSize vbytes = (VkDeviceSize)nv * ninputs * 16;
+    /* With `vx`: the title's bytes, then the converted inputs, then a
+     * (0, 0, 0, 1) for absent ones, each 16-byte aligned. */
+    VkDeviceSize rbytes = vx ? ((VkDeviceSize)vx->raw_bytes + 15) & ~(VkDeviceSize)15 : 0;
+    VkDeviceSize cbytes = vx ? (VkDeviceSize)nv * vx->nconv * 16 : 0;
+    VkDeviceSize vbytes = vx ? rbytes + cbytes + 16 : (VkDeviceSize)nv * ninputs * 16;
+    VtxBind vb;
     void *vp, *ip;
     Nv2aVkUbo *ub, *ubm, ubl;
     VkPipeline pipe;
@@ -5778,7 +5930,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     int ccw = st->front_face == 0x0901;
 
     if (dlog_active())
-        dlog_draw(st, prog, v, vbytes, idx, nidx);
+        dlog_draw(st, prog, vx ? vx->raw : v, vx ? vx->raw_bytes : vbytes, idx, nidx);
     {
         /* RECOMP_VK_SKIP_PROG=<hex>[,<hex>...]: drop those programs' draws,
          * to see what they are. */
@@ -5888,7 +6040,33 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         if (!vp || !ip || !ubm || !const_upload(&coff))
             return 1;
     }
-    memcpy(vp, v, (size_t)vbytes);
+    if (vx) {
+        static const float dflt[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        uint32_t i2;
+        if (vx->raw_bytes)
+            memcpy(vp, vx->raw, vx->raw_bytes);
+        if (cbytes)
+            memcpy((char *)vp + rbytes, vx->conv, (size_t)cbytes);
+        memcpy((char *)vp + rbytes + cbytes, dflt, 16);
+        vb.n = ninputs;
+        vb.nb = 3;
+        vb.stride[0] = vx->raw_stride;
+        vb.stride[1] = vx->nconv * 16;
+        vb.stride[2] = 0;
+        vb.boff[0] = voff;
+        vb.boff[1] = voff + rbytes;
+        vb.boff[2] = voff + rbytes + cbytes;
+        for (i2 = 0; i2 < ninputs; i2++) {
+            vb.bind[i2] = vx->src[i2];
+            vb.fmt[i2] = vx->src[i2] == NV2A_VS_RAW ? vfmt_vk(vx->fmt[i2])
+                                                     : VK_FORMAT_R32G32B32A32_SFLOAT;
+            vb.off[i2] = vx->src[i2] == NV2A_VS_RAW ? vx->off[i2]
+                       : vx->src[i2] == NV2A_VS_CONV ? 16u * vx->off[i2] : 0;
+        }
+    } else {
+        memcpy(vp, v, (size_t)vbytes);
+        vtx_float(&vb, ninputs, voff);
+    }
     memcpy(ip, idx, (size_t)nidx * 4);
 
     /* Per-draw constants. Built in ordinary memory and copied over once: the
@@ -6088,7 +6266,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     doff[1] = (uint32_t)coff;
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
                             &set, 2, doff);
-    vkCmdBindVertexBuffers(V.dcb, 0, 1, &V.vtx.buf, &voff);
+    vtx_bind(&vb);
     vkCmdBindIndexBuffer(V.dcb, V.idx.buf, ioff, VK_INDEX_TYPE_UINT32);
     vkCmdSetViewport(V.dcb, 0, 1, &vpt);
     sc = clip_rect(st);
@@ -6173,7 +6351,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
                 uint32_t doff[2] = { (uint32_t)uoff, (uint32_t)coff };
                 vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1, &set, 2, doff);
             }
-            vkCmdBindVertexBuffers(V.dcb, 0, 1, &V.vtx.buf, &voff);
+            vtx_bind(&vb);
             vkCmdBindIndexBuffer(V.dcb, V.idx.buf, ioff, VK_INDEX_TYPE_UINT32);
             vkCmdSetViewport(V.dcb, 0, 1, &vpt);
             vkCmdSetScissor(V.dcb, 0, 1, &sc);
@@ -6296,7 +6474,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     {
         int kind = aux_kind(st);
         if (kind)
-            aux_record(st, kind, vs, prog, ninputs, set, doff, voff, ioff, nidx, &vpt, &sc, cm,
+            aux_record(st, kind, vs, prog, ninputs, set, doff, &vb, ioff, nidx, &vpt, &sc, cm,
                        ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE, bc);
     }
     mark_drawn(st);
@@ -6311,7 +6489,7 @@ void nv2a_vk_draw(const Nv2aVkState *st, const Nv2aVshOutput *v, uint32_t nv,
 {
     if (!nidx || !nv || !nv2a_vk_active())
         return;
-    (void)draw_common(st, V.vs, 0, sizeof *v / 16, v, nv, idx, nidx);
+    (void)draw_common(st, V.vs, 0, sizeof *v / 16, v, NULL, nv, idx, nidx);
 }
 
 /* ---- title vertex programs on the GPU ----------------------------------- */
@@ -6613,7 +6791,29 @@ int nv2a_vk_draw_program(const Nv2aVkState *st, uint32_t hash, const float *vin,
     p = prog_get(hash);
     if (!p || __atomic_load_n(&p->state, __ATOMIC_ACQUIRE) != 1)
         return 0;
-    return draw_common(st, p->vs, hash, p->ninputs ? p->ninputs : 1, vin, nv, idx, nidx);
+    return draw_common(st, p->vs, hash, p->ninputs ? p->ninputs : 1, vin, NULL, nv, idx, nidx);
+}
+
+int nv2a_vk_raw_verts(void)
+{
+    return nv2a_vk_active() && V.vi_dyn;
+}
+
+int nv2a_vk_vfmt_ok(int fmt)
+{
+    return fmt >= 0 && fmt < NV2A_VF_COUNT && V.vf_ok[fmt];
+}
+
+int nv2a_vk_draw_program_raw(const Nv2aVkState *st, uint32_t hash, const Nv2aVkVerts *vx,
+                             uint32_t nv, const uint32_t *idx, uint32_t nidx)
+{
+    Prog *p;
+    if (!nidx || !nv || !nv2a_vk_active())
+        return 1;
+    p = prog_get(hash);
+    if (!p || __atomic_load_n(&p->state, __ATOMIC_ACQUIRE) != 1)
+        return 0;
+    return draw_common(st, p->vs, hash, p->ninputs ? p->ninputs : 1, NULL, vx, nv, idx, nidx);
 }
 
 
@@ -7257,6 +7457,7 @@ static void touch_pass(VkImageView view)
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.touch_pipe);
     V.bound_pipe = VK_NULL_HANDLE;
+    V.vi_valid = 0;                 /* a static vertex layout */
     vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     vkCmdEndRendering(V.dcb);
@@ -7375,6 +7576,7 @@ static void hdr_pass(VkImageView target, VkImageLayout layout, VkPipeline pipe, 
     vkCmdSetScissor(V.dcb, 0, 1, &sc);
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     V.bound_pipe = VK_NULL_HANDLE;
+    V.vi_valid = 0;                 /* a static vertex layout */
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     pc[0] = (float)ox;
     pc[1] = (float)oy;

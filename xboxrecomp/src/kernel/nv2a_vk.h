@@ -84,6 +84,37 @@ int  nv2a_vk_program(uint32_t hash, uint8_t inputs[16]);
 int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
                          uint32_t nv, const uint32_t *idx, uint32_t nidx);
 
+/* The same draw with the inputs as the title laid them out, for the GPU to
+ * read and convert itself (VK_EXT_vertex_input_dynamic_state): the
+ * vertices' bytes copied as they are, rather than turned into four floats
+ * an input on the CPU. An input whose format Vulkan has no match for (the
+ * packed 11:11:10 normal) comes converted, in `conv`; one the title does
+ * not supply reads (0, 0, 0, 1). */
+enum {
+    NV2A_VF_F32 = 0,            /* + size - 1: float, 1 to 4 components */
+    NV2A_VF_UN8 = 4,            /* unsigned byte, normalised */
+    NV2A_VF_SN16 = 8,           /* signed short, normalised */
+    NV2A_VF_SS16 = 12,          /* signed short, as is */
+    NV2A_VF_BGRA8 = 16,         /* D3DCOLOR */
+    NV2A_VF_COUNT
+};
+enum { NV2A_VS_RAW, NV2A_VS_CONV, NV2A_VS_NONE };
+typedef struct {
+    const void *raw;            /* vertex 0's first byte */
+    uint32_t raw_bytes, raw_stride;
+    const float *conv;          /* `nconv` float4s a vertex */
+    uint32_t nconv;
+    uint8_t src[16];            /* per input, NV2A_VS_* */
+    uint8_t fmt[16];            /* NV2A_VS_RAW: NV2A_VF_* */
+    uint16_t off[16];           /* RAW: byte offset in a vertex; CONV: its slot */
+} Nv2aVkVerts;
+
+/* 1 when nv2a_vk_draw_program_raw can be used, and for which formats. */
+int nv2a_vk_raw_verts(void);
+int nv2a_vk_vfmt_ok(int fmt);
+int nv2a_vk_draw_program_raw(const Nv2aVkState *s, uint32_t hash, const Nv2aVkVerts *vx,
+                             uint32_t nv, const uint32_t *idx, uint32_t nidx);
+
 /* CLEAR_SURFACE: `flags` is its parameter (0x01 Z, 0x02 stencil, 0xF0
  * colour), `argb` the colour clear value, `zs` ZSTENCIL_CLEAR_VALUE. */
 void nv2a_vk_clear(const Nv2aVkState *s, uint32_t flags, uint32_t argb,

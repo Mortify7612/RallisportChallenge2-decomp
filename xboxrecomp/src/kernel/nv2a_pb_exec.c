@@ -3209,13 +3209,114 @@ static void vk_draw_batch(const Nv2aVshOutput *v, uint32_t n, Nv2aVkState *st)
  * and lets the indices share vertices; otherwise one vertex per index. */
 static uint32_t k_or_1(uint32_t kk) { return kk ? kk : 1; }
 
+/* An attribute's format as the GPU can read it (NV2A_VF_*), and the size
+ * of its components; -1 for one it cannot (the packed normal). */
+static int vk_vfmt(const VertexAttr *a, uint32_t *csize)
+{
+    uint32_t n = a->size < 4 ? a->size : 4;
+    switch (a->type) {
+    case 0: *csize = 1; return a->size == 4 ? NV2A_VF_BGRA8 : -1;
+    case 2: *csize = 4; return NV2A_VF_F32 + (int)n - 1;
+    case 4: *csize = 1; return NV2A_VF_UN8 + (int)n - 1;
+    case 1: *csize = 2; return NV2A_VF_SN16 + (int)n - 1;
+    case 5: *csize = 2; return NV2A_VF_SS16 + (int)n - 1;
+    default: return -1;
+    }
+}
+
+/* The program's inputs for vertices lo..lo+nv-1 as the title laid them
+ * out (nv2a_vk_draw_program_raw): those in one interleaved stream, in a
+ * format the GPU reads, go as the stream's bytes; the rest are converted
+ * here into `conv`. 0 when nothing would be gained: draw it the old way. */
+static int vk_raw_verts(const uint8_t *ins, uint32_t kk, uint32_t lo, uint32_t nv,
+                        float *conv, Nv2aVkVerts *vx)
+{
+    const uint8_t *base;
+    uint32_t i, st0 = 0, bo = 0xFFFFFFFFu, end = 0, nraw = 0, nnone = 0, cs;
+    int f[16];
+
+    memset(vx, 0, sizeof *vx);
+    if (!kk) {
+        vx->src[0] = NV2A_VS_NONE;
+        return 1;
+    }
+    for (i = 0; i < kk; i++) {
+        const VertexAttr *a = &s_gpu.attr[ins[i]];
+        f[i] = -1;
+        if (!a->size || !a->stride || (!s_gpu.inline_active && !a->offset)) {
+            vx->src[i] = NV2A_VS_NONE;      /* reads (0, 0, 0, 1) */
+            nnone++;
+            continue;
+        }
+        vx->src[i] = NV2A_VS_CONV;
+        f[i] = vk_vfmt(a, &cs);
+        if (f[i] < 0 || !nv2a_vk_vfmt_ok(f[i]) || (a->stride % cs)) {
+            f[i] = -1;
+            continue;
+        }
+        if (!st0)
+            st0 = a->stride;
+        if (a->stride == st0 && a->offset < bo)
+            bo = a->offset;
+    }
+    /* One stream: the inputs within a vertex of the first one's stride. */
+    for (i = 0; i < kk && st0; i++) {
+        const VertexAttr *a = &s_gpu.attr[ins[i]];
+        uint32_t e;
+        if (f[i] < 0 || a->stride != st0 || a->offset - bo >= st0)
+            continue;
+        (void)vk_vfmt(a, &cs);
+        if ((a->offset - bo) % cs)
+            continue;
+        e = a->offset - bo + (f[i] == NV2A_VF_BGRA8 ? 4 : (a->size < 4 ? a->size : 4) * cs);
+        if (e > end)
+            end = e;
+        vx->src[i] = NV2A_VS_RAW;
+        vx->fmt[i] = (uint8_t)f[i];
+        vx->off[i] = (uint16_t)(a->offset - bo);
+        nraw++;
+    }
+    if (nraw) {
+        vx->raw_stride = st0;
+        vx->raw_bytes = (nv - 1) * st0 + end;
+        if (s_gpu.inline_active) {
+            /* Some of the stream past the payload's end: fetch_attr's
+             * (0, 0, 0, 1) for those, so convert them all. */
+            if ((size_t)bo + (size_t)(lo + nv - 1) * st0 + end > (size_t)s_gpu.inline_count * 4) {
+                for (i = 0; i < kk; i++)
+                    if (vx->src[i] == NV2A_VS_RAW)
+                        vx->src[i] = NV2A_VS_CONV;
+                nraw = 0;
+            }
+            base = (const uint8_t *)s_gpu.inline_buf;
+        } else {
+            base = (const uint8_t *)xbox_GetMemoryOffset();
+        }
+        vx->raw = base + bo + (size_t)lo * st0;
+    }
+    if (!nraw && !nnone)
+        return 0;
+    if (!nraw)
+        vx->raw_bytes = vx->raw_stride = 0;
+    for (i = 0; i < kk; i++)
+        if (vx->src[i] == NV2A_VS_CONV)
+            vx->off[i] = (uint16_t)vx->nconv++;
+    for (i = 0; i < kk; i++)
+        if (vx->src[i] == NV2A_VS_CONV)
+            fetch_attr_run(&s_gpu.attr[ins[i]], lo, NULL, nv, conv + (size_t)vx->off[i] * 4,
+                           (size_t)vx->nconv * 4);
+    vx->conv = conv;
+    return 1;
+}
+
 static int vk_program_batch(void)
 {
     static float *vin;
     uint8_t ins[16];
     uint32_t h, n = s_gpu.idx_count, i, j, lo, hi, nv, k, kk, ranged;
-    int got;
+    int got, raw;
     Nv2aVkState st;
+    Nv2aVkVerts vx;
 
     if (!nv2a_vk_active())
         return 0;
@@ -3237,16 +3338,20 @@ static int vk_program_batch(void)
     }
     ranged = hi - lo < NV_MAX_INDICES && hi - lo + 1 <= 2 * n + 64;
     nv = ranged ? hi - lo + 1 : n;
-    if (!kk)
+    /* The title's vertices handed over as they are, when the GPU can take
+     * them (RECOMP_VK_RAW_VERTS=0 not): the paused race's executor spent a
+     * quarter of its time making floats of them. */
+    raw = ranged && nv2a_vk_raw_verts() && vk_raw_verts(ins, kk, lo, nv, vin, &vx);
+    if (!raw && !kk)
         for (j = 0; j < nv; j++) {
             float *o = vin + (size_t)j * 4;
             o[0] = o[1] = o[2] = 0.0f;
             o[3] = 1.0f;
         }
-    for (i = 0; i < kk; i++)
+    for (i = 0; i < kk && !raw; i++)
         fetch_attr_run(&s_gpu.attr[ins[i]], ranged ? lo : 0, ranged ? NULL : s_gpu.idx,
                        nv, vin + (size_t)i * 4, (size_t)k * 4);
-    {
+    if (!raw) {
         /* RECOMP_PB_FETCH_CHECK=1: every batch fetched again vertex by
          * vertex (fetch_attr), compared bit for bit with the fast path. */
         static int check = -1;
@@ -3289,7 +3394,7 @@ static int vk_program_batch(void)
             const char *e = getenv("RECOMP_VSH_DUMP");
             want = e ? (long)strtoul(e, NULL, 16) : -1;
         }
-        if (want >= 0 && (uint32_t)want == h && shown < (getenv("RECOMP_VSH_DUMP_N") ? atoi(getenv("RECOMP_VSH_DUMP_N")) : 24)) {
+        if (!raw && want >= 0 && (uint32_t)want == h && shown < (getenv("RECOMP_VSH_DUMP_N") ? atoi(getenv("RECOMP_VSH_DUMP_N")) : 24)) {
             uint32_t vv;
             shown++;
             fprintf(stderr, "[VSHDUMP] F%u prog %08X nv %u prim %u inputs", s_presented, h, nv, s_gpu.prim);
@@ -3312,7 +3417,8 @@ static int vk_program_batch(void)
         }
     }
     vk_state(&st);
-    if (!nv2a_vk_draw_program(&st, h, vin, nv, s_vk_idx, k))
+    if (!(raw ? nv2a_vk_draw_program_raw(&st, h, &vx, nv, s_vk_idx, k)
+              : nv2a_vk_draw_program(&st, h, vin, nv, s_vk_idx, k)))
         return 0;                       /* still compiling: the CPU path draws it */
     s_gpu.tris_drawn += k / 3;
     s_gpu.xf_drawn += k / 3;
