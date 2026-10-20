@@ -3493,6 +3493,15 @@ static int tex_get(const Nv2aVkTex *t, VkImageView *view, uint32_t *levels_out)
     uint32_t nregs = 0;
 
     d.filter = d.addr_u = d.addr_v = d.addr_p = 0;
+    /* Registers a format does not read hold whatever an earlier draw left:
+     * RSC2's DXT textures came with two or three pitches and palettes, and
+     * each was a texture of its own -- cached, checked every epoch and
+     * uploaded again. The palette is P8's only; swizzled and DXT textures
+     * have no pitch. (Found in the Switch port's GL renderer.) */
+    if (d.color != 0x0B)
+        d.palette = 0;
+    if (d.size_from_format)
+        d.pitch = 0;
     if (!d.valid || !d.width || !d.height || d.width > 4096 || d.height > 4096)
         { tex_fail(1, &d); return 0; }
     bytes = nv2a_pb_tex_bytes(&d);
