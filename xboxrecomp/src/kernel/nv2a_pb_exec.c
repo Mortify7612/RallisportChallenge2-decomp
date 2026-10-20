@@ -2992,7 +2992,8 @@ uint32_t nv2a_pb_tex_bytes(const Nv2aVkTex *d)
     return n;
 }
 
-/* The topology vk_tri_list produced: 0 triangles, 1 lines, 2 points. */
+/* The topology vk_tri_list produced: 0 triangles, 1 lines, 2 points, 3 a
+ * triangle strip. */
 static uint32_t s_vk_topo;
 
 static void vk_state(Nv2aVkState *v)
@@ -3139,6 +3140,15 @@ static uint32_t vk_tri_list(uint32_t n)
         }
         break;
     case NV_PRIM_TRIANGLE_STRIP:
+        if (n >= 3 && nv2a_vk_strips()) {
+            /* Drawn as a strip: no list of three indices a triangle to
+             * build here (and remap, and copy), which was a tenth of the
+             * executor in the paused race. RECOMP_VK_STRIPS=0 for the list. */
+            for (i = 0; i < n; i++)
+                s_vk_idx[i] = i;
+            s_vk_topo = 3;
+            return n;
+        }
         for (i = 0; i + 2 < n; i++) {
             s_vk_idx[k++] = (i & 1) ? i + 1 : i;
             s_vk_idx[k++] = (i & 1) ? i : i + 1;

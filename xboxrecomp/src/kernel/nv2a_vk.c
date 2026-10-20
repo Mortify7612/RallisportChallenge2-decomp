@@ -62,6 +62,7 @@ int nv2a_vk_draw_program(const Nv2aVkState *s, uint32_t hash, const float *vin,
                          uint32_t nv, const uint32_t *idx, uint32_t nidx)
 { (void)s; (void)hash; (void)vin; (void)nv; (void)idx; (void)nidx; return 0; }
 int nv2a_vk_raw_verts(void) { return 0; }
+int nv2a_vk_strips(void) { return 0; }
 int nv2a_vk_vfmt_ok(int fmt) { (void)fmt; return 0; }
 int nv2a_vk_draw_program_raw(const Nv2aVkState *s, uint32_t hash, const Nv2aVkVerts *vx,
                              uint32_t nv, const uint32_t *idx, uint32_t nidx)
@@ -100,7 +101,8 @@ int nv2a_vk_draw_program_raw(const Nv2aVkState *s, uint32_t hash, const Nv2aVkVe
     X(vkCmdSetCullMode, "EXT") X(vkCmdSetFrontFace, "EXT") \
     X(vkCmdSetDepthTestEnable, "EXT") X(vkCmdSetDepthWriteEnable, "EXT") \
     X(vkCmdSetDepthCompareOp, "EXT") X(vkCmdSetStencilTestEnable, "EXT") \
-    X(vkCmdSetStencilOp, "EXT") X(vkResetQueryPool, "EXT")
+    X(vkCmdSetStencilOp, "EXT") X(vkResetQueryPool, "EXT") \
+    X(vkCmdSetPrimitiveTopology, "EXT")
 #define VK_LATE_DECL(name, sfx) static PFN_##name p_##name;
 VK_LATE_FNS(VK_LATE_DECL)
 #undef VK_LATE_DECL
@@ -114,6 +116,7 @@ VK_LATE_FNS(VK_LATE_DECL)
 #define vkCmdSetStencilTestEnable p_vkCmdSetStencilTestEnable
 #define vkCmdSetStencilOp         p_vkCmdSetStencilOp
 #define vkResetQueryPool          p_vkResetQueryPool
+#define vkCmdSetPrimitiveTopology p_vkCmdSetPrimitiveTopology
 
 /* 0 if any is missing. */
 static int vk_load_device_fns(VkDevice dev)
@@ -481,6 +484,9 @@ static struct {
      * reads; `vi_key` the layout last set, `vi_valid` 0 after anything
      * that may have replaced it. */
     int vi_dyn, vi_valid;
+    /* The primitive topology last set (dynamic in every pipe_build
+     * pipeline, so a strip shares a list's pipelines), -1 when unknown. */
+    int topo_set;
     PFN_vkCmdSetVertexInputEXT set_vi;
     uint8_t vf_ok[NV2A_VF_COUNT];
     uint32_t vi_key[2 + 3 + 16 * 3];
@@ -637,6 +643,19 @@ static void vtx_bind(const VtxBind *b)
     }
     memcpy(V.vi_key, key, sizeof key);
     V.vi_valid = 1;
+}
+
+/* The draw's topology (Nv2aVkState.topology), unless it is already set. */
+static void topo_set(uint32_t t)
+{
+    static const VkPrimitiveTopology k[4] = {
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST,
+        VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
+    };
+    if ((int)(t & 3) == V.topo_set)
+        return;
+    vkCmdSetPrimitiveTopology(V.dcb, k[t & 3]);
+    V.topo_set = (int)(t & 3);
 }
 
 static double now_ms(void)
@@ -984,6 +1003,7 @@ static void segment_begin(void)
     vkBeginCommandBuffer(V.dcb, &bi);
     V.bound_pipe = VK_NULL_HANDLE;
     V.vi_valid = 0;
+    V.topo_set = -1;
     V.recording = 1;
     V.seg_draws = 0;
     if (V.tspool && V.nts + 2 <= 2 * (VK_KICKS + 2))
@@ -3175,7 +3195,8 @@ static VkPipeline pipe_build(const PipeDesc *d, int count)
         VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
         VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
-        VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_VERTEX_INPUT_EXT,
+        VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY,
+        VK_DYNAMIC_STATE_VERTEX_INPUT_EXT,
     };
     VkPipelineDynamicStateCreateInfo dy = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
     VkPipelineRenderingCreateInfo ri = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
@@ -3305,7 +3326,7 @@ static void pipe_desc(PipeDesc *d, VkFormat cfmt, int has_depth, const Nv2aVkSta
     d->beq = s->blend_equation;
     d->sf = s->blend_sfactor;
     d->df = s->blend_dfactor;
-    d->topo = s->topology;
+    d->topo = s->topology == 3 ? 0 : s->topology;   /* a strip: a list's pipeline */
     d->vs = vs;
     d->ninputs = ninputs;
     d->samples = V.cur_samples ? V.cur_samples : 1;
@@ -4521,6 +4542,7 @@ static void ms_refresh(Surf *cs)
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.up_pipe);
     V.bound_pipe = VK_NULL_HANDLE;
     V.vi_valid = 0;                 /* a static vertex layout */
+    V.topo_set = -1;
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     vkCmdEndRendering(V.dcb);
@@ -4786,6 +4808,7 @@ static void ao_pass(VkImageView target, VkImageView resolve, uint32_t w, uint32_
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     V.bound_pipe = VK_NULL_HANDLE;
     V.vi_valid = 0;                 /* a static vertex layout */
+    V.topo_set = -1;
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pcsize, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
@@ -5805,6 +5828,7 @@ typedef struct {
     VkDescriptorSet set;
     uint32_t doff[2];
     VtxBind vb;
+    uint32_t topo;
     VkDeviceSize ioff;
     uint32_t nidx;
     VkViewport vp;
@@ -5902,6 +5926,7 @@ static void aux_record(const Nv2aVkState *st, int kind, VkShaderModule vs, uint3
     a->doff[0] = doff[0];
     a->doff[1] = doff[1];
     a->vb = *vb;
+    a->topo = st->topology;
     a->ioff = ioff;
     a->nidx = nidx;
     a->vp = *vp;
@@ -5979,6 +6004,7 @@ static void aux_flush(void)
         vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
                                 &a->set, 2, a->doff);
         vtx_bind(&a->vb);
+        topo_set(a->topo);
         vkCmdBindIndexBuffer(V.dcb, V.idx.buf, a->ioff, VK_INDEX_TYPE_UINT32);
         vkCmdSetViewport(V.dcb, 0, 1, &a->vp);
         vkCmdSetScissor(V.dcb, 0, 1, &a->sc);
@@ -6373,6 +6399,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.pl, 0, 1,
                             &set, 2, doff);
     vtx_bind(&vb);
+    topo_set(st->topology);
     vkCmdBindIndexBuffer(V.dcb, V.idx.buf, ioff, VK_INDEX_TYPE_UINT32);
     vkCmdSetViewport(V.dcb, 0, 1, &vpt);
     sc = clip_rect(st);
@@ -6586,7 +6613,7 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
     mark_drawn(st);
     V.st_draws++;
     V.seg_draws++;
-    V.st_tris += nidx / 3;
+    V.st_tris += st->topology == 3 ? nidx - 2 : nidx / 3;
     return 1;
 }
 
@@ -6898,6 +6925,16 @@ int nv2a_vk_draw_program(const Nv2aVkState *st, uint32_t hash, const float *vin,
     if (!p || __atomic_load_n(&p->state, __ATOMIC_ACQUIRE) != 1)
         return 0;
     return draw_common(st, p->vs, hash, p->ninputs ? p->ninputs : 1, vin, NULL, nv, idx, nidx);
+}
+
+int nv2a_vk_strips(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_VK_STRIPS");
+        on = !(e && strcmp(e, "0") == 0);
+    }
+    return on && nv2a_vk_active();
 }
 
 int nv2a_vk_raw_verts(void)
@@ -7564,6 +7601,7 @@ static void touch_pass(VkImageView view)
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.touch_pipe);
     V.bound_pipe = VK_NULL_HANDLE;
     V.vi_valid = 0;                 /* a static vertex layout */
+    V.topo_set = -1;
     vkCmdPushConstants(V.dcb, V.post_pl, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
     vkCmdDraw(V.dcb, 3, 1, 0, 0);
     vkCmdEndRendering(V.dcb);
@@ -7683,6 +7721,7 @@ static void hdr_pass(VkImageView target, VkImageLayout layout, VkPipeline pipe, 
     vkCmdBindPipeline(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
     V.bound_pipe = VK_NULL_HANDLE;
     V.vi_valid = 0;                 /* a static vertex layout */
+    V.topo_set = -1;
     vkCmdBindDescriptorSets(V.dcb, VK_PIPELINE_BIND_POINT_GRAPHICS, V.post_pl, 0, 1, &set, 0, NULL);
     pc[0] = (float)ox;
     pc[1] = (float)oy;

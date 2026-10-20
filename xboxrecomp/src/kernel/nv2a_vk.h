@@ -46,7 +46,7 @@ typedef struct {
     uint32_t blend_enable, blend_sfactor, blend_dfactor, blend_equation;
     uint32_t blend_color, color_mask;
     uint32_t depth_test, depth_func, depth_mask, wbuffer, zint;
-    uint32_t topology;          /* 0 triangles, 1 lines, 2 points */
+    uint32_t topology;          /* 0 triangles, 1 lines, 2 points, 3 a strip */
     float    point_size;        /* SET_POINT_SIZE, pixels */
     uint32_t point_params;      /* SET_POINT_PARAMS_ENABLE: size from oPts */
     uint32_t point_sprite;      /* SET_POINT_SMOOTH_ENABLE: stage 3 = point coord */
@@ -108,6 +108,10 @@ typedef struct {
     uint8_t fmt[16];            /* NV2A_VS_RAW: NV2A_VF_* */
     uint16_t off[16];           /* RAW: byte offset in a vertex; CONV: its slot */
 } Nv2aVkVerts;
+
+/* 1 when a triangle strip can be drawn as one (topology 3) rather than
+ * made into a list. */
+int nv2a_vk_strips(void);
 
 /* 1 when nv2a_vk_draw_program_raw can be used, and for which formats. */
 int nv2a_vk_raw_verts(void);
