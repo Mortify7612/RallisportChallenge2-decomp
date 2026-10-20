@@ -1021,7 +1021,7 @@ static void end_rendering(void)
     V.cur_samples = 1;
 }
 
-static uint64_t hash_bytes(const uint8_t *p, size_t n)
+static uint64_t hash_scalar(const uint8_t *p, size_t n)
 {
     /* Four independent lanes, so the multiplies overlap. Not a quality hash;
      * a change detector over memory the title rewrites wholesale. */
@@ -1040,6 +1040,112 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n)
     for (; i < n; i++)
         h0 = (h0 ^ p[i]) * 0x100000001B3ull;
     return h0 ^ (h1 * 31) ^ (h2 * 1009) ^ (h3 * 65599) ^ n;
+}
+
+#if defined(__x86_64__)
+/* The same job in SIMD lanes, XXH3's way: each 64-bit lane adds its data
+ * and (data ^ key) low half times high half. The scalar loop waits on its
+ * multiplies (~28 GB/s on a Zen 5); these do not (~45 with SSE2, ~88 with
+ * AVX2). The keys move on with each block, so blocks that trade places
+ * change the result too. Textures and surfaces hashed every epoch were a
+ * fifth of the executor in the paused race. */
+#include <immintrin.h>
+
+static uint64_t hash_fold(const uint64_t *lane, int nl, uint64_t tail, size_t n)
+{
+    uint64_t h = 0x27D4EB2F165667C5ull ^ n;
+    int i;
+    for (i = 0; i < nl; i++) {
+        h = (h ^ lane[i]) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 32;
+    }
+    return (h ^ tail) * 0xC2B2AE3D27D4EB4Full;
+}
+
+#define HASH_LANES(PRE, T, a, d, k) do { \
+        T x_ = PRE##_xor_si##T##_(d, k); \
+        a = PRE##_add_epi64(a, PRE##_add_epi64(PRE##_mul_epu32(x_, PRE##_srli_epi64(x_, 32)), \
+                                               PRE##_shuffle_epi32(d, _MM_SHUFFLE(1, 0, 3, 2)))); \
+    } while (0)
+#define _mm_xor_si__m128i_ _mm_xor_si128
+#define _mm256_xor_si__m256i_ _mm256_xor_si256
+
+static uint64_t hash_sse2(const uint8_t *p, size_t n)
+{
+    const __m128i k0 = _mm_set_epi64x(0x1F67B3B7A4A44072ll, 0x78E5C0CC4EE679CBll);
+    const __m128i k1 = _mm_set_epi64x(0x4C263A81E69035E0ll, (long long)0xCB00C391BB52283Cull);
+    const __m128i k2 = _mm_set_epi64x((long long)0xD8ACDEA946EF1938ull, 0x3F349CE33F76FAA8ll);
+    const __m128i k3 = _mm_set_epi64x(0x647378D9C97E9FC8ll, (long long)0xC3EBD33483ACC5EAull);
+    const __m128i step = _mm_set1_epi64x(0x0000000100000001ll);
+    __m128i a0 = k0, a1 = k1, a2 = k2, a3 = k3, ctr = _mm_setzero_si128();
+    uint64_t lane[8];
+    size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        __m128i d0 = _mm_loadu_si128((const __m128i *)(p + i));
+        __m128i d1 = _mm_loadu_si128((const __m128i *)(p + i + 16));
+        __m128i d2 = _mm_loadu_si128((const __m128i *)(p + i + 32));
+        __m128i d3 = _mm_loadu_si128((const __m128i *)(p + i + 48));
+        HASH_LANES(_mm, __m128i, a0, d0, _mm_add_epi64(k0, ctr));
+        HASH_LANES(_mm, __m128i, a1, d1, _mm_add_epi64(k1, ctr));
+        HASH_LANES(_mm, __m128i, a2, d2, _mm_add_epi64(k2, ctr));
+        HASH_LANES(_mm, __m128i, a3, d3, _mm_add_epi64(k3, ctr));
+        ctr = _mm_add_epi64(ctr, step);
+    }
+    _mm_storeu_si128((__m128i *)lane, a0);
+    _mm_storeu_si128((__m128i *)(lane + 2), a1);
+    _mm_storeu_si128((__m128i *)(lane + 4), a2);
+    _mm_storeu_si128((__m128i *)(lane + 6), a3);
+    return hash_fold(lane, 8, hash_scalar(p + i, n - i), n);
+}
+
+__attribute__((target("avx2")))
+static uint64_t hash_avx2(const uint8_t *p, size_t n)
+{
+    const __m256i k0 = _mm256_set_epi64x(0x1CAD21F72C81017Cll, (long long)0xDB979083E96DD4DEull,
+                                         0x1F67B3B7A4A44072ll, 0x78E5C0CC4EE679CBll);
+    const __m256i k1 = _mm256_set_epi64x(0x2172FFCC7DD05A82ll, (long long)0x8E2443F7744608B8ull,
+                                         0x4C263A81E69035E0ll, (long long)0xCB00C391BB52283Cull);
+    const __m256i k2 = _mm256_set_epi64x((long long)0xA32E531B8B65D088ull, 0x4EF90DA297486471ll,
+                                         (long long)0xD8ACDEA946EF1938ull, 0x3F349CE33F76FAA8ll);
+    const __m256i k3 = _mm256_set_epi64x(0x1D4F0BC7C7BBDCF9ll, 0x3159B4CD4BE0518All,
+                                         0x647378D9C97E9FC8ll, (long long)0xC3EBD33483ACC5EAull);
+    const __m256i step = _mm256_set1_epi64x(0x0000000100000001ll);
+    __m256i a0 = k0, a1 = k1, a2 = k2, a3 = k3, ctr = _mm256_setzero_si256();
+    uint64_t lane[16];
+    size_t i = 0;
+    for (; i + 128 <= n; i += 128) {
+        __m256i d0 = _mm256_loadu_si256((const __m256i *)(p + i));
+        __m256i d1 = _mm256_loadu_si256((const __m256i *)(p + i + 32));
+        __m256i d2 = _mm256_loadu_si256((const __m256i *)(p + i + 64));
+        __m256i d3 = _mm256_loadu_si256((const __m256i *)(p + i + 96));
+        HASH_LANES(_mm256, __m256i, a0, d0, _mm256_add_epi64(k0, ctr));
+        HASH_LANES(_mm256, __m256i, a1, d1, _mm256_add_epi64(k1, ctr));
+        HASH_LANES(_mm256, __m256i, a2, d2, _mm256_add_epi64(k2, ctr));
+        HASH_LANES(_mm256, __m256i, a3, d3, _mm256_add_epi64(k3, ctr));
+        ctr = _mm256_add_epi64(ctr, step);
+    }
+    _mm256_storeu_si256((__m256i *)lane, a0);
+    _mm256_storeu_si256((__m256i *)(lane + 4), a1);
+    _mm256_storeu_si256((__m256i *)(lane + 8), a2);
+    _mm256_storeu_si256((__m256i *)(lane + 12), a3);
+    return hash_fold(lane, 16, hash_scalar(p + i, n - i), n);
+}
+#undef HASH_LANES
+#endif
+
+/* RECOMP_VK_HASH_SIMD=0: the scalar loop for everything. */
+static uint64_t hash_bytes(const uint8_t *p, size_t n)
+{
+#if defined(__x86_64__)
+    static int simd = -1;
+    if (simd < 0) {
+        const char *e = getenv("RECOMP_VK_HASH_SIMD");
+        simd = e && strcmp(e, "0") == 0 ? 0 : __builtin_cpu_supports("avx2") ? 2 : 1;
+    }
+    if (n >= 256 && simd)
+        return simd == 2 ? hash_avx2(p, n) : hash_sse2(p, n);
+#endif
+    return hash_scalar(p, n);
 }
 
 /* 64 bytes of every kilobyte, and the last 64: a texture streamed into
