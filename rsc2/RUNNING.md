@@ -137,13 +137,15 @@ It builds in an Ubuntu 22.04 container (podman) and writes
 `rsc2/build-linux/rsc2`. The binary:
 
 - needs glibc 2.35 at most, so it runs on Ubuntu 22.04, Linux Mint 21,
-  Debian 12, SteamOS 3 and newer;
-- links glslang and libstdc++ in;
+  Debian 12, a current SteamOS and newer;
+- is built with GCC 15 (Ubuntu toolchain PPA) and links glslang, libstdc++
+  and libgcc in;
 - needs only libSDL2-2.0.so.0, libvulkan.so.1 and the GPU driver.
 
 It needs the generated code, `third_party/src/glslang` (tag
 `vulkan-sdk-1.4.363.0`, as for Windows) and the host's Vulkan headers.
-glslang is built once into `third_party/linux`. Ubuntu 22.04 has no
+glslang is built once into `third_party/linux`, again when the compiler
+changes. Ubuntu 22.04 has no
 `glslc`, so the shaders are compiled by `glslangValidator` through
 `tools/linux_portable/glslc.py`.
 
