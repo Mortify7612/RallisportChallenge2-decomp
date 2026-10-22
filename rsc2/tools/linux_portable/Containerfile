@@ -1,0 +1,9 @@
+# Build image for the portable Linux release (see build.sh next to this file).
+# Ubuntu 22.04 has glibc 2.35, so what it builds runs on Ubuntu 22.04,
+# Linux Mint 21, Debian 12, SteamOS 3 and anything newer.
+FROM docker.io/library/ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ make cmake ninja-build python3 pkg-config ca-certificates \
+        libsdl2-dev libepoxy-dev libvulkan1 \
+    && rm -rf /var/lib/apt/lists/*
