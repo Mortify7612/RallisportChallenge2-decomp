@@ -4494,6 +4494,39 @@ static double flip_now_s(void)
 #endif
 }
 
+/* The presentation interval of the flip being presented: D3D's Swap tells
+ * its vblank handler with a notify (type 1, parameter = framebuffer | flags
+ * | interval), and the handler flips only that many vblanks after the last
+ * flip. A title that asks for 2 runs at 30 fps on the console whatever it
+ * could draw -- RalliSport Challenge 2's replays do, and step one recorded
+ * frame per flip, so at 60 they played twice as fast. Intervals of 2 and
+ * more are kept here (at 60 Hz vblanks, above any RECOMP_FLIP_HZ); 1 and
+ * immediate leave the frame-rate limit alone. RECOMP_FLIP_INTERVAL=0
+ * ignores them; RECOMP_FLIP_TRACE prints each change. */
+static uint32_t s_flip_interval = 1;
+
+static void flip_notify(uint32_t param)
+{
+    static int on = -1;
+    uint32_t iv;
+    if (getenv("RECOMP_NOP_TRACE")) {
+        static int n;
+        if (n++ < 60)
+            fprintf(stderr, "  [NOP] F%u param %08X type %u\n", s_presented, param, param & 0x1Fu);
+    }
+    if ((param & 0x1Fu) != 1u)
+        return;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_FLIP_INTERVAL");
+        on = !(e && strcmp(e, "0") == 0);
+    }
+    iv = (param >> 5) & 7u;
+    if (iv != s_flip_interval && getenv("RECOMP_FLIP_TRACE"))
+        fprintf(stderr, "  [FLIP] F%u presentation interval %u -> %u\n",
+                s_presented, s_flip_interval, iv);
+    s_flip_interval = on ? iv : 1u;
+}
+
 static void flip_pace(void)
 {
     static double hz = -1.0, next;
@@ -4502,9 +4535,29 @@ static void flip_pace(void)
         const char *e = getenv("RECOMP_FLIP_HZ");
         hz = e ? atof(e) : (nv2a_vk_active() ? 60.0 : 0.0);
     }
-    if (hz <= 0.0)
+    {
+        /* RECOMP_FLIP_HZ_SWITCH=<frame>:<hz>: a new rate from that frame on
+         * (does the title step something per frame or by the clock?). */
+        static long at = -2;
+        static double hz2;
+        if (at == -2) {
+            const char *e = getenv("RECOMP_FLIP_HZ_SWITCH"), *c;
+            at = -1;
+            if (e && (c = strchr(e, ':')) != NULL) {
+                at = atol(e);
+                hz2 = atof(c + 1);
+            }
+        }
+        if (at >= 0 && s_presented >= (uint32_t)at) {
+            hz = hz2;
+            at = -1;
+        }
+    }
+    period = hz > 0.0 ? 1.0 / hz : 0.0;
+    if (s_flip_interval >= 2 && period < s_flip_interval / 60.0)
+        period = s_flip_interval / 60.0;
+    if (period <= 0.0)
         return;
-    period = 1.0 / hz;
     now = flip_now_s();
     if (next == 0.0 || now > next + period) {
         next = now + period;                  /* fell behind: new grid */
@@ -4677,6 +4730,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             /* A notify for the CPU (nv2a_irq.c, with RECOMP_NV2A_PFB_ASYNC):
              * D3D patches one in when it waits for push-buffer room. */
             extern int xbox_Nv2aIrqNotify(uint32_t subch, uint32_t method, uint32_t param);
+            flip_notify(param);
             xbox_Nv2aIrqNotify(subch, method, param);
         }
         return;
