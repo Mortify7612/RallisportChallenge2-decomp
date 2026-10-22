@@ -4,8 +4,9 @@
 # A build on the development machine needs that machine's glibc (2.4x) and
 # its shared glslang, so it does not start on Linux Mint, Ubuntu LTS or
 # Debian. This builds in an Ubuntu 22.04 container instead (podman): glibc
-# 2.35, glslang and libstdc++ linked in, and only libraries every desktop
-# has left dynamic (SDL2, the Vulkan loader, libepoxy).
+# 2.35, GCC 15 from the toolchain PPA, glslang, libstdc++ and libgcc linked
+# in, and only libraries every desktop has left dynamic (SDL2, the Vulkan
+# loader).
 #
 #   rsc2/tools/linux_portable/build.sh [jobs]
 #
@@ -31,22 +32,29 @@ cp -r /usr/include/vulkan /usr/include/vk_video "$tp/linux/include/"
 
 podman run --rm --userns=keep-id -v "$root:$root" -v "$tp:$tp" -w "$root" \
     -e TP="$tp/linux" -e JOBS="$jobs" -e HERE="$here" rsc2-linux-build bash -euo pipefail -c '
+# A new compiler in the image rebuilds glslang and the game from scratch.
+cc_id=$($CXX --version | head -1)
+if [ "$(cat "$TP/compiler" 2>/dev/null)" != "$cc_id" ]; then
+    rm -rf "$TP/build-glslang" "$TP/lib" "$TP/bin" "$TP/include/glslang" rsc2/build-linux
+fi
 if [ ! -f "$TP/lib/libglslang.a" ] || [ ! -x "$TP/bin/glslangValidator" ]; then
     cmake -S third_party/src/glslang -B "$TP/build-glslang" -G Ninja \
         -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$TP" \
         -DBUILD_SHARED_LIBS=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
         -DENABLE_OPT=OFF -DENABLE_HLSL=OFF -DGLSLANG_TESTS=OFF -DENABLE_GLSLANG_BINARIES=ON
     ninja -C "$TP/build-glslang" -j "$JOBS" install
+    echo "$cc_id" > "$TP/compiler"
 fi
 L=$TP/lib
 cmake -S rsc2 -B rsc2/build-linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+    -DCMAKE_EXE_LINKER_FLAGS=-static-libgcc \
     -DVulkan_INCLUDE_DIR="$TP/include" \
     -DVulkan_LIBRARY=/usr/lib/x86_64-linux-gnu/libvulkan.so.1 \
     -DXBOXRECOMP_GLSLC="$HERE/glslc.py" \
     -DXBOXRECOMP_GLSLANG_INCLUDE="$TP/include" \
     -DXBOXRECOMP_GLSLANG_LIB="$L/libglslang.a" \
     -DXBOXRECOMP_GLSLANG_RL_LIB="$L/libglslang-default-resource-limits.a" \
-    "-DXBOXRECOMP_GLSLANG_EXTRA_LIBS=$L/libSPIRV.a;$L/libMachineIndependent.a;$L/libOSDependent.a;$L/libGenericCodeGen.a;$L/libMachineIndependent.a;$(g++ -print-file-name=libstdc++.a);pthread"
+    "-DXBOXRECOMP_GLSLANG_EXTRA_LIBS=$L/libSPIRV.a;$L/libMachineIndependent.a;$L/libOSDependent.a;$L/libGenericCodeGen.a;$L/libMachineIndependent.a;$($CXX -print-file-name=libstdc++.a);pthread"
 GLSLANG_VALIDATOR="$TP/bin/glslangValidator" ninja -C rsc2/build-linux -j "$JOBS"
 '
 
