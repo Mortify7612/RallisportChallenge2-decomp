@@ -115,13 +115,11 @@ if(WIN32)
     # platform is an INTERFACE target on Windows: it contributes the src/
     # include path that "platform/xbox_winnt.h" resolves against.
     target_link_libraries(xbox_kernel PUBLIC platform kernel32 bcrypt)
-elseif(ANDROID)
-    # The Xbox crypto (kernel_crypto.c) is software; nothing needs OpenSSL.
-    target_link_libraries(xbox_kernel PUBLIC platform)
 else()
-    # Linux: platform layer (POSIX host primitives) + OpenSSL for crypto.
-    find_package(OpenSSL REQUIRED)
-    target_link_libraries(xbox_kernel PUBLIC platform OpenSSL::Crypto)
+    # POSIX host primitives. The Xbox crypto (kernel_crypto.c) is software;
+    # nothing needs OpenSSL, which also kept the Linux build off systems
+    # without libcrypto.so.3.
+    target_link_libraries(xbox_kernel PUBLIC platform)
 endif()
 
 if(MSVC)
