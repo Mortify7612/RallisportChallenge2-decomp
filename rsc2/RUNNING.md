@@ -123,6 +123,30 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
 - Compiled shaders are cached in `~/.cache/xboxrecomp/vk`
   (`RECOMP_VK_CACHE=dir`, `=0` off).
 
+### Release build (runs on older distributions)
+
+`rsc2/build` uses the build machine's glibc and shared glslang, so its
+binary only starts on systems as new as that one. For releases, use the
+portable build:
+
+```sh
+rsc2/tools/linux_portable/build.sh [jobs]
+```
+
+It builds in an Ubuntu 22.04 container (podman) and writes
+`rsc2/build-linux/rsc2`. The binary:
+
+- needs glibc 2.35 at most, so it runs on Ubuntu 22.04, Linux Mint 21,
+  Debian 12, SteamOS 3 and newer;
+- links glslang and libstdc++ in;
+- needs only libSDL2-2.0.so.0, libvulkan.so.1 and the GPU driver.
+
+It needs the generated code, `third_party/src/glslang` (tag
+`vulkan-sdk-1.4.363.0`, as for Windows) and the host's Vulkan headers.
+glslang is built once into `third_party/linux`. Ubuntu 22.04 has no
+`glslc`, so the shaders are compiled by `glslangValidator` through
+`tools/linux_portable/glslc.py`.
+
 ## Windows (cross-built on Linux, tested under Wine only)
 
 The MinGW sysroot is missing four things the Windows build needs. They live in
