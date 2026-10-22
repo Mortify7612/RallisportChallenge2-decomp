@@ -976,3 +976,118 @@ void sub_003683A0(void)
 #undef eax
 #undef ecx
 #undef esp
+
+/* ── Signed files: accept a signature the recomp cannot check ─────────────
+ *
+ * The game reads its signed files -- profiles, saves, downloadable content
+ * -- through two readers, 0x000A98D0 and 0x000A8FA0, and two direct checks
+ * further down. Each runs XAPI's HMAC over the data and compares it with the
+ * signature stored after it.
+ * XAPI keys that HMAC with the kernel's XboxSignatureKey, which on a console
+ * is derived at load time from a secret in the console's BIOS: the same on
+ * every console, which is why DLC and saves move between them. The recomp
+ * cannot ship that secret, so its kernel exports zeros. Files it writes
+ * itself check out; DLC and saves made on an Xbox all read as "damaged and
+ * cannot be used" (issue #13).
+ *
+ * So a check's answer stands, except when all the data was read and only
+ * the signature failed to match (or was missing). Both readers close their
+ * signature context, [obj+0x14] = -1, only once the body is read in full and
+ * return earlier on a short or failed read, which stays an error.
+ * RECOMP_SIGNED_STRICT=1 restores the console's strictness;
+ * RECOMP_SIGNED_TRACE=1 reports every check. The generated bodies are called
+ * as sub_X_gen (wraps), so none of the game's code is copied here.
+ */
+static int signed_strict(void)
+{
+    static int strict = -1;
+    if (strict < 0) {
+        const char *e = getenv("RECOMP_SIGNED_STRICT");
+        strict = e && *e && strcmp(e, "0") != 0;
+    }
+    return strict;
+}
+
+static void signed_accept(uint32_t obj)
+{
+    static uint32_t last;
+    if (obj != last) {
+        fprintf(stderr, "  [SIGNED] file %08X: signature not verifiable here -- accepted\n", obj);
+        last = obj;
+    }
+    g_eax = (g_eax & ~0xFFu) | 1u;
+}
+
+static void signed_check(uint32_t obj, const char *which)
+{
+    if (getenv("RECOMP_SIGNED_TRACE"))
+        fprintf(stderr, "  [SIGNED] %s file %08X: %s, signature context %08X\n", which, obj,
+                (g_eax & 0xFFu) ? "verified" : "failed", MEM32(obj + 0x14));
+    if (!signed_strict() && (g_eax & 0xFFu) == 0 && MEM32(obj + 0x14) == 0xFFFFFFFFu)
+        signed_accept(obj);
+}
+
+extern void sub_000A98D0_gen(void);
+extern void sub_000A8FA0_gen(void);
+
+void sub_000A98D0(void)
+{
+    uint32_t obj = MEM32(g_esp + 4);        /* its argument (ret 4) */
+    sub_000A98D0_gen();
+    signed_check(obj, "stream");
+}
+
+void sub_000A8FA0(void)
+{
+    uint32_t obj = MEM32(g_esp + 4);        /* its first argument (ret 8) */
+    sub_000A8FA0_gen();
+    signed_check(obj, "whole");
+}
+
+/* Two more checks hash their data themselves rather than through a reader:
+ * 0x002A35E0 checks a profile already in memory (the object in eax; on a
+ * mismatch it overwrites the profile's first dword at +0x72C with -1), and
+ * 0x002C17B0 checks a file in 0x400-byte chunks (one stream argument). Both
+ * also fail early when XAPI cannot open a signature context or a read fails.
+ * A mismatch is told from those by whether XAPI's signature End (0x00076C54)
+ * ran during the check: it runs only once all the data was hashed. */
+static __thread int s_sig_ends;
+
+extern void sub_00076C54_gen(void);
+extern void sub_002A35E0_gen(void);
+extern void sub_002C17B0_gen(void);
+
+void sub_00076C54(void)
+{
+    s_sig_ends++;
+    sub_00076C54_gen();
+}
+
+void sub_002A35E0(void)
+{
+    uint32_t obj = g_eax;
+    uint32_t head = MEM32(obj + 0x72C);
+    int ends = s_sig_ends;
+    sub_002A35E0_gen();
+    int hashed = s_sig_ends != ends;
+    if (getenv("RECOMP_SIGNED_TRACE"))
+        fprintf(stderr, "  [SIGNED] profile %08X: %s\n", obj,
+                (g_eax & 0xFFu) ? "verified" : hashed ? "failed" : "not checked");
+    if (!signed_strict() && (g_eax & 0xFFu) == 0 && hashed) {
+        MEM32(obj + 0x72C) = head;
+        signed_accept(obj);
+    }
+}
+
+void sub_002C17B0(void)
+{
+    uint32_t obj = MEM32(g_esp + 4);        /* its argument (ret 4) */
+    int ends = s_sig_ends;
+    sub_002C17B0_gen();
+    int hashed = s_sig_ends != ends;
+    if (getenv("RECOMP_SIGNED_TRACE"))
+        fprintf(stderr, "  [SIGNED] chunked file %08X: %s\n", obj,
+                (g_eax & 0xFFu) ? "verified" : hashed ? "failed" : "not checked");
+    if (!signed_strict() && (g_eax & 0xFFu) == 0 && hashed)
+        signed_accept(obj);
+}
