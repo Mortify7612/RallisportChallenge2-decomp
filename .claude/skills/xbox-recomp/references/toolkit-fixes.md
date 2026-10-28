@@ -17,6 +17,17 @@ a known cause.
 | Data islands not scanned for pointers | Functions reachable only through tables were never lifted |
 | `fnstcw` reserved bit 6 should read 1 | Minor, unfixed |
 
+**Device registers at constant addresses become direct calls** (RSC2 f2c42d8):
+DirectSound drives the APU through fixed addresses (0xFE82xxxx). Lifted as
+loads and stores, each one is a page fault plus an instruction decode; that
+was a quarter of the game thread in a heavy race on ARM. The lifter
+rewrites `MEMn(K)` for a constant K in the device range as it emits each
+function (`APU_RDn`/`APU_WRn`, which call the device model). Accesses
+through a register still trap. Unlike routing every access through a check
+(the Switch branch, ~10% slower on PC), this touches only those
+instructions. Check a regen against the old output with only the rewrite
+applied.
+
 Generated code must be compiled with `-fno-strict-aliasing -fwrapv -w`.
 Without a declaration of `sqrtf`/`rsqrt` and similar in scope, C89 implicit
 `int` returns corrupted matrices. `recomp_types.h` includes `<math.h>` for

@@ -18,6 +18,20 @@
   RECOMP_AUDIO_WAV=<file>`. Use `RECOMP_AUDIO=0` for unattended runs.
 - `RECOMP_APU_DSP_ACK`/`RECOMP_DSP_ACK_ALLOC`-style workarounds unblock
   titles that wait on the DSP.
+- **Music breaking up under load (RSC2 multi-car races on ARM):**
+  - **Mixer pacing.** A mixer paced by the clock alone that resets its
+    schedule when it falls behind loses that time from the output queue
+    for good, and after a few late frames every hiccup is a dropout. Keep
+    a cushion: when the queue is below ~24 ms, run at 4/3 of real time
+    until it's back. Catching up all at once made the title's streams run
+    dry (a metallic buzz).
+  - **The APU interrupt must not wait for DISPATCH_LEVEL** (see
+    kernel-hle.md). It waited up to 33 ms, and DirectSound refilled its
+    streams late.
+  - **Measure before guessing:** count output-queue underruns, stream
+    voices with no data, interrupt waits and guest-lock waits every 5 s.
+    Some no-data frames are normal: the PC showed ~100 per 5 s and sounds
+    fine.
 
 ## Controllers
 

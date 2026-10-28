@@ -29,6 +29,18 @@
   interrupted by a DPC. Taking a lock on raising to DISPATCH (guest threads
   and DPC context alike, ISRs excluded, 50 ms timeout with a log) fixed rare
   `0xCCCCCCCC` pad-handle crashes and garbage USB lengths.
+- **DISPATCH_LEVEL doesn't mask device interrupts.** It holds off DPCs and
+  thread switches; an ISR comes in anyway, and code sharing data with an
+  ISR raises to the ISR's IRQL (KeSynchronizeExecution). A device model
+  that holds its interrupt while *any* thread is at DISPATCH delays it for
+  as long as the title works there: RSC2's APU interrupt waited up to 33 ms
+  in races. Count threads above DISPATCH separately and gate device
+  interrupts on that (RSC2 `xbox_IrqlBlocksDeviceInterrupts`, cd146c9).
+- **Waits must sleep.** Spins that yield and read the clock cost little on
+  x86 Linux, but on some Android kernels every clock read is a syscall
+  (vDSO fallback). An idle executor loop, a lock wait and a frame pacer
+  ate most of two big cores. Use events, futexes and absolute-deadline
+  sleeps (376e72b).
 - `RECOMP_GUEST_LOCK=1` runs one guest thread at a time (released during
   kernel calls), like the single-CPU Xbox. It doesn't cover DPCs. On RSC2 it
   costs nothing measurable and is the default on ARM.
