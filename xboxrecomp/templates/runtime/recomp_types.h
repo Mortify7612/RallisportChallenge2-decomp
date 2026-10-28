@@ -541,8 +541,19 @@ typedef union RecompXmm {
 } RecompXmm;
 #endif
 
+#if defined(RECOMP_REG_BLOCK)
+#define g_xmm0 (*(RecompXmm *)g_rb.g_xmm[0])
+#define g_xmm1 (*(RecompXmm *)g_rb.g_xmm[1])
+#define g_xmm2 (*(RecompXmm *)g_rb.g_xmm[2])
+#define g_xmm3 (*(RecompXmm *)g_rb.g_xmm[3])
+#define g_xmm4 (*(RecompXmm *)g_rb.g_xmm[4])
+#define g_xmm5 (*(RecompXmm *)g_rb.g_xmm[5])
+#define g_xmm6 (*(RecompXmm *)g_rb.g_xmm[6])
+#define g_xmm7 (*(RecompXmm *)g_rb.g_xmm[7])
+#else
 extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+#endif
 
 /* -- construction -- */
 
@@ -1244,8 +1255,19 @@ typedef union RecompMmx {
 } RecompMmx;
 #endif
 
+#if defined(RECOMP_REG_BLOCK)
+#define g_mm0 (*(RecompMmx *)&g_rb.g_mm[0])
+#define g_mm1 (*(RecompMmx *)&g_rb.g_mm[1])
+#define g_mm2 (*(RecompMmx *)&g_rb.g_mm[2])
+#define g_mm3 (*(RecompMmx *)&g_rb.g_mm[3])
+#define g_mm4 (*(RecompMmx *)&g_rb.g_mm[4])
+#define g_mm5 (*(RecompMmx *)&g_rb.g_mm[5])
+#define g_mm6 (*(RecompMmx *)&g_rb.g_mm[6])
+#define g_mm7 (*(RecompMmx *)&g_rb.g_mm[7])
+#else
 extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
 extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
+#endif
 
 static inline RecompMmx MMX_ZERO(void) { RecompMmx r; r.q = 0; return r; }
 

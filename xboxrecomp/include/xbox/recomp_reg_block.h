@@ -28,6 +28,12 @@ typedef struct RecompRegBlock {
     uint16_t g_fp_control_word, g_fp_cc;                /* 56, 58 */
     uint32_t pad_;                                      /* 60 */
     double   g_fp_stack[8];                             /* 64 */
+    /* xmm0-7 and mm0-7: RecompXmm (16 bytes) and RecompMmx (8), unions of
+     * plain types at 8-byte alignment, held here as their bytes and read
+     * back through a cast (recomp_types.h; the lifted code is built with
+     * -fno-strict-aliasing). SSE-heavy lifted functions name several. */
+    uint64_t g_xmm[8][2];                               /* 128 */
+    uint64_t g_mm[8];                                   /* 256 */
 } RecompRegBlock;
 
 /* The members' offsets, as numbers the aliases' assembly can use
@@ -49,5 +55,7 @@ typedef struct RecompRegBlock {
 #define RECOMP_REG_BLOCK_OFF_g_fp_control_word 56
 #define RECOMP_REG_BLOCK_OFF_g_fp_cc           58
 #define RECOMP_REG_BLOCK_OFF_g_fp_stack        64
+#define RECOMP_REG_BLOCK_OFF_g_xmm             128
+#define RECOMP_REG_BLOCK_OFF_g_mm              256
 
 #endif

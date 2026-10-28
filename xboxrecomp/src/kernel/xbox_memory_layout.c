@@ -1426,11 +1426,22 @@ __asm__(RB_ALIAS(g_eax, 4) RB_ALIAS(g_ecx, 4) RB_ALIAS(g_edx, 4) RB_ALIAS(g_esp,
         RB_ALIAS(g_fs_base, 4) RB_ALIAS(g_seh_ebp, 4) RB_ALIAS(g_eflags_shadow, 4)
         RB_ALIAS(g_df, 4) RB_ALIAS(g_fp_top, 4) RB_ALIAS(g_fp_cmp, 4)
         RB_ALIAS(g_fp_control_word, 2) RB_ALIAS(g_fp_cc, 2) RB_ALIAS(g_fp_stack, 64));
+/* xmm0-7 and mm0-7, 16 and 8 bytes apart from their arrays' offsets. */
+#define RB_ALIAS_AT(name, off, size) \
+    ".globl " #name "\n.type " #name ", %tls_object\n.size " #name ", " #size "\n" \
+    ".set " #name ", g_rb + " RB_STR(off) "\n"
+__asm__(RB_ALIAS_AT(g_xmm0, 128, 16) RB_ALIAS_AT(g_xmm1, 144, 16) RB_ALIAS_AT(g_xmm2, 160, 16)
+        RB_ALIAS_AT(g_xmm3, 176, 16) RB_ALIAS_AT(g_xmm4, 192, 16) RB_ALIAS_AT(g_xmm5, 208, 16)
+        RB_ALIAS_AT(g_xmm6, 224, 16) RB_ALIAS_AT(g_xmm7, 240, 16)
+        RB_ALIAS_AT(g_mm0, 256, 8) RB_ALIAS_AT(g_mm1, 264, 8) RB_ALIAS_AT(g_mm2, 272, 8)
+        RB_ALIAS_AT(g_mm3, 280, 8) RB_ALIAS_AT(g_mm4, 288, 8) RB_ALIAS_AT(g_mm5, 296, 8)
+        RB_ALIAS_AT(g_mm6, 304, 8) RB_ALIAS_AT(g_mm7, 312, 8));
 #define RB_CHECK(m) _Static_assert(offsetof(RecompRegBlock, m) == RECOMP_REG_BLOCK_OFF_##m, #m)
 RB_CHECK(g_eax); RB_CHECK(g_ecx); RB_CHECK(g_edx); RB_CHECK(g_esp); RB_CHECK(g_ebx);
 RB_CHECK(g_esi); RB_CHECK(g_edi); RB_CHECK(g_ebp); RB_CHECK(g_fs_base); RB_CHECK(g_seh_ebp);
 RB_CHECK(g_eflags_shadow); RB_CHECK(g_df); RB_CHECK(g_fp_top); RB_CHECK(g_fp_cmp);
 RB_CHECK(g_fp_control_word); RB_CHECK(g_fp_cc); RB_CHECK(g_fp_stack);
+RB_CHECK(g_xmm); RB_CHECK(g_mm);
 #undef RB_CHECK
 
 extern RECOMP_TLS uint32_t g_fs_base, g_seh_ebp, g_eflags_shadow, g_ebp;
@@ -2137,10 +2148,15 @@ void xbox_WatchdogStart(void)
 }
 
 /* SSE. 128 bits of architectural state, per-thread like the rest. */
+#if defined(RECOMP_REG_BLOCK)
+/* In the register block, as the rest (aliases next to it). */
+_Static_assert(sizeof(RecompXmm) == 16 && sizeof(RecompMmx) == 8, "SSE/MMX register sizes");
+#else
 RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
 RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
 RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+#endif
 #if !defined(RECOMP_REG_BLOCK)
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
