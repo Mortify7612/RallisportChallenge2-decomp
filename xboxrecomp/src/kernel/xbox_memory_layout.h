@@ -188,6 +188,7 @@ void xbox_Nv2aFrameCounterFlip(void);
 void     xbox_DspAckNoteAlloc(uint32_t caller, uint32_t size, uint32_t va);
 void     xbox_Nv2aIrqInit(void);
 int      xbox_Nv2aIrqEnabled(void);
+void     xbox_Nv2aAckWake(void);        /* a kick: wake an idle ack loop */
 int      xbox_Nv2aIrqOwns(uint32_t xbox_va);
 int      xbox_Nv2aIrqHandleMmio(void *ctx, uint32_t xbox_va);
 int      xbox_Nv2aIrqTick(void);

@@ -250,6 +250,7 @@ static void reg_write(void *dev, uint32_t off, uint64_t val, int size)
          * software GPU and the game and the GPU never overlapped. GET is what
          * holds the title back when it gets ahead, as on hardware. */
         store_wr(off, v & ~PFB_WBC_FLUSH);
+        xbox_Nv2aAckWake();                 /* new work, if the executor idles */
         break;
         /* With RECOMP_NV2A_PFB_ASYNC. RalliSport Challenge 2's D3D, once it
          * is ahead of the GPU and short of push-buffer room, patches a

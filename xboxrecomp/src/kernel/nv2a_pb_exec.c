@@ -30,6 +30,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <errno.h>
 #include "kernel.h"   /* XBOX_CONTIG_BASE / XBOX_CONTIG_SIZE */
 #include "xbox_memory_layout.h"   /* xbox_Nv2aFrameCounterFlip */
 /* The swizzle decoder the D3D8 layer already uses -- one implementation of
@@ -4590,19 +4591,28 @@ static void flip_pace(void)
         next = now + period;                  /* fell behind: new grid */
         return;
     }
+#if defined(_WIN32)
     while ((now = flip_now_s()) < next) {
         double left = next - now;
-        if (left > 0.002) {
-#if defined(_WIN32)
+        if (left > 0.002)
             Sleep((DWORD)((left - 0.0015) * 1000.0));
-#else
-            struct timespec ts;
-            ts.tv_sec = 0;
-            ts.tv_nsec = (long)((left - 0.0015) * 1e9);
-            nanosleep(&ts, NULL);
-#endif
-        }
     }
+#else
+    /* Asleep until a quarter of a millisecond before the slot (an absolute
+     * deadline, which Linux meets within ~0.1 ms), then the rest spun. It
+     * spun the last 1.5-2 ms, and on some Android kernels each clock read
+     * is a system call: a tenth of the tablet's executor in a race. */
+    if (next - now > 0.0005) {
+        double t = next - 0.00025;
+        struct timespec ts;
+        ts.tv_sec = (time_t)t;
+        ts.tv_nsec = (long)((t - (double)ts.tv_sec) * 1e9);
+        while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, NULL) == EINTR)
+            ;
+    }
+    while (flip_now_s() < next)
+        ;
+#endif
     next += period;
 }
 

@@ -18,6 +18,11 @@
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
+#if defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #if defined(_MSC_VER) && !defined(__clang__)
 #pragma intrinsic(_ReturnAddress)
 #define IRQL_CALLER() _ReturnAddress()
@@ -186,6 +191,7 @@ void xbox_IrqlDumpHolders(void)
  * hold it for good, so a waiter gives up after 50 ms, says so, and runs
  * anyway. RECOMP_DISPATCH_LOCK=0 turns it off. */
 static volatile LONG s_disp_owner;
+static volatile LONG s_disp_waiters;    /* asleep on s_disp_owner (Linux) */
 static RECOMP_TLS int t_disp_count;
 static RECOMP_TLS int t_isr_depth;
 static int s_disp_on = -1;
@@ -208,6 +214,20 @@ static void dispatch_acquire(void)
     }
     start = GetTickCount64();
     while (InterlockedCompareExchange(&s_disp_owner, me, 0) != 0) {
+#if defined(__linux__)
+        /* Asleep on the owner word until it is released (dispatch_release
+         * wakes a sleeper), 2 ms at most so the timeout below still runs.
+         * The timer thread yielded and read the clock in a loop here, each
+         * a system call on the tablet's kernel: three quarters of that
+         * thread in a race, on a big core. */
+        LONG cur = s_disp_owner;
+        if (cur != 0) {
+            struct timespec ts = { 0, 2000000 };
+            InterlockedIncrement(&s_disp_waiters);
+            syscall(SYS_futex, &s_disp_owner, FUTEX_WAIT_PRIVATE, cur, &ts, NULL, 0);
+            InterlockedDecrement(&s_disp_waiters);
+        }
+#endif
         if (GetTickCount64() - start > 50) {
             if (InterlockedIncrement(&s_disp_timeouts) <= 10) {
                 fprintf(stderr, "  [IRQL] tid %lu waited 50 ms for DISPATCH_LEVEL "
@@ -217,7 +237,9 @@ static void dispatch_acquire(void)
             }
             return;
         }
+#if !defined(__linux__)
         Sleep(0);
+#endif
     }
     t_disp_count = 1;
 }
@@ -226,8 +248,15 @@ static void dispatch_release(void)
 {
     if (!t_disp_count)
         return;
-    if (--t_disp_count == 0)
+    if (--t_disp_count == 0) {
         InterlockedExchange(&s_disp_owner, 0);
+#if defined(__linux__)
+        /* Ordered after the release above, as the waiter's count is before
+         * its sleep: one of the two sees the other. */
+        if (__atomic_load_n(&s_disp_waiters, __ATOMIC_SEQ_CST))
+            syscall(SYS_futex, &s_disp_owner, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+#endif
+    }
 }
 
 static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)

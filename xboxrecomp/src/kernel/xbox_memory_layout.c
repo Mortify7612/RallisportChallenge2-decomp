@@ -994,6 +994,41 @@ static void framebuffer_probe_tick(void)
     fflush(stderr);
 }
 
+/* RECOMP_ACK_IDLE (on by default on Android with RECOMP_NV2A_PFB_ASYNC): the
+ * loop below, with nothing to do -- PUT caught up, no flush waiting -- for a
+ * while, sleeps on an event for up to 1 ms instead of yielding. D3D's kick
+ * wakes it: with the PFB flush async its write is trapped (nv2a_irq.c,
+ * xbox_Nv2aAckWake). Each idle turn read the clock two or three times and
+ * yielded, and on the tablet's kernel those are all system calls: ~45% of
+ * the executor's thread in a race, a big core kept busy doing nothing. */
+static HANDLE s_ack_event;
+static int ack_idle_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_ACK_IDLE");
+        if (e)
+            on = strcmp(e, "0") != 0;
+        else {
+#if defined(__ANDROID__)
+            /* As nv2a_irq.c decides, which is set up after this thread
+             * starts. Without the async flush nothing wakes the loop. */
+            const char *a = getenv("RECOMP_NV2A_PFB_ASYNC");
+            on = getenv("RECOMP_NV2A_IRQ") && a && strcmp(a, "0") != 0;
+#else
+            on = 0;
+#endif
+        }
+    }
+    return on;
+}
+
+void xbox_Nv2aAckWake(void)
+{
+    if (s_ack_event)
+        SetEvent(s_ack_event);
+}
+
 /* RECOMP_ACK_STATS: how fast the loop below turns, and how often it
  * acknowledges a PFB flush -- every D3D kick waits for one. */
 static uint64_t s_ack_loops, s_ack_clears, s_ack_scan_us;
@@ -1038,6 +1073,7 @@ void xbox_Nv2aPatternColor0(uint32_t v)
 static DWORD WINAPI nv2a_ack_thread(LPVOID param)
 {
     volatile uint32_t *regs = (volatile uint32_t *)param;
+    unsigned idle = 0;
     s_ack_stats = getenv("RECOMP_ACK_STATS") != NULL;
     while (!InterlockedCompareExchange(&g_nv2a_ack_stop, 0, 0)) {
         /* Entry 0, the PFB flush, is acknowledged further down, once the
@@ -1303,6 +1339,23 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                 tick0 + (uint32_t)(xbox_GuestClockNs() / 1000000ull);
         }
 
+        if (s_ack_event) {
+            /* Idle: everything submitted is executed and no flush waits. A
+             * wake-up starts the count again, as the kick's PUT write can
+             * follow the flush that woke the loop. */
+            uint32_t put = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_PUT);
+            uint32_t get = *(volatile uint32_t *)((char *)regs + NV2A_USER_DMA_GET);
+            uint32_t flush = *(volatile uint32_t *)((char *)regs + NV2A_ACK[0].offset);
+            if (put == get && !(flush & NV2A_ACK[0].busy_mask))
+                idle++;
+            else
+                idle = 0;
+            if (idle > 32) {
+                if (WaitForSingleObject(s_ack_event, 1) == WAIT_OBJECT_0)
+                    idle = 0;
+                continue;
+            }
+        }
         Sleep(0);  /* yield; the waiter is spinning on another core */
     }
     return 0;
@@ -1314,6 +1367,8 @@ static void xbox_Nv2aAckStart(void)
     poke_init();
     g_nv2a_ack_stop = 0;
     s_flush_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (ack_idle_on())
+        s_ack_event = CreateEventW(NULL, FALSE, FALSE, NULL);
     g_nv2a_ack_thread = CreateThread(NULL, 0, nv2a_ack_thread,
                                      g_nv2a_memory, 0, NULL);
     if (g_nv2a_ack_thread) {

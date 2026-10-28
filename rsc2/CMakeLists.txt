@@ -114,7 +114,11 @@ if(ANDROID)
     add_library(${PROJECT_NAME} SHARED ${GAME_SOURCES} ${RECOMP_GEN_SOURCES})
     set_target_properties(${PROJECT_NAME} PROPERTIES OUTPUT_NAME main)
     target_link_libraries(${PROJECT_NAME} PRIVATE android log)
-    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--no-undefined)
+    # -Bsymbolic-functions: calls inside libmain.so bind to its own functions.
+    # -rdynamic exports every sub_XXXXXXXX (for naming faults with dladdr),
+    # which made each a preemptible symbol called through a PLT stub: 4% of
+    # the game thread in a race. Nothing interposes them.
+    target_link_options(${PROJECT_NAME} PRIVATE -Wl,--no-undefined -Wl,-Bsymbolic-functions)
 else()
 add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
