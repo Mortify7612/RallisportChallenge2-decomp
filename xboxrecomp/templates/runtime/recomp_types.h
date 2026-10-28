@@ -164,6 +164,31 @@ extern uint32_t g_xbox_code_hi;
 #  define RECOMP_TLS _Thread_local
 #endif
 
+#if defined(RECOMP_REG_BLOCK)
+/* All of the registers below in one thread-local block, for a host where
+ * reaching each thread-local is a call (a dlopen'd library, as on Android):
+ * a function then asks once. See xbox/recomp_reg_block.h; the separate
+ * declarations below are left out, as these names are macros. */
+#include "xbox/recomp_reg_block.h"
+extern RECOMP_TLS RecompRegBlock g_rb;
+#define g_eax             (g_rb.g_eax)
+#define g_ecx             (g_rb.g_ecx)
+#define g_edx             (g_rb.g_edx)
+#define g_esp             (g_rb.g_esp)
+#define g_ebx             (g_rb.g_ebx)
+#define g_esi             (g_rb.g_esi)
+#define g_edi             (g_rb.g_edi)
+#define g_ebp             (g_rb.g_ebp)
+#define g_fs_base         (g_rb.g_fs_base)
+#define g_seh_ebp         (g_rb.g_seh_ebp)
+#define g_eflags_shadow   (g_rb.g_eflags_shadow)
+#define g_df              (g_rb.g_df)
+#define g_fp_top          (g_rb.g_fp_top)
+#define g_fp_cmp          (g_rb.g_fp_cmp)
+#define g_fp_control_word (g_rb.g_fp_control_word)
+#define g_fp_cc           (g_rb.g_fp_cc)
+#define g_fp_stack        (g_rb.g_fp_stack)
+#else
 extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
 extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
 
@@ -171,6 +196,7 @@ extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
  * arguments are passed in st(0)/st(1) across call boundaries. */
 extern RECOMP_TLS double g_fp_stack[8];
 extern RECOMP_TLS int g_fp_top;
+#endif
 
 /**
  * SEH frame pointer bridge.
@@ -188,10 +214,14 @@ extern RECOMP_TLS int g_fp_top;
  * Per-thread, because a TIB is. fs:[0] is the SEH chain head and fs:[4]
  * reaches the CRT's per-thread data, so a single shared base makes every
  * guest thread the same thread as far as the CRT is concerned. */
+#if !defined(RECOMP_REG_BLOCK)
 extern RECOMP_TLS uint32_t g_fs_base;
+#endif
 #define XBOX_FS_BASE g_fs_base
 
+#if !defined(RECOMP_REG_BLOCK)
 extern RECOMP_TLS uint32_t g_seh_ebp;
+#endif
 
 /* EFLAGS as pushfd shows it and popfd restores it.
  *
@@ -205,7 +235,9 @@ extern RECOMP_TLS uint32_t g_seh_ebp;
  * pushfd/popfd and checks it stuck. With pushfd/popfd lifted to nothing the
  * probe's pops took the stack instead, and inflate_fast ran off with a
  * corrupt frame. */
+#if !defined(RECOMP_REG_BLOCK)
 extern RECOMP_TLS uint32_t g_eflags_shadow;
+#endif
 #define RECOMP_EFLAGS_SHADOW_MASK 0x00240602u /* ID AC DF IF bit1 */
 
 /* cpuid as the console's CPU answers it: a 733 MHz Pentium III-class
@@ -265,7 +297,9 @@ extern RECOMP_TLS uint32_t g_eflags_shadow;
 #include <setjmp.h>
 jmp_buf *recomp_setjmp_slot(uint32_t buf_va);
 int recomp_guest_longjmp(uint32_t buf_va, uint32_t value);
+#if !defined(RECOMP_REG_BLOCK)
 extern RECOMP_TLS uint32_t g_ebp;
+#endif
 
 /* EFLAGS.DF, and the signed step the string instructions take because of it.
  *
@@ -279,16 +313,20 @@ extern RECOMP_TLS uint32_t g_ebp;
  * be found by name, and the dashboard rebooted rather than showing a UI.
  * memmove's overlapping case is the same instruction and the same bug.
  */
+#if !defined(RECOMP_REG_BLOCK)
 extern RECOMP_TLS int g_df;
+#endif
 #define RECOMP_DF_STEP(n) (g_df ? -(int32_t)(n) : (int32_t)(n))
 
 /* x87 control and status. Thread-local for the same reason the x87 stack
    above is: one guest routine can lift to several C functions, so a compare
    and the FNSTSW that reads it can land in different bodies, and the control
    word has to survive a call. (g_fp_stack/g_fp_top are declared above.) */
+#if !defined(RECOMP_REG_BLOCK)
 extern RECOMP_TLS uint16_t g_fp_control_word;
 extern RECOMP_TLS int g_fp_cmp;
 extern RECOMP_TLS uint16_t g_fp_cc;
+#endif
 /* x87 precision control (control word bits 8-9). The stack is double-backed,
  * which matches PC=53 and is close enough for PC=64, but PC=24 -- what the
  * Xbox runs with -- rounds every arithmetic result to float. A title that

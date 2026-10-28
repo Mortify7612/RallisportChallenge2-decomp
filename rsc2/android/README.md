@@ -136,6 +136,13 @@ unstripped `rsc2/build-android/libmain.so` for it.
 - **No launcher window yet.** The game starts full screen with the default
   settings.
 - **One guest thread at a time** (`RECOMP_GUEST_LOCK=1`, the ARM default).
+- **The x86 registers are one thread-local block** (`RECOMP_REG_BLOCK`,
+  `xboxrecomp/include/xbox/recomp_reg_block.h`). `libmain.so` is dlopen'd,
+  so each thread-local is reached through a TLS descriptor, a call into
+  the linker's resolver: a lifted function made five to ten of them, and
+  now makes one. `-DRSC2_REG_BLOCK=OFF` builds it the old way.
+  (Local-dynamic TLS would do the same, but lld cannot link its AArch64
+  relocations.)
 - **Vulkan driver:** calls go through volk, loaded from the system's
   libvulkan or, when that driver is older than 1.3, from libadrenotools'
   private copy whose driver is the APK's Turnip (`libvulkan_freedreno.so`).

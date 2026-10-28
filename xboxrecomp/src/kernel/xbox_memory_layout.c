@@ -1348,9 +1348,46 @@ uint32_t g_xbox_code_lo = 0;
 uint32_t g_xbox_code_hi = 0;
 
 /* Global registers for recompiled code (via recomp_types.h) */
+#if defined(RECOMP_REG_BLOCK)
+/* All of them in one thread-local block (recomp_reg_block.h), with the
+ * initial values given below for the separate variables. The old names
+ * are TLS symbols at their members' offsets, so code written by hand, which
+ * declares them one by one, reaches the same storage. */
+#include <stddef.h>
+#include "../../include/xbox/recomp_reg_block.h"
+
+RECOMP_TLS RecompRegBlock g_rb = {
+    .g_fs_base = XBOX_TIB_MAIN, .g_eflags_shadow = 0x00000202u,
+    .g_fp_control_word = 0x037Fu, .g_fp_cc = 0x4000,
+};
+
+#define RB_STR_(x) #x
+#define RB_STR(x) RB_STR_(x)
+#define RB_ALIAS(m, size) \
+    ".globl " #m "\n.type " #m ", %tls_object\n.size " #m ", " #size "\n" \
+    ".set " #m ", g_rb + " RB_STR(RECOMP_REG_BLOCK_OFF_##m) "\n"
+__asm__(RB_ALIAS(g_eax, 4) RB_ALIAS(g_ecx, 4) RB_ALIAS(g_edx, 4) RB_ALIAS(g_esp, 4)
+        RB_ALIAS(g_ebx, 4) RB_ALIAS(g_esi, 4) RB_ALIAS(g_edi, 4) RB_ALIAS(g_ebp, 4)
+        RB_ALIAS(g_fs_base, 4) RB_ALIAS(g_seh_ebp, 4) RB_ALIAS(g_eflags_shadow, 4)
+        RB_ALIAS(g_df, 4) RB_ALIAS(g_fp_top, 4) RB_ALIAS(g_fp_cmp, 4)
+        RB_ALIAS(g_fp_control_word, 2) RB_ALIAS(g_fp_cc, 2) RB_ALIAS(g_fp_stack, 64));
+#define RB_CHECK(m) _Static_assert(offsetof(RecompRegBlock, m) == RECOMP_REG_BLOCK_OFF_##m, #m)
+RB_CHECK(g_eax); RB_CHECK(g_ecx); RB_CHECK(g_edx); RB_CHECK(g_esp); RB_CHECK(g_ebx);
+RB_CHECK(g_esi); RB_CHECK(g_edi); RB_CHECK(g_ebp); RB_CHECK(g_fs_base); RB_CHECK(g_seh_ebp);
+RB_CHECK(g_eflags_shadow); RB_CHECK(g_df); RB_CHECK(g_fp_top); RB_CHECK(g_fp_cmp);
+RB_CHECK(g_fp_control_word); RB_CHECK(g_fp_cc); RB_CHECK(g_fp_stack);
+#undef RB_CHECK
+
+extern RECOMP_TLS uint32_t g_fs_base, g_seh_ebp, g_eflags_shadow, g_ebp;
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp, g_ebx, g_esi, g_edi;
+extern RECOMP_TLS double g_fp_stack[8];
+extern RECOMP_TLS int g_fp_top, g_fp_cmp, g_df;
+extern RECOMP_TLS uint16_t g_fp_control_word, g_fp_cc;
+#else
 /* Each guest thread's TIB. The first thread uses the one the loader built;
  * a spawned thread gets its own from xbox_AllocThreadTib(). */
 RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
+#endif
 
 /* The shape of the TLS block the loader built, so a new thread can be
  * given one just like it: where the initialised image data starts, how
@@ -1358,8 +1395,10 @@ RECOMP_TLS uint32_t g_fs_base = XBOX_TIB_MAIN;
  * at is. Zero total means the image had no TLS directory. */
 static uint32_t g_tls_template_va, g_tls_total, g_tls_thread_size = 64;
 
+#if !defined(RECOMP_REG_BLOCK)
 RECOMP_TLS uint32_t g_eax = 0, g_ecx = 0, g_edx = 0, g_esp = 0;
 RECOMP_TLS uint32_t g_ebx = 0, g_esi = 0, g_edi = 0;
+#endif
 
 #ifdef RECOMP_ABI_CHECK
 /* Report a lifted function that returned without restoring ebx/esi/edi.
@@ -1420,6 +1459,7 @@ void recomp_abi_violation_log(uint32_t va, uint32_t ebx0, uint32_t esi0,
 }
 #endif
 
+#if !defined(RECOMP_REG_BLOCK)
 /* SEH frame pointer bridge (see recomp_types.h for explanation) */
 RECOMP_TLS uint32_t g_seh_ebp = 0;
 /* EFLAGS bits the lifter does not track per instruction (see recomp_types.h).
@@ -1427,17 +1467,20 @@ RECOMP_TLS uint32_t g_seh_ebp = 0;
 RECOMP_TLS uint32_t g_eflags_shadow = 0x00000202u;
 RECOMP_TLS double g_fp_stack[8];
 RECOMP_TLS int g_fp_top = 0;
+#endif
 
 /* Set once at startup. The generated code reads it at the ret of every
  * --force-return function, so it has to be cheap and it has to default to
  * off: a build carrying forced functions behaves normally until the
  * variable is set. */
 int g_force_return = 0;
+#if !defined(RECOMP_REG_BLOCK)
 /* x87 control and status. The reset default masks every exception and
  * rounds to nearest, which is what the CRT expects before _control87. */
 RECOMP_TLS uint16_t g_fp_control_word = 0x037Fu;
 RECOMP_TLS int g_fp_cmp = 0;
 RECOMP_TLS uint16_t g_fp_cc = 0x4000;
+#endif
 
 /* Defined below, with the other guest registers. */
 extern RECOMP_TLS uint32_t g_ebp;
@@ -2043,9 +2086,11 @@ RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
 RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
 RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
 RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+#if !defined(RECOMP_REG_BLOCK)
 /* Last frame established by `mov ebp, esp`. Read by frameless functions
  * that address their caller's frame through ebp. */
 RECOMP_TLS uint32_t g_ebp = 0;
+#endif
 
 /* EFLAGS.DF. Zero means the string instructions walk forwards, which is the
  * ABI's resting state and what almost every one of them does -- so this is
@@ -2054,7 +2099,9 @@ RECOMP_TLS uint32_t g_ebp = 0;
  * `std; repne scasb`, and memmove goes backwards when its regions overlap the
  * wrong way. Thread-local, because `std` and the `cld` that undoes it can land
  * in different lifted bodies of the same guest routine. */
+#if !defined(RECOMP_REG_BLOCK)
 RECOMP_TLS int g_df = 0;
+#endif
 
 /* ICALL trace ring buffer */
 volatile uint32_t g_icall_trace[16] = {0};

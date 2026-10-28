@@ -166,6 +166,17 @@ else()
         COMPILE_OPTIONS "-fno-strict-aliasing;-fwrapv;-w")
 endif()
 
+# Android: libmain.so is dlopen'd, so each thread-local is reached through a
+# TLS descriptor, a call into the linker's resolver, and a lifted function
+# named five to ten of them (the x86 registers). In one block
+# (xbox/recomp_reg_block.h) it asks once. The toolkit defines the block and
+# the old names as aliases into it, for the code written by hand.
+option(RSC2_REG_BLOCK "Android: the x86 registers in one thread-local block" ON)
+if(ANDROID AND RSC2_REG_BLOCK)
+    set_property(SOURCE ${RECOMP_GEN_SOURCES} APPEND PROPERTY COMPILE_DEFINITIONS RECOMP_REG_BLOCK=1)
+    target_compile_definitions(xbox_kernel PRIVATE RECOMP_REG_BLOCK=1)
+endif()
+
 # MinGW (the Linux-hosted Windows cross build): the same code-generation
 # contract as GCC elsewhere, and a self-contained .exe -- without -static it
 # needs libwinpthread-1.dll and libgcc's DLL next to it.
