@@ -582,6 +582,7 @@ static struct {
     VkSampler last_samps[8];
     /* stats */
     uint32_t st_draws, st_tris, st_syncs, st_tex_up, st_tex_hash_mb, st_surf_up;
+    uint64_t st_vtx_bytes, st_idx_bytes;    /* copied into the rings (VK_STATS) */
     uint32_t st_surf_hash_kb;   /* surface bytes hashed (surf_hash_now) */
     uint32_t st_compiles, st_pipes_new;
     uint32_t st_pipes_async;    /* general pipelines handed to the worker */
@@ -6343,6 +6344,8 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         vtx_float(&vb, ninputs, voff);
     }
     memcpy(ip, idx, (size_t)nidx * 4);
+    V.st_vtx_bytes += (uint64_t)vbytes;
+    V.st_idx_bytes += (uint64_t)nidx * 4;
 
     /* Per-draw constants. Built in ordinary memory and copied over once: the
      * ring is mapped device memory, write-combined on most drivers, where
@@ -9039,6 +9042,9 @@ void nv2a_vk_flush(void)
                         V.st_compiles, V.st_compile_ms, V.st_pipes_new, V.st_pipe_ms);
             fprintf(stderr, "  [VK]   visibility: %u reports, %u counted draws\n",
                     V.st_reports, V.st_qdraws);
+            fprintf(stderr, "  [VK]   copied a frame: vertices %.0f KB, indices %.0f KB\n",
+                    V.st_vtx_bytes / 1024.0 / 120.0, V.st_idx_bytes / 1024.0 / 120.0);
+            V.st_vtx_bytes = V.st_idx_bytes = 0;
             V.st_reports = V.st_qdraws = 0;
             if (V.msaa > 1 || V.st_ao)
                 fprintf(stderr, "  [VK]   msaa refreshes %u, ao passes %u\n", V.st_ms_refresh, V.st_ao);
