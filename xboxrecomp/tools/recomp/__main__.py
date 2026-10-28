@@ -259,6 +259,12 @@ def main():
                         help="JSON list of addresses to emit an entry trace "
                              "for (RECOMP_TRACE_ENTER). For bring-up: shows "
                              "which call in an init chain is not returning")
+    parser.add_argument("--poll-loops", metavar="FILE",
+                        help="JSON list of polling-loop addresses (the label "
+                             "a loop branches back to) that get RECOMP_POLL in "
+                             "their back-edge: spin a little, then let the "
+                             "guest CPU go and sleep, as the console's "
+                             "scheduler would run other threads meanwhile")
     parser.add_argument("--force-return", metavar="ADDR=VALUE",
                         action="append", default=[],
                         help="Make a function hand its callers a constant "
@@ -340,6 +346,7 @@ def main():
         abi_json_path=data_files.get("abi"),
         output_dir=args.output_dir,
         trace_functions=_load_addrs(args.trace_functions),
+        poll_loops=_load_addrs(args.poll_loops),
         force_returns=_parse_force_returns(args.force_return),
         coalesce_json_paths=args.coalesce_functions,
         protected_function_starts=protected_function_starts,

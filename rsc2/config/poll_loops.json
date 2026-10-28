@@ -1,0 +1,17 @@
+[
+  {"address": "0x00368073", "what": "D3D: push-buffer room, DMA_GET (0xFD800044) until enough is free"},
+  {"address": "0x00367EE0", "what": "D3D: GPU progress, PGRAPH PATT_COLOR0 (+0x400B10) against its counter"},
+  {"address": "0x00368240", "what": "D3D: PFIFO CACHE1 DMA GET == PUT (+0x3240/+0x3244)"},
+  {"address": "0x003682F0", "what": "D3D: PFIFO CACHE1 DMA GET == PUT (+0x3240/+0x3244)"},
+  {"address": "0x00369EF0", "what": "D3D: PFIFO CACHE1 DMA GET == PUT (+0x3240/+0x3244)"},
+  {"address": "0x003650E0", "what": "D3D: a word until zero"},
+  {"address": "0x0036A0B5", "what": "D3D: a word until zero"},
+  {"address": "0x0036B5E6", "what": "D3D: a status byte, bit 4 clear"},
+  {"address": "0x0036C0B3", "what": "D3D PGRAPH handler: PGRAPH status (+0x400700) until idle"},
+  {"address": "0x0036C260", "what": "D3D: PFIFO status byte (+0x2500), bit 4 clear"},
+  {"address": "0x00326E57", "what": "DirectSound: the GP DSP's command word until cleared (RECOMP_DSP_ACK_ALLOC)"},
+  {"address": "0x00326EBA", "what": "DirectSound: a DSP word until zero"},
+  {"address": "0x0032ABE3", "what": "DirectSound: an APU register, bit 20 clear"},
+  {"address": "0x0032B35C", "what": "DirectSound: an APU register, bit 20 clear"},
+  {"address": "0x0037774E", "what": "a flag word until its bits clear"}
+]

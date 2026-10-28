@@ -18,5 +18,6 @@ if [ -s "$HERE/config/trace_functions.json" ]; then
 fi
 "$PY" -m tools.recomp game_files/default.xbe --all --split 250 \
     --exclude-manual "$HERE/src/rsc2_overrides.c" \
+    --poll-loops "$HERE/config/poll_loops.json" \
     "${TRACE[@]}" \
     --gen-dir "$HERE/src/recomp/gen"

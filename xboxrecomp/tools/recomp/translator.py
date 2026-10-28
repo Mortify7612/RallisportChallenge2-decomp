@@ -23,7 +23,7 @@ import sys
 from .config import va_to_file_offset, is_code_address
 from . import config as _config
 from .disasm import Disassembler
-from .lifter import direct_apu_access
+from .lifter import direct_apu_access, poll_hints
 from .lifter import (Lifter, lift_basic_block, detect_seh_helpers,
                      _RESULT_SNAPSHOT_SETTERS, _as_addr_set,
                      detect_setjmp_helpers, _func_ident, _operand_width)
@@ -453,7 +453,8 @@ class FunctionTranslator:
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
                  abi_db=None, seh_prolog=None, seh_epilog=None,
                  setjmp_fn=None, longjmp_fn=None,
-                 trace_functions=None, force_returns=None, icall_sites=None):
+                 trace_functions=None, force_returns=None, icall_sites=None,
+                 poll_loops=None):
         """
         xbe_data: bytes - raw XBE file contents
         icall_sites: dict - call-site VA -> [target VAs] a recorded run saw
@@ -471,6 +472,7 @@ class FunctionTranslator:
         self.classification_db = classification_db or {}
         self.abi_db = abi_db or {}
         self.trace_functions = set(trace_functions or ())
+        self.poll_loops = sorted(poll_loops or ())
         self.force_returns = dict(force_returns or {})
         self.disasm = Disassembler()
         self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db,
@@ -2633,7 +2635,7 @@ class FunctionTranslator:
         lines.append(f"}}")
         lines.append(f"")
 
-        return direct_apu_access("\n".join(lines))
+        return direct_apu_access(poll_hints("\n".join(lines), self.poll_loops))
 
     def _find_used_registers(self, instructions):
         """Find which 32-bit registers are referenced by any instruction."""
@@ -2678,7 +2680,7 @@ class BatchTranslator:
                  output_dir=None, seh_prolog=None, seh_epilog=None,
                  trace_functions=None, force_returns=None,
                  coalesce_json_paths=None, protected_function_starts=None,
-                 icall_sites_json_path=None):
+                 icall_sites_json_path=None, poll_loops=None):
         self.xbe_path = xbe_path
         # Per-site indirect-call targets. A saturated site reached more
         # targets than the runtime records, so it is never guarded.
@@ -2738,7 +2740,8 @@ class BatchTranslator:
             self.classification_db, self.abi_db,
             seh_prolog=0, seh_epilog=0,
             trace_functions=trace_functions,
-            force_returns=force_returns, icall_sites=self.icall_sites)
+            force_returns=force_returns, icall_sites=self.icall_sites,
+            poll_loops=poll_loops)
         self.translator.protected_function_starts = set(
             protected_function_starts or ())
         for explicit_helper in (seh_prolog, seh_epilog):

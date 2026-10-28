@@ -501,6 +501,12 @@ void     xbox_ApuMmioWrite(uint32_t va, uint32_t val, unsigned size);
 #define APU_WR16(addr, v)   xbox_ApuMmioWrite((addr), (uint16_t)(v), 2)
 #define APU_WR32(addr, v)   xbox_ApuMmioWrite((addr), (uint32_t)(v), 4)
 
+/** A listed polling loop's back-edge (the lifter's poll_hints, --poll-loops):
+ * 64 turns spinning, then recomp_poll_wait lets the guest CPU go and sleeps,
+ * as the console's scheduler would run other threads while one polls. */
+void recomp_poll_wait(uint32_t *turns);
+#define RECOMP_POLL(n) do { if (++(n) > 64u) recomp_poll_wait(&(n)); } while (0)
+
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))

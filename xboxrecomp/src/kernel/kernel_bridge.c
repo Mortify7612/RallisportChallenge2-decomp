@@ -38,6 +38,7 @@
  * but only as warnings, and this file is compiled with /W4 /WX-. */
 #include <stdlib.h>
 #include <float.h>
+#include <time.h>         /* nanosleep: recomp_poll_wait */
 /* Section B string helpers: wcslen helper, case folding.
  * ctype.h/wctype.h are not pulled in by the platform headers on either host. */
 #include <string.h>
@@ -9702,6 +9703,34 @@ static void guest_cpu_take(void)
         waits = 0;
         wait_ms = worst_ms = 0.0;
         t_report = t1;
+    }
+}
+
+/* A lifted polling loop that has spun 64 turns (RECOMP_POLL, the title's
+ * --poll-loops list): the guest CPU goes to other guest threads while this
+ * one sleeps, longer the longer it has polled -- 50 us, 200 us after 256
+ * turns, 1 ms after 1024. D3D's wait for push-buffer room held a big core
+ * (a third of the game thread at 60 fps on an Android tablet) and the
+ * guest CPU for as long as the executor took. */
+void recomp_poll_wait(uint32_t *turns)
+{
+    unsigned us = *turns < 256 ? 50 : *turns < 1024 ? 200 : 1000;
+    int held = t_guest_held;
+    if (held) {
+        t_guest_held = 0;
+        LeaveCriticalSection(&g_guest_cpu);
+    }
+#if defined(_WIN32)
+    Sleep(us >= 1000 ? 1 : 0);
+#else
+    {
+        struct timespec ts = { 0, (long)us * 1000 };
+        nanosleep(&ts, NULL);
+    }
+#endif
+    if (held) {
+        guest_cpu_take();
+        t_guest_held = 1;
     }
 }
 

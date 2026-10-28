@@ -213,6 +213,40 @@ def direct_apu_access(code):
     return _APU_LOAD.sub(load, _APU_STORE.sub(store, code))
 
 
+_LOC_LABEL = re.compile(r"^loc_[0-9A-F]{8}: ;")
+
+
+def poll_hints(code, addrs):
+    """RECOMP_POLL(_poll) in the back-edge of each listed polling loop: a
+    block at loc_A whose last statement is `if (c) goto loc_A;` and that only
+    re-reads memory another thread or a device changes (the title's list,
+    e.g. rsc2/config/poll_loops.json). The console's scheduler runs other
+    threads while one polls; here the loop held a core, and the guest CPU
+    (RECOMP_GUEST_LOCK), for as long as it waited. RECOMP_POLL spins 64
+    turns, then lets the guest CPU go and sleeps (recomp_poll_wait)."""
+    if not addrs or "goto loc_" not in code:
+        return code
+    lines = code.split("\n")
+    changed = False
+    for a in addrs:
+        label = f"loc_{a:08X}: ;"
+        if label not in lines:
+            continue
+        back = re.compile(r"^(\s*)if \((.*)\) goto loc_%08X;(.*)$" % a)
+        for j in range(lines.index(label) + 1, len(lines)):
+            if _LOC_LABEL.match(lines[j]) or lines[j].startswith("}"):
+                break
+            m = back.match(lines[j])
+            if m:
+                lines[j] = (f"{m.group(1)}if ({m.group(2)}) {{ RECOMP_POLL(_poll); "
+                            f"goto loc_{a:08X}; }}{m.group(3)}")
+                changed = True
+                break
+    if changed and "{" in lines:
+        lines.insert(lines.index("{") + 1, "    uint32_t _poll = 0; /* RECOMP_POLL */")
+    return "\n".join(lines)
+
+
 def _fmt_imm(val):
     """Format an immediate value as a C hex literal."""
     if val == 0:
