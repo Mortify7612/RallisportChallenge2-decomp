@@ -489,6 +489,18 @@ void recomp_trace_bb(uint32_t va, uint32_t ebp);
 #define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
 #define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
 
+/** The APU's registers at a constant address (the lifter's direct_apu_access):
+ * calls into the APU model, which a load or store there reached through a
+ * page fault and an instruction decode (src/apu/apu_mmio_hook.c). */
+uint32_t xbox_ApuMmioRead(uint32_t va, unsigned size);
+void     xbox_ApuMmioWrite(uint32_t va, uint32_t val, unsigned size);
+#define APU_RD8(addr)       ((uint8_t)xbox_ApuMmioRead((addr), 1))
+#define APU_RD16(addr)      ((uint16_t)xbox_ApuMmioRead((addr), 2))
+#define APU_RD32(addr)      xbox_ApuMmioRead((addr), 4)
+#define APU_WR8(addr, v)    xbox_ApuMmioWrite((addr), (uint8_t)(v), 1)
+#define APU_WR16(addr, v)   xbox_ApuMmioWrite((addr), (uint16_t)(v), 2)
+#define APU_WR32(addr, v)   xbox_ApuMmioWrite((addr), (uint32_t)(v), 4)
+
 /** Signed memory reads. */
 #define SMEM8(addr)  (*(volatile int8_t   *)XBOX_PTR(addr))
 #define SMEM16(addr) (*(volatile int16_t  *)XBOX_PTR(addr))

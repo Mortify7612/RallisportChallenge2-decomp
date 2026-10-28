@@ -15,6 +15,20 @@
  * platform's MMIO hook is active, so define it before the #if guard. */
 MCPXAPUState *g_apu_state = NULL;
 
+/* The APU's registers at constant addresses, from lifted code (APU_RDn /
+ * APU_WRn, the lifter's direct_apu_access): the model's own read and write,
+ * which the fault path below ends in too, without the fault. */
+uint32_t xbox_ApuMmioRead(uint32_t va, unsigned size)
+{
+    return g_apu_state ? (uint32_t)mcpx_apu_mmio_read(g_apu_state, va - 0xFE800000u, size) : 0;
+}
+
+void xbox_ApuMmioWrite(uint32_t va, uint32_t val, unsigned size)
+{
+    if (g_apu_state)
+        mcpx_apu_mmio_write(g_apu_state, va - 0xFE800000u, val, size);
+}
+
 /* The MMIO hook decodes the faulting instruction under a Win32 VEH -- on
  * Linux the sigaction shim in win32_compat.c. x86-64 uses the decoder below;
  * AArch64 the shared one in mmio_decode.h. Hosts without a fault path have

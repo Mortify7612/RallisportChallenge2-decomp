@@ -170,6 +170,49 @@ def _fmt_set_reg(name, value_expr):
     return f"{name} = {value_expr};"
 
 
+# The APU's registers (MCPX audio, 0xFE800000-0xFE87FFFF), reached at constant
+# addresses: DirectSound's voice-method interface writes and polls them by
+# absolute address. As loads and stores each one trapped, and a page fault
+# with an instruction decode per access was a quarter of the game thread in a
+# multi-car race on an Android tablet. direct_apu_access() makes them calls
+# into the APU model (APU_RDn / APU_WRn, recomp_types.h), which the fault
+# handler calls in the end anyway. Accesses through a register still trap.
+APU_DIRECT_LO = 0xFE800000
+APU_DIRECT_HI = 0xFE880000
+
+_APU_ADDR = r"(-?\d+|0x[0-9A-Fa-f]+)u?"
+_APU_STORE = re.compile(r"\bMEM(8|16|32)\(" + _APU_ADDR + r"\) = ([^;]*);")
+_APU_LOAD = re.compile(r"\bMEM(8|16|32)\(" + _APU_ADDR + r"\)")
+
+
+def _apu_addr(text):
+    v = int(text, 0) & 0xFFFFFFFF
+    return v if APU_DIRECT_LO <= v < APU_DIRECT_HI else None
+
+
+def direct_apu_access(code):
+    """Rewrite MEMn(K) for a constant K among the APU's registers: a store
+    `MEMn(K) = v;` becomes `APU_WRn(K, v);`, any other use `APU_RDn(K)`.
+    The lifter writes these accesses as plain stores and loads; a form other
+    than those (a compound assignment) would be left as an APU_RDn lvalue and
+    fail to compile, not change meaning quietly."""
+    def store(m):
+        v = _apu_addr(m.group(2))
+        if v is None:
+            return m.group(0)
+        return f"APU_WR{m.group(1)}(0x{v:08X}u, {m.group(3)});"
+
+    def load(m):
+        v = _apu_addr(m.group(2))
+        if v is None:
+            return m.group(0)
+        return f"APU_RD{m.group(1)}(0x{v:08X}u)"
+
+    if "MEM" not in code:
+        return code
+    return _APU_LOAD.sub(load, _APU_STORE.sub(store, code))
+
+
 def _fmt_imm(val):
     """Format an immediate value as a C hex literal."""
     if val == 0:
