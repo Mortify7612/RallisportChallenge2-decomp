@@ -7486,6 +7486,31 @@ int nv2a_vk_create_android_surface(void *anw, uint64_t *surface)
     if (vkCreateAndroidSurfaceKHR(V.inst, &ci, NULL, &surf) != VK_SUCCESS)
         return 0;
     *surface = (uint64_t)(uintptr_t)surf;
+    {
+        /* RECOMP_DISPLAY_HZ=<hz>: ask the system to run the panel at the
+         * game's rate (ANativeWindow_setFrameRate, Android 11+, looked up as
+         * the APK targets 10). On the tablet's 90 Hz panel 60 fps shows as
+         * frames of one refresh and two in turn. Off by default: asked with
+         * FIXED_SOURCE compatibility the panel went to 60 Hz, but every touch
+         * (the on-screen controls) boosted it back to 90 for 200 ms, and the
+         * switching stuttered badly. The vote is now DEFAULT, which the
+         * system's selector leaves out of touch boost -- not yet tried on
+         * the tablet. "Always" (Android 12+) allows a switch that is not
+         * seamless. */
+        const char *e = getenv("RECOMP_DISPLAY_HZ");
+        float hz = e ? (float)atof(e) : 0.0f;
+        void *lib = hz > 0.0f ? dlopen("libandroid.so", RTLD_NOW) : NULL;
+        if (lib) {
+            int32_t (*set2)(void *, float, int8_t, int8_t) =
+                (int32_t (*)(void *, float, int8_t, int8_t))dlsym(lib, "ANativeWindow_setFrameRateWithChangeStrategy");
+            int32_t (*set1)(void *, float, int8_t) =
+                (int32_t (*)(void *, float, int8_t))dlsym(lib, "ANativeWindow_setFrameRate");
+            /* compatibility 0: DEFAULT; change strategy 1: ALWAYS */
+            int32_t r = set2 ? set2(anw, hz, 0, 1) : set1 ? set1(anw, hz, 0) : -1;
+            fprintf(stderr, "  [VK] display rate %.0f Hz asked for (%s): %d\n", hz,
+                    set2 ? "setFrameRateWithChangeStrategy" : set1 ? "setFrameRate" : "not available", (int)r);
+        }
+    }
     return 1;
 #else
     (void)anw; (void)surface;
