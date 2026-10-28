@@ -146,6 +146,9 @@ unstripped `rsc2/build-android/libmain.so` for it.
 - **No launcher window yet.** The game starts full screen with the default
   settings.
 - **One guest thread at a time** (`RECOMP_GUEST_LOCK=1`, the ARM default).
+- **The game and the executor overlap** (`RECOMP_NV2A_PFB_ASYNC=1` and
+  `RECOMP_NV2A_IRQ_WAKE=1`, Android defaults, as on the Switch): the game
+  builds the next frame while the executor draws this one.
 - **The x86 registers are one thread-local block** (`RECOMP_REG_BLOCK`,
   `xboxrecomp/include/xbox/recomp_reg_block.h`). `libmain.so` is dlopen'd,
   so each thread-local is reached through a TLS descriptor, a call into
@@ -173,6 +176,50 @@ unstripped `rsc2/build-android/libmain.so` for it.
   - the window no longer converts the guest framebuffer for itself when
     Vulkan presents (only video recording and dumps used it);
     together a tenth of the executor's time.
+
+Measured again on 2026-10-28 (now on an Android 14 GSI, panel at 90 Hz),
+with the desktop renderer's speed-ups since then included. `my_run2_resume.xi`
+replay, `RECOMP_FPS_LOG=60`, the race over flips 840-1320, each run started
+with the CPU under 45 °C:
+
+- At the default pacing the race holds 60 fps.
+- Unpaced on screen it runs ~71 fps: frames of a little over 11 ms wait
+  for the panel's next refresh.
+- Headless (`RECOMP_FB_WINDOW=0 RECOMP_FLIP_HZ=0`, which leaves the
+  presentation out) it runs 116.6 fps, with:
+  - the game/executor overlap off: 76.8 fps;
+  - NEON texture hashing off (`RECOMP_VK_HASH_SIMD=0`): 115.1 fps;
+  - the register block off: 116.4 fps, as the executor sets the pace
+    (8.6 ms a frame). The game thread's CPU time per frame goes from 5.9
+    to 4.9 ms with the block.
+
+The multi-car races are heavier: 51-59 fps, and the music broke up. Profiled
+with simpleperf attached while the owner raced (30 s,
+`record --app io.github.rsc2recomp --call-graph fp`), then fixed:
+
+- This kernel makes every clock read a system call (the vDSO falls back).
+  The executor's idle loop read the clock and yielded back to back (~45%
+  of its thread), the timer thread yielded waiting for the DISPATCH lock
+  (~74%), and the frame pacer spun its last 1.5-2 ms. Now the idle loop
+  sleeps on an event that D3D's kick sets, the lock wait is a futex, and
+  the pacer sleeps to a quarter of a millisecond before the slot.
+- A quarter of the game thread went to APU register faults: DirectSound's
+  voice methods, written at constant addresses. The lifter now emits those
+  as calls into the APU model (`APU_RDn`/`APU_WRn`).
+- `-Bsymbolic-functions`: lifted functions called each other through PLT
+  stubs, as `-rdynamic` exported them all.
+- The music: the mixer lost the time of every late frame from the output
+  queue and ran it dry (up to 80 dropouts in 5 s), and the APU's
+  interrupt waited for every thread at DISPATCH_LEVEL, up to 33 ms, so
+  the title refilled its streams late. The mixer now keeps a 24 ms cushion
+  (`RECOMP_AUDIO_CUSHION_MS`), and the interrupt waits only for a thread
+  above DISPATCH (`RECOMP_APU_IRQ_AT_DISPATCH`, an Android default).
+  `RECOMP_PERF=1` reports the output queue, stream voices with no data,
+  interrupt waits and guest-CPU lock waits every 5 s.
+
+After these the multi-car race holds 60 fps, the music plays through, and
+the game thread spends about a third of its time waiting in D3D's
+push-buffer loop (0x00368073): headroom.
 
 ## Touch controls
 
