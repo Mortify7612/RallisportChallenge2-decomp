@@ -53,3 +53,49 @@
   `~/.local/share/xboxrecomp`. Know where saves land before running tests.
 - A profile saved by the Linux build showed as "Unable to load" on Windows.
   Unresolved; suspect a file-attribute or metadata difference.
+
+## D3D's kick and GPU overlap (PFB flush, PATT_COLOR0, NOP notify)
+
+XDK D3D's push-buffer kick sets the PFB write-back flush (`0xFD100410` bit
+`0x10000`) and spins until it clears. If the software GPU only clears it once
+the executor has caught up with PUT, the game and the executor take turns:
+frame time is the sum of both. On the console the flush is a CPU
+write-combining flush, done at once. Clearing it immediately is right, but a
+D3D that is then ahead of the GPU waits for push-buffer room through two
+things a plain register aperture does not provide (RSC2 hung on race load):
+
+- **PGRAPH `PATT_COLOR0` (`0x400B10`) is D3D's GPU progress counter.** It
+  queues the pattern object's `SET_MONOCHROME_COLOR0` (method `0x0310` on a
+  non-3D subchannel) and polls the register (bits 2-6 against its counter).
+  The executor must write it when it executes that method.
+- **`NV097_NO_OPERATION` with a non-zero parameter is a notify interrupt.**
+  The GPU sets `PGRAPH_INTR` ERROR (bit 20), `NSOURCE` NOTIFICATION (bit 0),
+  `TRAPPED_ADDR` (method in bits 0-12, subchannel in 16-18) and
+  `TRAPPED_DATA_LOW` (the parameter), raises PMC bit 12, and stalls until
+  the ISR writes the ERROR bit back (xemu `pgraph.c`). D3D patches one into
+  space the GPU has not reached and waits on a device event its ISR sets.
+- **The GPU stays stalled until `PGRAPH_FIFO` (`0x400720`) is back on, not
+  only until the ERROR bit is cleared.** D3D's handler turns FIFO access
+  off, clears the interrupt, and only then reads `TRAPPED_DATA_LOW`. An
+  executor that goes on at the clear can overwrite the parameter with the
+  next notify. RSC2 lost its "push-buffer room" notify (5) that way and
+  froze in a wait with no timeout, but only once notifies were delivered
+  promptly. Count "parameter changed between clear and read" in the model,
+  and add a knob that sleeps after the clear to widen the window. That
+  proved the race in one run.
+
+With both modelled (toolkit `nv2a_irq.c`, `RECOMP_NV2A_PFB_ASYNC`), RSC2's main
+thread went from ~15M flush polls a second to ~2000, and its Switch race
+from 17-20 to 20-33 fps. GET, idle bits and semaphores must still advance
+only as the executor really completes work: D3D's buffer reuse waits on
+those. `RECOMP_MMIO_POLL_TRACE=1` names the register a spinning thread reads.
+
+## Threads created suspended
+
+Honour `PsCreateSystemThreadEx`'s `CreateSuspended`. The XDK CRT's thread
+wrapper passes `(flags >> 2) & 1`, and titles create workers suspended,
+then set up what the worker waits on, then call `NtResumeThread`. A
+worker started at once races its creator. It usually loses by a hair,
+so the bug hides until the timing shifts. On RSC2 a profiler thread was
+enough to tip it: the worker waited on heap garbage (handle `0x9`) and
+crashed at the first movie.

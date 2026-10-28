@@ -147,3 +147,18 @@ to guest RAM at flip only where the game reads them.
   PRIME desktop (KWin on the iGPU, screen on the dGPU) this cut slow frames
   from 61% to 1.3%. KWin never direct-scans out buffers from a GPU other
   than its render GPU.
+
+## Texture descriptors carry stale registers
+
+A texture stage's state includes registers its format never reads: the
+palette address (only P8, format 0x0B, uses it) and the pitch (only linear
+formats do; swizzled and DXT size from format). Titles leave whatever an
+earlier draw set there. Keyed on the whole descriptor, RSC2's DXT textures
+showed up with two or three pitches and palettes each, so every one was
+cached, hash-checked and uploaded several times, and any per-draw lookup
+cache missed. Clear the unused fields before keying (the GL renderer's
+tex_get does; check the Vulkan renderer's texture cache for the same).
+
+Checking textures for changes less often (sampled hashes from smaller sizes,
+skipping "settled" textures) saved little on the Switch and made RSC2's road
+flash, a change seen late. Make each check cheaper, not rarer.
