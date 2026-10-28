@@ -119,6 +119,57 @@ extern void xbox_worker_stack_free(int slot);
 extern uint32_t xbox_GetConnectedInterrupt(uint32_t vector);
 extern uint32_t xbox_AllocThreadTib(void);
 extern int xbox_IrqlBlocksInterrupts(void);
+extern int xbox_IrqlBlocksDeviceInterrupts(void);
+
+/* RECOMP_APU_IRQ_AT_DISPATCH (on by default on Android): the interrupt
+ * waits only for a thread above DISPATCH_LEVEL, as on the console, not for
+ * every thread at DISPATCH_LEVEL (xbox_IrqlBlocksDeviceInterrupts). In a
+ * multi-car race on the tablet the title spent so long at DISPATCH that
+ * DirectSound's "buffer done" waited up to 50 frames, its streams ran dry
+ * (a metallic buzz) and the music broke up. RECOMP_PERF counts the frames
+ * an interrupt waited. */
+static int apu_irq_blocked(void)
+{
+    static int at_dispatch = -1;
+    if (at_dispatch < 0) {
+        const char *e = getenv("RECOMP_APU_IRQ_AT_DISPATCH");
+#if defined(__ANDROID__)
+        at_dispatch = !(e && strcmp(e, "0") == 0);
+#else
+        at_dispatch = e && strcmp(e, "0") != 0;
+#endif
+    }
+    return at_dispatch ? xbox_IrqlBlocksDeviceInterrupts() : xbox_IrqlBlocksInterrupts();
+}
+
+static void apu_irq_stats(int held)
+{
+    static int on = -1;
+    static uint32_t frames, delivered, longest, run;
+    static int64_t t0;
+    int64_t now;
+    if (on < 0)
+        on = getenv("RECOMP_PERF") != NULL;
+    if (!on)
+        return;
+    if (held) {
+        frames++;
+        if (++run > longest)
+            longest = run;
+    } else {
+        delivered++;
+        run = 0;
+    }
+    now = qemu_clock_get_ms(QEMU_CLOCK_REALTIME);
+    if (!t0)
+        t0 = now;
+    if (now - t0 >= 5000) {
+        fprintf(stderr, "[APU] 5 s: %u interrupts delivered; %u frames one waited for IRQL,"
+                " at most %u in a row\n", delivered, frames, longest);
+        frames = delivered = longest = 0;
+        t0 = now;
+    }
+}
 extern int xbox_IrqlEnterInterrupt(int level);
 extern void xbox_IrqlLeaveInterrupt(int saved);
 #if defined(_MSC_VER)
@@ -145,9 +196,12 @@ static void apu_deliver_irq(MCPXAPUState *d)
 
     if (!InterlockedCompareExchange(&s_irq_line, 0, 0))
         return;
-    if (xbox_IrqlBlocksInterrupts() && ++held_off <= 50)
+    if (apu_irq_blocked() && ++held_off <= 50) {
+        apu_irq_stats(1);
         return;
+    }
     held_off = 0;
+    apu_irq_stats(0);
     kint = xbox_GetConnectedInterrupt(APU_VECTOR);
     if (!kint)
         return;
@@ -498,6 +552,27 @@ static void throttle(MCPXAPUState *d)
     if (d->next_frame_time_us == 0 ||
         now_us - d->next_frame_time_us > EP_FRAME_US) {
         d->next_frame_time_us = now_us;
+    }
+
+    /* A cushion in the output queue (RECOMP_AUDIO_CUSHION_MS, default 24;
+     * 0: the clock alone). Paced by the clock alone, a frame that ran late
+     * moved the grid above to now: the time it lost came out of what was
+     * queued for the device and never went back, and after a few, nothing
+     * was. In a multi-car race on the tablet the queue was found empty up
+     * to 80 times in 5 s (a dropout each), the mixer late waiting for d->lock
+     * while the title's APU writes held it. Under the cushion the mixer
+     * runs at 4/3 of real time until the queue holds it again: mixing the
+     * missing frames at once drew the title's streams down faster than it
+     * refills them, which sharpened a buzz where they ran dry. */
+    {
+        static int cushion = -1;
+        int q;
+        if (cushion < 0) {
+            const char *e = getenv("RECOMP_AUDIO_CUSHION_MS");
+            cushion = e ? atoi(e) : 24;
+        }
+        if (cushion > 0 && (q = xa2_queued_ms()) >= 0 && q < cushion)
+            d->next_frame_time_us -= EP_FRAME_US / 4;
     }
 
     while (!d->pause_requested) {

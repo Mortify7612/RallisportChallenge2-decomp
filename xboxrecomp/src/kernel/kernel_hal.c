@@ -89,6 +89,23 @@ int xbox_IrqlBlocksInterrupts(void)
     return InterlockedCompareExchange(&g_irql_raised_count, 0, 0) != 0;
 }
 
+/* How many threads are above DISPATCH_LEVEL: at a device's IRQL, in an ISR
+ * or synchronising with one (KeSynchronizeExecution, KeRaiseIrql to DIRQL).
+ *
+ * The count above treats DISPATCH_LEVEL as masking every interrupt, and on
+ * the console it does not: it holds off DPCs and thread switches, and a
+ * device's interrupt still comes in -- code sharing data with an ISR raises
+ * to the ISR's own level. A device model that delivers only while this is
+ * zero interrupts DISPATCH-level code as the console does (the APU,
+ * apu_core.c: DirectSound's "buffer done" waited up to 33 ms behind the
+ * title's DISPATCH-level work, and its streams ran dry in races). */
+static volatile LONG g_irql_device_count = 0;
+
+int xbox_IrqlBlocksDeviceInterrupts(void)
+{
+    return InterlockedCompareExchange(&g_irql_device_count, 0, 0) != 0;
+}
+
 /* The raw depth, for callers that want to report it. A count that only ever
  * grows is a leak somewhere in the raise/lower pairs, and the number says so
  * where a yes/no cannot. */
@@ -265,6 +282,12 @@ static void irql_track(KIRQL old_level, KIRQL new_level, void *ra)
     int now = (new_level >= DISPATCH_LEVEL);
     LONG d;
 
+    if ((old_level > DISPATCH_LEVEL) != (new_level > DISPATCH_LEVEL)) {
+        if (new_level > DISPATCH_LEVEL)
+            InterlockedIncrement(&g_irql_device_count);
+        else
+            InterlockedDecrement(&g_irql_device_count);
+    }
     if (now == was)
         return;
 

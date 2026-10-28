@@ -21,4 +21,8 @@ int xa2_submit_samples(const int16_t *samples, int num_samples);
 /* Get the preferred buffer size in samples. */
 int xa2_get_buffer_size(void);
 
+/* Milliseconds of audio queued for the device, or -1 where that is not
+ * known (XAudio2): the mixer keeps a cushion there (apu_core.c, throttle). */
+int xa2_queued_ms(void);
+
 #endif /* APU_XAUDIO2_H */

@@ -810,6 +810,7 @@ KIRQL   __fastcall xbox_KfRaiseIrql(KIRQL NewIrql);
  * Device models ask before delivering an interrupt; raising IRQL masks the
  * line for the whole processor on hardware, not just for one thread. */
 int     xbox_IrqlBlocksInterrupts(void);
+int     xbox_IrqlBlocksDeviceInterrupts(void);  /* a thread above DISPATCH_LEVEL */
 int     xbox_IrqlRaisedCount(void);
 int     xbox_IrqlEnterInterrupt(int level);     /* around host-run ISRs and DPCs */
 void    xbox_IrqlLeaveInterrupt(int saved);

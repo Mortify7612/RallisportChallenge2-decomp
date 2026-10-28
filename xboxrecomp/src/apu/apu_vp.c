@@ -126,6 +126,31 @@ static void voice_set_mask(MCPXAPUState *d, uint16_t voice_handle,
  * Voice off / lock
  * ============================================================ */
 
+/* RECOMP_PERF: stream voices (the title's music, among others) every 5 s:
+ * frames a playing stream had no data for (its next buffer not given in
+ * time: silence), buffers it played through, and streams active. */
+static uint32_t s_st_starved, s_st_done, s_st_frames;
+static uint64_t s_st_active[MCPX_HW_MAX_VOICES / 64];
+
+static void stream_stats_frame(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("RECOMP_PERF") != NULL;
+    if (!on)
+        return;
+    if (++s_st_frames >= 5 * 48000 / NUM_SAMPLES_PER_FRAME) {
+        int k, n = 0;
+        for (k = 0; k < MCPX_HW_MAX_VOICES / 64; k++)
+            n += __builtin_popcountll(s_st_active[k]);
+        fprintf(stderr, "[APU] 5 s: %d stream voice(s) played; %u buffers done; %u voice-frames"
+                " with no data (%.1f ms)\n", n, s_st_done, s_st_starved,
+                s_st_starved * 1000.0 * NUM_SAMPLES_PER_FRAME / 48000.0);
+        s_st_frames = s_st_starved = s_st_done = 0;
+        memset(s_st_active, 0, sizeof s_st_active);
+    }
+}
+
 static void voice_off(MCPXAPUState *d, uint16_t v)
 {
     voice_set_mask(d, v, NV_PAVS_VOICE_PAR_STATE,
@@ -793,7 +818,10 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
         page = d->vp.ssl[v].base[ssl_index] + ssl_seg;
         count = d->vp.ssl[v].count[ssl_index];
 
+        s_st_active[v / 64] |= 1ULL << (v % 64);
         if (count == 0) {
+            if (persist)
+                s_st_starved++;
             voice_set_mask(d, (uint16_t)v, NV_PAVS_VOICE_PAR_OFFSET,
                            NV_PAVS_VOICE_PAR_OFFSET_CBO, 0);
             d->vp.ssl[v].ssl_seg = 0;
@@ -921,6 +949,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 /* Move to next segment */
             } else {
                 int next_index = (ssl_index + 1) % 2;
+                s_st_done++;
                 d->vp.ssl[v].ssl_index = next_index;
                 d->vp.ssl[v].ssl_seg = 0;
                 set_notify_status(d, v, MCPX_HW_NOTIFIER_SSLA_DONE + ssl_index,
@@ -1339,6 +1368,7 @@ static void vp_stats_frame(float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 void mcpx_apu_vp_frame(MCPXAPUState *d,
                         float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
+    stream_stats_frame();
     memset(d->vp.sample_buf, 0, sizeof(d->vp.sample_buf));
 
     for (int list = 0; list < 3; list++) {

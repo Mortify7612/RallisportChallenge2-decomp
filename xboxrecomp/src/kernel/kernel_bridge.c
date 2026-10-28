@@ -9663,6 +9663,48 @@ void guest_cpu_part(void)
     t_guest_thread = 0;
 }
 
+/* Taking the guest CPU back after a kernel call. RECOMP_PERF: every 5 s, how
+ * often a guest thread found it taken, the longest it waited and the total --
+ * a thread woken to feed an audio stream waits here until the one holding it
+ * makes a kernel call. The counts are kept under the lock itself. */
+static void guest_cpu_take(void)
+{
+    static int perf = -1;
+    static LARGE_INTEGER freq, t_report;
+    static uint32_t waits;
+    static double wait_ms, worst_ms;
+    LARGE_INTEGER t0, t1;
+    if (perf < 0)
+        perf = getenv("RECOMP_PERF") != NULL;
+    if (!perf) {
+        EnterCriticalSection(&g_guest_cpu);
+        return;
+    }
+    if (TryEnterCriticalSection(&g_guest_cpu))
+        return;
+    QueryPerformanceCounter(&t0);
+    EnterCriticalSection(&g_guest_cpu);
+    QueryPerformanceCounter(&t1);
+    if (!freq.QuadPart) {
+        QueryPerformanceFrequency(&freq);
+        t_report = t1;
+    }
+    {
+        double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+        waits++;
+        wait_ms += ms;
+        if (ms > worst_ms)
+            worst_ms = ms;
+    }
+    if (t1.QuadPart - t_report.QuadPart >= 5 * freq.QuadPart) {
+        fprintf(stderr, "[GUEST] 5 s: %u waits for the guest CPU, %.0f ms in all, longest %.1f ms\n",
+                waits, wait_ms, worst_ms);
+        waits = 0;
+        wait_ms = worst_ms = 0.0;
+        t_report = t1;
+    }
+}
+
 /* A guest thread lets go of the guest CPU for the length of every kernel
  * call. */
 static void kernel_thunk_dispatch(void)
@@ -9679,7 +9721,7 @@ static void kernel_thunk_dispatch(void)
      * a guest callback a bridge runs (an APC) returns into the bridge, not to
      * the thread's own code -- and only if the thread still exists as one. */
     if (t_guest_thread && t_dispatch_depth == 0 && guest_cpu_enabled()) {
-        EnterCriticalSection(&g_guest_cpu);
+        guest_cpu_take();
         t_guest_held = 1;
     }
     (void)held;
