@@ -1107,15 +1107,7 @@ static uint64_t hash_scalar(const uint8_t *p, size_t n)
     return h0 ^ (h1 * 31) ^ (h2 * 1009) ^ (h3 * 65599) ^ n;
 }
 
-#if defined(__x86_64__)
-/* The same job in SIMD lanes, XXH3's way: each 64-bit lane adds its data
- * and (data ^ key) low half times high half. The scalar loop waits on its
- * multiplies (~28 GB/s on a Zen 5); these do not (~45 with SSE2, ~88 with
- * AVX2). The keys move on with each block, so blocks that trade places
- * change the result too. Textures and surfaces hashed every epoch were a
- * fifth of the executor in the paused race. */
-#include <immintrin.h>
-
+#if defined(__x86_64__) || defined(__aarch64__)
 static uint64_t hash_fold(const uint64_t *lane, int nl, uint64_t tail, size_t n)
 {
     uint64_t h = 0x27D4EB2F165667C5ull ^ n;
@@ -1126,6 +1118,16 @@ static uint64_t hash_fold(const uint64_t *lane, int nl, uint64_t tail, size_t n)
     }
     return (h ^ tail) * 0xC2B2AE3D27D4EB4Full;
 }
+#endif
+
+#if defined(__x86_64__)
+/* The same job in SIMD lanes, XXH3's way: each 64-bit lane adds its data
+ * and (data ^ key) low half times high half. The scalar loop waits on its
+ * multiplies (~28 GB/s on a Zen 5); these do not (~45 with SSE2, ~88 with
+ * AVX2). The keys move on with each block, so blocks that trade places
+ * change the result too. Textures and surfaces hashed every epoch were a
+ * fifth of the executor in the paused race. */
+#include <immintrin.h>
 
 #define HASH_LANES(PRE, T, a, d, k) do { \
         T x_ = PRE##_xor_si##T##_(d, k); \
@@ -1198,6 +1200,53 @@ static uint64_t hash_avx2(const uint8_t *p, size_t n)
 #undef HASH_LANES
 #endif
 
+#if defined(__aarch64__)
+/* The same lanes in NEON (the Switch port's GL renderer has them too): the
+ * product of (data ^ key)'s 32-bit halves is one umull per lane pair. Guest
+ * RAM is a cache miss more often than not on a phone, so the long full
+ * checks ask for memory 512 bytes ahead. */
+#include <arm_neon.h>
+
+#define HASH_LANE(a, d, k) do { \
+        uint64x2_t x_ = veorq_u64(d, k); \
+        uint64x2_t p_ = vmull_u32(vmovn_u64(x_), vshrn_n_u64(x_, 32)); \
+        a = vaddq_u64(a, vaddq_u64(p_, vextq_u64(d, d, 1))); \
+    } while (0)
+
+static uint64_t hash_neon(const uint8_t *p, size_t n)
+{
+    static const uint64_t K[8] = {
+        0x78E5C0CC4EE679CBull, 0x1F67B3B7A4A44072ull, 0xCB00C391BB52283Cull, 0x4C263A81E69035E0ull,
+        0x3F349CE33F76FAA8ull, 0xD8ACDEA946EF1938ull, 0xC3EBD33483ACC5EAull, 0x647378D9C97E9FC8ull,
+    };
+    const uint64x2_t k0 = vld1q_u64(K), k1 = vld1q_u64(K + 2), k2 = vld1q_u64(K + 4);
+    const uint64x2_t k3 = vld1q_u64(K + 6), step = vdupq_n_u64(0x0000000100000001ull);
+    uint64x2_t a0 = k0, a1 = k1, a2 = k2, a3 = k3, ctr = vdupq_n_u64(0);
+    uint64_t lane[8];
+    size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        uint64x2_t d0, d1, d2, d3;
+        if (n >= 1024)
+            __builtin_prefetch(p + i + 512);
+        d0 = vreinterpretq_u64_u8(vld1q_u8(p + i));
+        d1 = vreinterpretq_u64_u8(vld1q_u8(p + i + 16));
+        d2 = vreinterpretq_u64_u8(vld1q_u8(p + i + 32));
+        d3 = vreinterpretq_u64_u8(vld1q_u8(p + i + 48));
+        HASH_LANE(a0, d0, vaddq_u64(k0, ctr));
+        HASH_LANE(a1, d1, vaddq_u64(k1, ctr));
+        HASH_LANE(a2, d2, vaddq_u64(k2, ctr));
+        HASH_LANE(a3, d3, vaddq_u64(k3, ctr));
+        ctr = vaddq_u64(ctr, step);
+    }
+    vst1q_u64(lane, a0);
+    vst1q_u64(lane + 2, a1);
+    vst1q_u64(lane + 4, a2);
+    vst1q_u64(lane + 6, a3);
+    return hash_fold(lane, 8, hash_scalar(p + i, n - i), n);
+}
+#undef HASH_LANE
+#endif
+
 /* RECOMP_VK_HASH_SIMD=0: the scalar loop for everything. */
 static uint64_t hash_bytes(const uint8_t *p, size_t n)
 {
@@ -1209,6 +1258,14 @@ static uint64_t hash_bytes(const uint8_t *p, size_t n)
     }
     if (n >= 256 && simd)
         return simd == 2 ? hash_avx2(p, n) : hash_sse2(p, n);
+#elif defined(__aarch64__)
+    static int simd = -1;
+    if (simd < 0) {
+        const char *e = getenv("RECOMP_VK_HASH_SIMD");
+        simd = !(e && strcmp(e, "0") == 0);
+    }
+    if (n >= 256 && simd)
+        return hash_neon(p, n);
 #endif
     return hash_scalar(p, n);
 }
@@ -1223,8 +1280,17 @@ static uint64_t hash_sparse(const uint8_t *p, size_t n)
 {
     uint64_t h = 0x9E3779B97F4A7C15ull ^ n;
     size_t off;
-    for (off = 0; off + 64 <= n; off += 1024)
+    /* Each block is a cache miss in guest RAM, and waited on in turn they
+     * were most of the Switch's texture checks: ask for the ones 8 ahead. */
+    for (off = 0; off + 64 <= n && off < 8 * 1024; off += 1024)
+        __builtin_prefetch(p + off), __builtin_prefetch(p + off + 63);
+    for (off = 0; off + 64 <= n; off += 1024) {
+        if (off + 8 * 1024 + 64 <= n) {
+            __builtin_prefetch(p + off + 8 * 1024);
+            __builtin_prefetch(p + off + 8 * 1024 + 63);
+        }
         h = h * 31 + hash_bytes(p + off, 64);
+    }
     return h * 31 + hash_bytes(p + n - 64, 64);
 }
 
