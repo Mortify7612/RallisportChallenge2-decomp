@@ -90,6 +90,16 @@ tar -cf - . | $A exec-in run-as io.github.rsc2recomp \
     sh -c 'mkdir -p files/game && tar -C files/game -xf -'
 ```
 
+On the tablet's Android 14 GSI that pipe stalled after a few hundred MB
+while adbd kept reading, buffering ~900 MB on the device until it ran
+short of memory. Pushing first and copying as the app works there:
+
+```sh
+$A push <your game folder> /data/local/tmp/rsc2game
+$A shell run-as io.github.rsc2recomp cp -r /data/local/tmp/rsc2game files/game
+$A shell rm -r /data/local/tmp/rsc2game
+```
+
 That is `/data/data/io.github.rsc2recomp/files/game`. The app uses it when
 `game/default.xbe` is there, and otherwise falls back to
 `/sdcard/Android/data/io.github.rsc2recomp/files`. Next to `game/`:

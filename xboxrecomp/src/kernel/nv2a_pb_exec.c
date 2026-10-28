@@ -4494,6 +4494,33 @@ static double flip_now_s(void)
 #endif
 }
 
+/* RECOMP_FPS_LOG=<n>: the frame rate over every n flips, with the flip
+ * numbers and the slowest frame among them. The [GPU] report's 10 s windows
+ * do not line up with a replay's race, which can pass in less. */
+static void fps_log_flip(uint32_t flips)
+{
+    static int every = -1;
+    static double t0, tprev, worst;
+    double t;
+    if (every < 0) {
+        const char *e = getenv("RECOMP_FPS_LOG");
+        every = e ? atoi(e) : 0;
+    }
+    if (every <= 0)
+        return;
+    t = flip_now_s();
+    if (tprev > 0.0 && t - tprev > worst)
+        worst = t - tprev;
+    tprev = t;
+    if (flips % (uint32_t)every)
+        return;
+    if (t0 > 0.0)
+        fprintf(stderr, "[FPS] flips %u-%u: %.1f fps, slowest %.1f ms%c",
+                flips - (uint32_t)every, flips, every / (t - t0), worst * 1000.0, 10);
+    t0 = t;
+    worst = 0.0;
+}
+
 /* The presentation interval of the flip being presented: D3D's Swap tells
  * its vblank handler with a notify (type 1, parameter = framebuffer | flags
  * | interval), and the handler flips only that many vblanks after the last
@@ -5002,6 +5029,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          ? (s_gpu.flip_write + 1) % s_gpu.flip_modulo
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
+        fps_log_flip(s_gpu.flips);
         frame_trace_flip();
         probe_flip();
         return;

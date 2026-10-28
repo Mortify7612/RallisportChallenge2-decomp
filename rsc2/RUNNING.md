@@ -73,6 +73,9 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
   corner. It shows the average, fastest and slowest frame time of the last
   second, and a graph of the last 160 frames against the frame-rate limit
   (the line). It's also in the launcher, and needs the Vulkan renderer.
+- `RECOMP_FPS_LOG=N`: log the frame rate over every N flips, with the
+  flip numbers and the slowest frame among them (`[FPS] flips 840-900:
+  73.9 fps, slowest 16.9 ms`). For timing part of a replay, such as its race.
 - `RECOMP_GAMMA=0`: ignore the game's gamma ramp. The console's video DAC
   maps every pixel through the ramp the game sets; RalliSport Challenge 2's
   race ramp lifts and warms the shadows and midtones. It's applied when

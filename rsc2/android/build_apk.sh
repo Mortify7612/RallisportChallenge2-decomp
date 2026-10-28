@@ -8,7 +8,8 @@
 # Environment: ANDROID_SDK (default ~/Android/Sdk), JAVA_HOME (a JDK 17+,
 # default ~/Android/jdk21), NDK_VERSION, BUILD_TOOLS, PLATFORM to override
 # the newest installed ones. RSC2_ANDROID_CFLAGS (default -gline-tables-only:
-# line numbers for simpleperf, stripped from the APK's copy).
+# line numbers for simpleperf, stripped from the APK's copy). RSC2_JOBS caps
+# ninja's parallel compiles (each lifted-code file takes a GB or two).
 set -e
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -40,7 +41,7 @@ cmake -S "$root/rsc2" -B "$OUT" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DXBOXRECOMP_GLSLANG_RL_LIB="$TP/lib/libglslang-default-resource-limits.a" \
     "-DXBOXRECOMP_GLSLANG_EXTRA_LIBS=$TP/lib/libSPIRV.a;$TP/lib/libMachineIndependent.a;$TP/lib/libOSDependent.a;$TP/lib/libGenericCodeGen.a;$TP/lib/libMachineIndependent.a;c++_static;c++abi" \
     > "$OUT.configure.log"
-ninja -C "$OUT"
+ninja -C "$OUT" ${RSC2_JOBS:+-j "$RSC2_JOBS"}
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE/lib/arm64-v8a" "$STAGE/classes" "$STAGE/dex"
