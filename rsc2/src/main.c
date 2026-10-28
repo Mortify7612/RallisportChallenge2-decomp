@@ -533,8 +533,11 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
      *                        the game builds the next frame while the
      *                        executor draws this one: the paused race
      *                        230 -> 255 fps uncapped (first found on the
-     *                        Switch port, where it was 28 -> 38). Not on
-     *                        by default until it has been raced live.
+     *                        Switch port, where it was 28 -> 38). On by
+     *                        default on Android, where the tablet's
+     *                        profile showed the game waiting at every kick
+     *                        for the executor; elsewhere not until it has
+     *                        been raced live.
      *   RECOMP_NV2A_IRQ_WAKE those notifies delivered at once rather than at
      *                        the timer thread's next 2 ms tick (with the
      *                        above). */
@@ -560,6 +563,12 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
              * run one guest thread at a time. Costs nothing measurable on
              * x86 (same race replay, no slower). */
             { "RECOMP_GUEST_LOCK",    "1" },
+#endif
+#if defined(__ANDROID__)
+            /* The game builds the next frame while the executor draws this
+             * one, as on the Switch (where it is also the default). */
+            { "RECOMP_NV2A_PFB_ASYNC", "1" },
+            { "RECOMP_NV2A_IRQ_WAKE", "1" },
 #endif
         };
         size_t k;
