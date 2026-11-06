@@ -2909,6 +2909,29 @@ static int vk_init(void)
                     }
                 }
             }
+            {
+                /* These dynamic states are core in Vulkan 1.3, so the renderer
+                 * uses them without asking for the extension -- and RADV
+                 * decides whether to set up its fragment-shader epilog cache
+                 * from the feature bits alone (radv_device.c: ps_epilogs is
+                 * created for the extendedDynamicState* bits, vs_prologs also
+                 * for vertexInputDynamicState). Dynamic rendering plus a
+                 * shader that writes gl_FragDepth needs an epilog, and with
+                 * ps_epilogs never created RADV calls a null ops->hash on the
+                 * first such draw: the SIGSEGV at race start on Mesa. Asking
+                 * for the promoted bit costs nothing and initialises it. */
+                static VkPhysicalDeviceExtendedDynamicStateFeaturesEXT fds = {
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT };
+                VkPhysicalDeviceFeatures2 q3 = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+                q3.pNext = &fds;
+                vkGetPhysicalDeviceFeatures2(V.pd, &q3);
+                if (fds.extendedDynamicState) {
+                    fds.pNext = f2.pNext;
+                    f2.pNext = &fds;
+                    fprintf(stderr, "  [VK] extended dynamic state on"
+                            " (RADV builds its fragment-shader epilog cache from this)\n");
+                }
+            }
             if (V.has_swapchain_ext) {
                 swext[nx++] = "VK_KHR_swapchain";
                 if (V.has_hdr_meta)

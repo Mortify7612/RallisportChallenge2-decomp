@@ -1,0 +1,30 @@
+# Build image for the AppImage (see build.sh next to this file).
+#
+# Ubuntu 22.04 has glibc 2.35, so what it builds starts on Ubuntu 22.04,
+# Linux Mint 21, Debian 12, a current SteamOS and anything newer -- not only
+# on the glibc the developer happens to run (2.43 on Arch/CachyOS).
+#
+# The compiler is GCC 15 from the Ubuntu toolchain PPA (its gcc-16 is a trunk
+# snapshot), not 22.04's GCC 11: the generated game code runs 15-25% slower
+# built with GCC 11.
+#
+# This mirrors rsc2/tools/linux_portable/Containerfile, the same recipe the
+# release tarball uses. The additions are the SDL2 build dependencies: the
+# AppImage builds SDL2 2.32.10 itself (see container_build.sh) so that the
+# AppImage does not inherit Ubuntu's libSDL2, which links libpulse,
+# libsystemd, libsndfile and a dozen more libraries that are not on every
+# system.
+FROM docker.io/library/ubuntu:22.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common gpg-agent \
+    && add-apt-repository -y ppa:ubuntu-toolchain-r/test \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        gcc-15 g++-15 make cmake ninja-build python3 pkg-config ca-certificates \
+        libepoxy-dev libvulkan1 \
+        libasound2-dev libpulse-dev libpipewire-0.3-dev \
+        libwayland-dev wayland-protocols libxkbcommon-dev libdecor-0-dev \
+        libx11-dev libxext-dev libxrandr-dev libxfixes-dev libxcursor-dev \
+        libxi-dev libxss-dev libxinerama-dev \
+    && rm -rf /var/lib/apt/lists/*
+ENV CC=gcc-15 CXX=g++-15
