@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=RalliSport Challenge 2
+GenericName=Rally racing game
+Comment=Native recompilation of the Xbox game RalliSport Challenge 2
+Exec=rsc2
+Icon=rsc2
+Terminal=false
+Categories=Game;
+Keywords=rally;racing;xbox;

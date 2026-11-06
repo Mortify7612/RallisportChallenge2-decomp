@@ -152,6 +152,80 @@ changes. Ubuntu 22.04 has no
 `glslc`, so the shaders are compiled by `glslangValidator` through
 `tools/linux_portable/glslc.py`.
 
+### AppImage (one file, no Wine)
+
+`rsc2/tools/linux_appimage/build.sh` packs the portable binary above, its
+SDL2, a desktop entry and an icon into one file:
+
+```sh
+rsc2/tools/linux_appimage/build.sh [jobs]
+```
+
+It writes `rsc2/tools/linux_appimage/dist/rsc2-<version>-x86_64.AppImage`
+(`VERSION=` sets the version, `OUT=` the output path). Needs docker or
+podman, and network the first time for glslang, the Vulkan headers, SDL2
+2.32.10 and appimagetool, cached in `rsc2/tools/linux_appimage/.cache`
+(gitignored). The game is built in `rsc2/build-appimage`; `rsc2/build` is
+not touched. See `rsc2/tools/linux_appimage/README.md` for the build side.
+
+What the AppImage contains, and what it expects from the system:
+
+- the game binary, built in an Ubuntu 22.04 container with GCC 15 -- it
+  needs **glibc 2.35 or newer** (Ubuntu 22.04, Mint 21, Debian 12, SteamOS
+  3, current Arch/Fedora). glslang, libstdc++ and libgcc are linked in;
+- SDL2 2.32.10, built so that its ALSA/PulseAudio/PipeWire and
+  Wayland/X11 backends are `dlopen`ed, bundled. (libepoxy is bundled only
+  if the toolkit's OpenGL fallback ends up linked in; this build does not
+  need it.)
+- **not** bundled: the Vulkan loader and the GPU driver. The system needs a
+  working Vulkan 1.3 setup, as for the tarball;
+- **no game data**. That is the player's copy.
+
+Running it: put the game files in a `game` folder next to the AppImage,
+then start the AppImage:
+
+```sh
+mkdir -p /games/rsc2
+cp -r RalliSport2/* /games/rsc2/game/       # default.xbe, Media, ...
+/games/rsc2/rsc2-v0.7.0-x86_64.AppImage
+```
+
+`AppRun` changes into the directory whose `game/default.xbe` it finds, in
+this order: the AppImage's own directory; the parent of a manually extracted
+AppDir; `$RSC2_GAME_DIR` (the folder holding `default.xbe`, or the folder
+holding `game/`); `$XDG_DATA_HOME/rsc2/game` (`~/.local/share/rsc2/game`).
+Settings, saves and the shader/Z: caches stay in `$XDG_CONFIG_HOME/rsc2` and
+`$XDG_DATA_HOME/xboxrecomp`, so the game folder may be read-only.
+
+Caveats:
+
+- An AppImage needs FUSE to mount itself. Without FUSE (or where mounts are
+  denied) start it as
+  `APPIMAGE_EXTRACT_AND_RUN=1 ./rsc2-v0.7.0-x86_64.AppImage`: the runtime
+  unpacks into `$TMPDIR` and runs from there.
+- The bundled SDL2 is always used, not the system one. If audio or a
+  controller misbehaves only in the AppImage, `SDL_AUDIODRIVER` /
+  `SDL_VIDEODRIVER` are the first things to try.
+- The first start compiles the title's shaders and caches them in
+  `~/.cache/xboxrecomp/vk`, as any build does.
+
+Headless check that the payload reaches the title screen (no window, and no
+launcher: `RECOMP_FB_WINDOW=0` skips it):
+
+```sh
+mkdir -p /tmp/rsc2-frames
+RECOMP_FB_WINDOW=0 RECOMP_AUDIO=0 RECOMP_VK_SCALE=1 RECOMP_HDR=0 \
+RECOMP_VK_MSAA=0 RECOMP_FULLSCREEN=0 \
+RECOMP_FB_DUMP_AT=/tmp/rsc2-frames:8400 \
+    /games/rsc2/rsc2-v0.7.0-x86_64.AppImage
+ls /tmp/rsc2-frames        # frame008400.bmp -- the title screen
+```
+
+Frame 8400 is about two and a half minutes in (the flips run at the
+console's 60 Hz): the intro films and the "PRESS START TO BEGIN" title. Frame
+dumps later than that show the title or its attract loop. `RECOMP_VK_DEVICE=N`
+picks the Vulkan device; the log lists them at start.
+
 ## Windows (cross-built on Linux, tested under Wine only)
 
 The MinGW sysroot is missing four things the Windows build needs. They live in

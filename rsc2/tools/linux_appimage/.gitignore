@@ -1,0 +1,3 @@
+# The AppImage build's downloads, build trees and output. Not in git.
+.cache/
+dist/

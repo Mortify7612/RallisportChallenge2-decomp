@@ -1,0 +1,78 @@
+#!/bin/sh
+# AppRun for the RalliSport Challenge 2 AppImage.
+#
+# The game opens its data at the hardcoded relative path "game/default.xbe"
+# (rsc2/src/main.c), so the program has to run from the directory that holds
+# a "game" folder. This finds one, in this order:
+#
+#   1. next to the AppImage file itself        (<dir>/game/default.xbe)
+#   2. next to a manually extracted AppDir     (<dir>/game/default.xbe)
+#   3. $RSC2_GAME_DIR, if set -- either the folder that holds default.xbe,
+#      or the folder that holds that folder as "game"
+#   4. $XDG_DATA_HOME/rsc2/game                (~/.local/share/rsc2/game)
+#
+# Settings, saves and caches already go to the XDG directories, so the game
+# folder itself may be read-only.
+set -eu
+
+appdir=${APPDIR:-$(dirname "$(readlink -f "$0")")}
+bin=$appdir/usr/bin/rsc2
+libdir=$appdir/usr/lib
+
+if [ ! -x "$bin" ]; then
+    echo "rsc2 AppRun: $bin is missing; the AppImage is damaged." >&2
+    exit 1
+fi
+
+# The AppImage runtime sets APPIMAGE to the file being run. Without it (a
+# manually extracted squashfs-root) look next to the AppDir instead.
+if [ -n "${APPIMAGE:-}" ]; then
+    imgdir=$(dirname "$(readlink -f -- "$APPIMAGE")")
+else
+    imgdir=$(dirname "$appdir")
+fi
+
+datahome=${XDG_DATA_HOME:-}
+if [ -z "$datahome" ]; then
+    if [ -n "${HOME:-}" ]; then datahome=$HOME/.local/share; else datahome=/nonexistent; fi
+fi
+
+# When $RSC2_GAME_DIR points straight at the data folder, the binary still
+# wants CWD/game: make a temporary directory with a "game" symlink.
+tmpgame=
+cleanup() { [ -n "$tmpgame" ] && rm -rf "$tmpgame"; }
+trap cleanup EXIT HUP INT TERM
+
+if [ -f "$imgdir/game/default.xbe" ]; then
+    cd "$imgdir"
+elif [ -n "${RSC2_GAME_DIR:-}" ] && [ -f "$RSC2_GAME_DIR/game/default.xbe" ]; then
+    cd "$RSC2_GAME_DIR"
+elif [ -n "${RSC2_GAME_DIR:-}" ] && [ -f "$RSC2_GAME_DIR/default.xbe" ]; then
+    tmpgame=$(mktemp -d "${TMPDIR:-/tmp}/rsc2-appimage.XXXXXX")
+    ln -s "$(readlink -f -- "$RSC2_GAME_DIR")" "$tmpgame/game"
+    cd "$tmpgame"
+elif [ -f "$datahome/rsc2/game/default.xbe" ]; then
+    cd "$datahome/rsc2"
+else
+    cat >&2 <<EOF
+RalliSport Challenge 2 needs the game files, which are not part of this
+AppImage (default.xbe, Media/, ...). Put your copy in one of:
+
+  $imgdir/game/
+  $datahome/rsc2/game/
+
+or set RSC2_GAME_DIR to the folder that holds default.xbe, e.g.
+
+  RSC2_GAME_DIR=/games/RalliSport2 <the AppImage>
+EOF
+    exit 1
+fi
+
+export LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
+if [ -n "$tmpgame" ]; then
+    # Cannot exec: the temporary directory must be removed afterwards.
+    "$bin" "$@"
+    exit $?
+fi
+exec "$bin" "$@"
