@@ -269,6 +269,14 @@ Defaults are baked into `src/main.c`; `NAME=0` turns one off.
   - `RECOMP_APU_I3DL2_TRACE=1` prints each listener the game sets.
   - `RECOMP_APU_REVERB_STATS=1` prints the dry, send and wet levels once a
     second.
+- `RSC2_FOV=<degrees>`: the vertical field of view of the race views (the
+  launcher's Field of view row, 60-90). The game's is 70; `0` keeps it, and
+  other values are held to 40-120. Each camera's
+  angle is widened only while its projection, culling frustum and derived
+  terms are built (0x002B26F0, 0x002B28E0, 0x002B2550), so the picture and
+  the culling agree and the game's own logic never sees it. Square cameras
+  (the shadow and cube-map views) keep their angle. `RSC2_FOV_TRACE=1`
+  lists the cameras (`rsc2/tools/fov_check.sh`).
 - `RECOMP_FB_WINDOW=0`: headless. `RECOMP_FB_DUMP=prefix` plus
   `RECOMP_FB_WINDOW_DUMP_EVERY=N` writes BMP frames.
 - `RECOMP_PAD_SCRIPT=@file`: scripted input (`ms:button:holdms,...`; buttons
