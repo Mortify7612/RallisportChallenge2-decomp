@@ -38,7 +38,7 @@ int nv2a_vk_device_names(char (*names)[256], int max);
 #define MAXV 12
 
 enum {
-    O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS, O_FPSCOUNT, O_HDR, O_HDRPAPER,
+    O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_FOV, O_DISPLAY, O_FPS, O_FPSCOUNT, O_HDR, O_HDRPAPER,
     O_SHOW,
     O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_KEYBOARD, O_KEYS, O_STEER, O_RUMBLE,
     O_COUNT
@@ -151,6 +151,19 @@ static void opts_init(int list_gpus)
                 "widescreen TV: a wider view, with the HUD moved out to the edges.");
     opt_add(o, "4:3  (original)", "0");
     opt_add(o, "16:9  widescreen", "1");
+
+    o = opt_def(O_FOV, "fov", "RSC2_FOV", NULL, 0, "Field of view",
+                "How much of the world the camera takes in, top to bottom. The game's "
+                "70\xC2\xB0 is the original; wider shows more around the car and makes "
+                "speed feel faster.");
+    opt_add(o, "60\xC2\xB0", "60");
+    opt_add(o, "65\xC2\xB0", "65");
+    opt_add(o, "70\xC2\xB0  (original)", "70");
+    opt_add(o, "75\xC2\xB0", "75");
+    opt_add(o, "80\xC2\xB0", "80");
+    opt_add(o, "85\xC2\xB0", "85");
+    opt_add(o, "90\xC2\xB0", "90");
+    o->def = 2;
 
     o = opt_def(O_DISPLAY, "display", "RECOMP_FULLSCREEN", NULL, 0, "Display mode",
                 "Fullscreen uses your desktop resolution. F11 or Alt+Enter switches "
@@ -455,16 +468,16 @@ static int launcher_window(void) { return 1; }
 
 /* Layout in logical units; the renderer's pixels per unit is s_px. */
 #define WIN_W 1000
-#define WIN_H 816
+#define WIN_H 860
 #define ROW_H 42
 #define SEC_H 34
 #define COL_W 444
 #define COL0_X 40
 #define COL1_X 516
 #define TOP_Y 128
-#define HELP_Y 644                      /* the focused row's help text */
-#define FOOT_Y 702                      /* key hints; a rule below them */
-#define BTN_Y 752
+#define HELP_Y 688                      /* the focused row's help text */
+#define FOOT_Y 746                      /* key hints; a rule below them */
+#define BTN_Y 796
 
 enum { B_DEFAULTS = O_COUNT, B_STEAM, B_QUIT, B_START, FOCUS_COUNT };
 
