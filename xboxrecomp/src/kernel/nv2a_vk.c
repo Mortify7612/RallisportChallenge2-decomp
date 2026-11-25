@@ -176,7 +176,7 @@ static const uint32_t s_frag_fast_spv[] =
 #define VK_MAX_ZETA    8
 #define VK_MAX_PIPES   4096          /* power of two: hashed */
 #define VK_MAX_PROGS   1024          /* power of two */
-#define VK_PROG_VERSION 10           /* translated-program cache files */
+#define VK_PROG_VERSION 20           /* translated-program cache files */
 #define VK_MAX_SAMPLERS 512
 #define VK_TEX_SLOTS   8192          /* power of two */
 #define VK_MAX_RETIRED 4096
@@ -6461,7 +6461,19 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         k = force > 0.0f ? force : (16.0f / 9.0f) / view_aspect();
         ub->wide[0] = c && !c->swz && c->bpp == 4 && c->w == 640 && V.cur_zs && c->rows <= 480
                     ? k : 1.0f;
-        ub->wide[1] = ub->wide[2] = ub->wide[3] = 0.0f;
+        /* RECOMP_WIDE_UI (default on): squeeze only perspective geometry and
+         * let flat UI draws stretch across a screen wider than 16:9, instead
+         * of squeezing the HUD and menus toward the centre. =0 restores the
+         * earlier edge-tested squeeze for flats. */
+        {
+            static int ui = -1;
+            if (ui < 0) {
+                const char *e = getenv("RECOMP_WIDE_UI");
+                ui = !(e && strcmp(e, "0") == 0);
+            }
+            ub->wide[1] = (float)ui;
+        }
+        ub->wide[2] = ub->wide[3] = 0.0f;
     }
     memcpy(ubm, ub, sizeof *ub);
 
@@ -6892,15 +6904,22 @@ static const char k_prog_main[] =
 static const char k_prog_tail[] =
     "    float w = R[12].w;\n"
     "    vec2 ndc = R[12].xy * u.vp.xy - 1.0;\n"
-    /* A screen wider than the title's: everything drawn into the scene is
-     * squeezed towards the centre, so the 3D view is widened rather than
-     * stretched and the HUD keeps its proportions -- except flat (w = 1)
-     * vertices on the screen's edges, which keep full-screen passes
-     * (colour grading, fades) covering the whole screen. "On the edge" is
-     * within a title pixel of it: D3D's half-pixel offset puts a full-screen
-     * quad at -0.5 .. 639.5, just outside on the left and just inside on the
-     * right, which a tighter test pinned on one side only. */
-    "    if (abs(w - 1.0) > 1e-5 || abs(ndc.x) < 1.0 - u.vp.x * 1.01) ndc.x *= u.wide.x;\n"
+    /* A screen wider than the title's. Two behaviours, RECOMP_WIDE_UI picks:
+     * the earlier one (RECOMP_WIDE_UI=0) squeezes everything drawn into
+     * the scene toward the centre -- 3D widened rather than stretched, HUD
+     * keeping its proportions but floating mid-screen -- except flat (w = 1)
+     * vertices on the screen's edges, which keep full-screen passes (colour
+     * grading, fades) covering the whole screen. "On the edge" is within a
+     * title pixel of it: D3D's half-pixel offset puts a full-screen quad at
+     * -0.5 .. 639.5, just outside on the left and just inside on the right,
+     * which a tighter test pinned on one side only.
+     * The default (u.wide.y, RECOMP_WIDE_UI=1) squeezes only
+     * perspective geometry (w != 1): the 3D view is still widened, while
+     * flat UI draws stretch to fill the wide screen, so menus and the
+     * on-screen keyboard read normally on a 21:9 monitor instead of
+     * shrinking into a 16:9 band with empty flanks. Full-screen flat passes
+     * are w = 1 too, so they still cover the whole screen either way. */
+    "    if (u.wide.y > 0.5 ? (abs(w - 1.0) > 1e-5) : (abs(w - 1.0) > 1e-5 || abs(ndc.x) < 1.0 - u.vp.x * 1.01)) ndc.x *= u.wide.x;\n"
     "    gl_Position = vec4(ndc * w, u.vp.w == 2.0 ? WREV_C : R[12].z * u.vp.z * w, w);\n"
     "    v_zs = R[12].z * u.vp.z;\n"
     /* oD0/oD1 are clamped to [0,1] by the hardware before interpolation
