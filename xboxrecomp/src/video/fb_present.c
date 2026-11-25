@@ -246,6 +246,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
             nv2a_vk_overlay_toggle();
             return 0;
         }
+        if (w == VK_F4 && m == WM_KEYDOWN && !(l & 0x40000000)) {
+            /* Show or hide the HUD (not Alt+F4: that is WM_SYSKEYDOWN). */
+            extern volatile int g_recomp_hud_toggles;
+            g_recomp_hud_toggles++;
+            return 0;
+        }
         /* Alt+Enter, as in most Windows games: fullscreen, and not an Enter
          * for the title (bit 29: Alt held; it arrives as WM_SYSKEYDOWN). */
         if (w == VK_RETURN && (l & 0x20000000)) {
@@ -834,6 +840,12 @@ static void fb_events(SDL_Window *win, int *resized)
                 /* The FPS counter (RECOMP_FPS_OVERLAY). */
                 extern void nv2a_vk_overlay_toggle(void);
                 nv2a_vk_overlay_toggle();
+            }
+            if (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_F4
+                    && !ev.key.repeat && !(ev.key.keysym.mod & KMOD_ALT)) {
+                /* Show or hide the game's HUD, where the game supports it. */
+                extern volatile int g_recomp_hud_toggles;
+                g_recomp_hud_toggles++;
             }
             /* F11 or Alt+Enter: fullscreen. Alt+Enter is not also an Enter
              * for the title, where Enter is START. */
