@@ -6,8 +6,8 @@
 # German, Italian, Japanese and Spanish text, fonts and speech were
 # unreachable).
 #
-# Three headless replays to the loading-tip screen (frame 776 of ss1b.xi,
-# a Time Attack run started from boot): the default, RECOMP_LANGUAGE=english
+# Three headless replays to the loading-tip screen (frame 776 of the
+# recording it was written against, a Time Attack run started from boot): the default, RECOMP_LANGUAGE=english
 # and RECOMP_LANGUAGE=german. The button-hint bar at the bottom ("Select /
 # Quit / Previous tip / Next tip") must differ between the default and
 # German -- in German it reads "Wählen / Beenden / ..." -- and English set
@@ -15,8 +15,8 @@
 # picked at random, so it is left out.
 # A build that ignores the variable fails: every run shows English.
 # For a recording that reaches that screen at another frame, change frame=
-# below. Saved launcher settings apply to these runs too; point
-# XDG_CONFIG_HOME at an empty directory to run without them.
+# below. The runs use an empty settings folder, so a saved launcher
+# Language does not leak in; the default run then leaves the variable empty.
 # Needs ImageMagick (6 or 7). Exit 0 = pass. LANGUAGE_KEEP=1 keeps the frames.
 set -u
 rec=$(realpath "${1:?usage: language_check.sh <recording.xi> [build dir]}")
@@ -26,12 +26,14 @@ frame=776
 out=$(mktemp -d)
 [ -n "${LANGUAGE_KEEP:-}" ] && echo "output kept in $out" || trap 'rm -rf "$out"' EXIT
 
+pids=()
 run() {  # run <name> [VAR=value...]
     local name=$1; shift
-    mkdir -p "$out/$name"
-    (cd "$build" && exec env "$@" RSC2_INPUT_REPLAY="$rec" RECOMP_FB_WINDOW=0 RECOMP_AUDIO=0 \
+    mkdir -p "$out/$name" "$out/config"
+    (cd "$build" && exec env "$@" XDG_CONFIG_HOME="$out/config" RSC2_INPUT_REPLAY="$rec" RECOMP_FB_WINDOW=0 RECOMP_AUDIO=0 \
         RECOMP_FB_DUMP_AT="$out/$name:$frame" timeout 600 ./rsc2 --no-launcher \
         > "$out/$name.log" 2>&1) &
+    pids+=($!)  # timeout (exec'd), which passes a TERM on to the game
 }
 run default
 run english RECOMP_LANGUAGE=english
@@ -42,7 +44,7 @@ for _ in $(seq 600); do
     sleep 1
 done
 sleep 2
-pkill -x rsc2
+kill "${pids[@]}" 2>/dev/null   # only the games this script started
 wait 2>/dev/null
 for n in default english german; do
     [ -s "$out/$n/$f" ] || { echo "FAIL: the $n run did not reach frame $frame"; exit 2; }
