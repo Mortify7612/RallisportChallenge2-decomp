@@ -725,6 +725,32 @@ void sub_0037E590(void)
             float a = nv2a_vk_view_aspect();
             if (a > 16.0f / 9.0f)
                 MEMF(0x3DFE94) = a;
+            {
+                /* Native wide (default; RSC2_WIDE_NATIVE=0 turns it off):
+                 * the game projects at the screen's own aspect -- 0x3B8DA0,
+                 * the 16:9 its camera setup (sub_002A9B10) uses in
+                 * widescreen mode -- and the renderer does not squeeze
+                 * (main.c sets RECOMP_VK_WIDE_X=1). Every screen-space
+                 * effect and visibility test the game works out then agrees
+                 * with what is drawn: the pre-race flyover stopped culling
+                 * scenery at the old 16:9 border, which the squeeze plus
+                 * the 0x3DFE94 frustum alone did not fix. Written every
+                 * frame, and never below the shipped 16:9: a window made
+                 * wider and then narrow again goes back to it. */
+                static int native = -1;
+                static float ship;
+                if (native < 0) {
+                    const char *e = getenv("RSC2_WIDE_NATIVE");
+                    native = !(e && strcmp(e, "0") == 0);
+                    ship = MEMF(0x3B8DA0);
+                }
+                if (native) {
+                    static int told;
+                    if (a > ship && !told++)
+                        fprintf(stderr, "[WIDE] native: the game projects at %.4f\n", (double)a);
+                    MEMF(0x3B8DA0) = a > ship ? a : ship;
+                }
+            }
         }
     }
     if (!mode || !pstate)

@@ -18,6 +18,10 @@
 # against 182-197 x 268-300. Measured: broken 0.82, fixed 0.99. For
 # another recording pick the frame and override GHOST_BOX / REF_BOX
 # ("x0 y0 x1 y1", title px).
+#
+# The ghosts came from the renderer's squeeze. By default the game projects
+# wide itself and nothing is squeezed, so run it with RSC2_WIDE_NATIVE=0 as
+# well to test the squeeze path.
 # Needs ImageMagick. Exit 0 = pass.
 set -u
 rec=$(realpath "${1:?usage: wide_shadow_check.sh <recording.xi> [frame] [build dir]}")
