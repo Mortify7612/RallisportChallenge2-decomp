@@ -176,7 +176,7 @@ static const uint32_t s_frag_fast_spv[] =
 #define VK_MAX_ZETA    8
 #define VK_MAX_PIPES   4096          /* power of two: hashed */
 #define VK_MAX_PROGS   1024          /* power of two */
-#define VK_PROG_VERSION 20           /* translated-program cache files */
+#define VK_PROG_VERSION 21           /* translated-program cache files */
 #define VK_MAX_SAMPLERS 512
 #define VK_TEX_SLOTS   8192          /* power of two */
 #define VK_MAX_RETIRED 4096
@@ -6474,6 +6474,33 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
             ub->wide[1] = (float)ui;
         }
         ub->wide[2] = ub->wide[3] = 0.0f;
+        {
+            /* Stages bound to one of the title's own 640x480 screen
+             * surfaces, sampled 1:1 against screen coordinates: their
+             * lookup must follow the geometry squeeze (k_prog_tail uses
+             * these bits), or screen pixels read content written for
+             * another position -- the SS1 pipeline-shadow ghosts. Match
+             * the texture's size, not the surface's: RSC2's shadow buffer
+             * 83E78000 is a 640x480 texture on a 640x1024 surface (rows
+             * 480). Read by the ground programs 29BF6A25 and CED240D4 on
+             * t3, written by 54B796C1. */
+            uint32_t bits = 0, st2;
+            for (st2 = 0; st2 < 4; st2++) {
+                int k2;
+                if (!st->tex[st2].valid || !st->tex[st2].offset
+                        || st->tex[st2].width != 640 || st->tex[st2].height != 480)
+                    continue;
+                for (k2 = 0; k2 < V.nsurf; k2++) {
+                    const Surf *q = &V.surf[k2];
+                    if (q->va == st->tex[st2].offset && !q->swz
+                            && q->w == 640 && q->rows <= 480 && q->bpp == 4) {
+                        bits |= 1u << st2;
+                        break;
+                    }
+                }
+            }
+            ub->wide[2] = (float)bits;
+        }
     }
     memcpy(ubm, ub, sizeof *ub);
 
@@ -6928,6 +6955,24 @@ static const char k_prog_tail[] =
     "    v_d0 = clamp(O[3], 0.0, 1.0); v_d1 = clamp(O[4], 0.0, 1.0);\n"
     "    v_fog = fog_factor(O[5].x);\n"
     "    v_t0 = O[9]; v_t1 = O[10]; v_t2 = O[11]; v_t3 = O[12];\n"
+    /* A stage whose texture is one of the title's own 640x480 screen
+     * surfaces (u.wide.z bit per stage, set by the draw setup) is sampled
+     * 1:1 against screen coordinates -- and the geometry squeeze above has
+     * already moved where that surface's content sits. Look it up at the
+     * squeezed coordinate, or the content lands where it would if squeezed
+     * twice: RSC2's SS1 caster silhouettes showed as dark ghosts
+     * (x-320)(k-1) title px toward the centre of their casters. The
+     * coordinates are projective (oT = screen * w, q = w) and, for a
+     * linear texture, in texels (ts = 1/width), so the centre is
+     * (0.5 / ts) * q, not 0.5; the map is linear in (s, q), so it is exact
+     * per vertex. */
+    "    if (u.wide.x < 0.999 && u.wide.z > 0.0) {\n"
+    "        int wb = int(u.wide.z + 0.5);\n"
+    "        if ((wb & 1) != 0) v_t0.x = v_t0.x * u.wide.x + (1.0 - u.wide.x) * (0.5 / u.ts[0].x) * (v_t0.w != 0.0 ? v_t0.w : 1.0);\n"
+    "        if ((wb & 2) != 0) v_t1.x = v_t1.x * u.wide.x + (1.0 - u.wide.x) * (0.5 / u.ts[1].x) * (v_t1.w != 0.0 ? v_t1.w : 1.0);\n"
+    "        if ((wb & 4) != 0) v_t2.x = v_t2.x * u.wide.x + (1.0 - u.wide.x) * (0.5 / u.ts[2].x) * (v_t2.w != 0.0 ? v_t2.w : 1.0);\n"
+    "        if ((wb & 8) != 0) v_t3.x = v_t3.x * u.wide.x + (1.0 - u.wide.x) * (0.5 / u.ts[3].x) * (v_t3.w != 0.0 ? v_t3.w : 1.0);\n"
+    "    }\n"
     /* Points: the program's oPts when point parameters are on, else
      * SET_POINT_SIZE -- either at the render scale. */
     "    gl_PointSize = max(u.pts.w != 0.0 ? O[6].x * u.pts.y : u.pts.x, 1.0);\n"

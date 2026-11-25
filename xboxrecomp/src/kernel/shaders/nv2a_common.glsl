@@ -21,7 +21,9 @@ layout(set = 0, binding = 0, std140) uniform Nv2aDraw {
     vec4  wide;      /* x: horizontal squeeze of perspective scene draws
                         (screens wider than the title's), 1 = off
                         y: RECOMP_WIDE_UI: 1 squeezes only w != 1 geometry
-                        and lets flat UI stretch; 0 = edge-tested squeeze   */
+                        and lets flat UI stretch; 0 = edge-tested squeeze
+                        z: bits 0-3: stage samples a 640x480 title screen
+                        surface and needs the same squeeze on its UVs   */
 } u;
 
 /* Reversed w-buffer (vp.w == 2): depth = WREV_C / w. With gl_Position.z set to
