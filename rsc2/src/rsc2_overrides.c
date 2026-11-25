@@ -1091,3 +1091,46 @@ void sub_002C17B0(void)
     if (!signed_strict() && (g_eax & 0xFFu) == 0 && hashed)
         signed_accept(obj);
 }
+
+/* ── The race HUD (0x002673A0, 2 args, ret 8) ─────────────────────
+ *
+ * RSC2_HUD=0 (the launcher's HUD row) hides the race HUD; F4 in the window
+ * shows or hides it while playing (g_recomp_hud_toggles, fb_present.c).
+ *
+ * 0x002673A0 draws the in-race overlay each frame (timers, speedometer,
+ * map, positions), called from 0x0027F8F0 for every view. It may keep race
+ * state as well (it calls a few dozen functions), so it always runs and
+ * only what it draws is dropped. Its pictures and text are sprites queued
+ * in the batch at 0x481188, which 0x00118FF0 draws (MEM32(batch+0x100)
+ * of them) and then empties. Inside the HUD, hidden, the batch is emptied
+ * before each draw instead. The game's own Options > HUD can turn every
+ * piece off but Time Attack's RACE TIME box; this takes that too. The
+ * pause menu is drawn elsewhere and stays. */
+extern void sub_002673A0_gen(void);
+extern void sub_00118FF0_gen(void);
+extern volatile int g_recomp_hud_toggles;
+static int s_in_hud;
+
+static int hud_hidden(void)
+{
+    static int hide = -1;
+    if (hide < 0) {
+        const char *e = getenv("RSC2_HUD");
+        hide = e && strcmp(e, "0") == 0;
+    }
+    return hide ^ (g_recomp_hud_toggles & 1);
+}
+
+void sub_002673A0(void)
+{
+    s_in_hud++;
+    sub_002673A0_gen();
+    s_in_hud--;
+}
+
+void sub_00118FF0(void)
+{
+    if (s_in_hud && hud_hidden())
+        MEM32(g_esi + 0x100) = 0;
+    sub_00118FF0_gen();
+}

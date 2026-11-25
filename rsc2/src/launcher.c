@@ -40,7 +40,7 @@ int nv2a_vk_device_names(char (*names)[256], int max);
 enum {
     O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS, O_FPSCOUNT, O_HDR, O_HDRPAPER,
     O_SHOW,
-    O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_KEYBOARD, O_KEYS, O_STEER, O_RUMBLE,
+    O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_HUD, O_KEYBOARD, O_KEYS, O_STEER, O_RUMBLE,
     O_COUNT
 };
 
@@ -236,6 +236,13 @@ static void opts_init(int list_gpus)
     opt_add(o, "Normal", "0.3");
     opt_add(o, "Strong", "0.5");
     o->def = 2;
+
+    o = opt_def(O_HUD, "hud", "RSC2_HUD", "GAME", 1, "Race HUD",
+                "The timers, speedometer and map over a race. Hidden takes all of it "
+                "away, even Time Attack's race time, which the game's own Options > HUD "
+                "keeps. F4 shows or hides it while you play.");
+    opt_add(o, "Shown  (original)", "1");
+    opt_add(o, "Hidden", "0");
 
     o = opt_def(O_KEYBOARD, "keyboard", "RECOMP_KEYBOARD", "CONTROLS", 1, "Keyboard",
                 "Play with the keyboard as controller 1, alongside any real "
@@ -455,16 +462,16 @@ static int launcher_window(void) { return 1; }
 
 /* Layout in logical units; the renderer's pixels per unit is s_px. */
 #define WIN_W 1000
-#define WIN_H 816
+#define WIN_H 884
 #define ROW_H 42
 #define SEC_H 34
 #define COL_W 444
 #define COL0_X 40
 #define COL1_X 516
 #define TOP_Y 128
-#define HELP_Y 644                      /* the focused row's help text */
-#define FOOT_Y 702                      /* key hints; a rule below them */
-#define BTN_Y 752
+#define HELP_Y 712                      /* the focused row's help text */
+#define FOOT_Y 770                      /* key hints; a rule below them */
+#define BTN_Y 820
 
 enum { B_DEFAULTS = O_COUNT, B_STEAM, B_QUIT, B_START, FOCUS_COUNT };
 

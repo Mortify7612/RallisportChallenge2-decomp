@@ -428,6 +428,9 @@ static void snapb_exit(uint32_t va)
  * kind 9: a mark (F9 in the window; extra = the mark count).
  * Needs trace hooks on 0x0010F0D0, 0x00273360 and 0x00273890. */
 volatile int g_recomp_user_mark;
+/* F4 in the window: how many times the player asked to show or hide the
+ * game's HUD. A game that can hide it reads this (rsc2: RSC2_HUD). */
+volatile int g_recomp_hud_toggles;
 static FILE *s_tt;
 static int s_tt_on = -1;
 static uint32_t s_tt_out, s_tt_cnt, s_tt_a3, s_tt_a4, s_tt_obj;

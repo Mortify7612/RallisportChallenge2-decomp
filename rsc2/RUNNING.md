@@ -269,6 +269,12 @@ Defaults are baked into `src/main.c`; `NAME=0` turns one off.
   - `RECOMP_APU_I3DL2_TRACE=1` prints each listener the game sets.
   - `RECOMP_APU_REVERB_STATS=1` prints the dry, send and wet levels once a
     second.
+- `RSC2_HUD=0`, or F4 in the window: no race HUD (the launcher's Race HUD
+  row). The game's own Options > HUD can turn every piece off but Time
+  Attack's RACE TIME box; this takes all of it. The HUD's code
+  (0x002673A0) still runs, in case it keeps race state; the sprites it queues
+  are dropped before they're drawn. The pause menu stays
+  (`rsc2/tools/hud_check.sh`).
 - `RECOMP_FB_WINDOW=0`: headless. `RECOMP_FB_DUMP=prefix` plus
   `RECOMP_FB_WINDOW_DUMP_EVERY=N` writes BMP frames.
 - `RECOMP_PAD_SCRIPT=@file`: scripted input (`ms:button:holdms,...`; buttons
