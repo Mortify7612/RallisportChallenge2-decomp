@@ -275,6 +275,7 @@ void sub_0030FD2A(void)
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -1091,3 +1092,89 @@ void sub_002C17B0(void)
     if (!signed_strict() && (g_eax & 0xFFu) == 0 && hashed)
         signed_accept(obj);
 }
+
+/* ── Field of view (RSC2_FOV) ─────────────────────────────────────
+ *
+ * A camera (0x428 bytes; 0x002A9B10 sets them up): +0 type (1 is
+ * orthographic), +4 vertical field of view (radians; 70 degrees for the
+ * race views), +0xC a second angle (the same), +0x10/+0x14 near/far,
+ * +0x18 aspect, +0x1C zoom, +0x138 the projection matrix. Three functions
+ * work from those angles: 0x002B26F0 builds the matrix (camera in ebx),
+ * 0x002B28E0 the culling frustum and 0x002B2550 the derived terms (camera in
+ * eax). RSC2_FOV=<degrees> is the vertical view the game's 70 shows as:
+ * each perspective camera's tan(angle/2) is scaled by tan(FOV/2)/tan(35)
+ * for the length of those calls, then put back, so the game's own logic
+ * never sees it, and the picture and the culling agree. Square cameras
+ * (aspect 1: the shadow and cube-map views) are left alone.
+ * RSC2_FOV_TRACE prints each camera the first time it is built. */
+extern void sub_002B26F0_gen(void);
+extern void sub_002B28E0_gen(void);
+extern void sub_002B2550_gen(void);
+
+static double fov_scale(void)
+{
+    static double k = -1.0;
+    if (k < 0.0) {
+        const char *e = getenv("RSC2_FOV");
+        double deg = e && *e ? atof(e) : 70.0;
+        if (deg <= 0.0)                 /* 0 or not a number: the game's own */
+            deg = 70.0;
+        if (deg < 40.0) deg = 40.0;
+        if (deg > 120.0) deg = 120.0;
+        k = tan(deg * 0.5 * 3.14159265358979 / 180.0) / tan(35.0 * 3.14159265358979 / 180.0);
+        if (deg != 70.0)
+            fprintf(stderr, "[FOV] the race view's 70 degrees drawn as %.1f (x%.3f)\n", deg, k);
+    }
+    return k;
+}
+
+static void fov_trace(uint32_t cam, const char *who)
+{
+    static uint32_t seen[64];
+    static int nseen, on = -1;
+    int i;
+    if (on < 0) {
+        const char *t = getenv("RSC2_FOV_TRACE");
+        on = t && *t && strcmp(t, "0") != 0;
+    }
+    if (!on)
+        return;
+    for (i = 0; i < nseen; i++)
+        if (seen[i] == cam)
+            return;
+    if (nseen < 64)
+        seen[nseen++] = cam;
+    fprintf(stderr, "[FOV] %s camera %08X type %u fov %.2f/%.2f deg zoom %.3f aspect %.3f (from %08X)\n",
+            who, cam, MEM32(cam), MEMF(cam + 4) * 57.29578, MEMF(cam + 0xC) * 57.29578,
+            MEMF(cam + 0x1C), MEMF(cam + 0x18), MEM32(g_esp));
+}
+
+static float fov_widen(float a, double k)
+{
+    return (float)(2.0 * atan(tan(a * 0.5) * k));
+}
+
+/* Run `gen` with camera `cam`'s angles widened. */
+static void fov_call(uint32_t cam, void (*gen)(void), const char *who)
+{
+    double k = fov_scale();
+    float a4, ac;
+    fov_trace(cam, who);
+    /* Orthographic cameras, and square ones: the shadow and cube-map
+     * views (90 degrees, aspect 1) must keep their exact angle. */
+    if (k == 1.0 || MEM32(cam) == 1 || fabsf(MEMF(cam + 0x18) - 1.0f) < 0.05f) {
+        gen();
+        return;
+    }
+    a4 = MEMF(cam + 4);
+    ac = MEMF(cam + 0xC);
+    MEMF(cam + 4) = fov_widen(a4, k);
+    MEMF(cam + 0xC) = fov_widen(ac, k);
+    gen();
+    MEMF(cam + 4) = a4;
+    MEMF(cam + 0xC) = ac;
+}
+
+void sub_002B26F0(void) { fov_call(g_ebx, sub_002B26F0_gen, "matrix"); }
+void sub_002B28E0(void) { fov_call(g_eax, sub_002B28E0_gen, "frustum"); }
+void sub_002B2550(void) { fov_call(g_eax, sub_002B2550_gen, "terms"); }
