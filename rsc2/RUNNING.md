@@ -263,6 +263,10 @@ Defaults are baked into `src/main.c`; `NAME=0` turns one off.
 
 - `RECOMP_AUDIO=0`: no audio device. `RECOMP_AUDIO_WAV=out.wav` records
   the mix.
+- `RECOMP_LANGUAGE=<language>`: the console language the game sees:
+  english (default), french, german, italian, spanish or japanese (or the
+  dashboard's number, 1-9). Text, fonts and the co-driver follow it
+  (`rsc2/tools/language_check.sh`).
 - `RECOMP_APU_REVERB=x`: reverb level. 0.3, the launcher's Normal, is the
   game's own level; 0 turns it off. The reverb follows the I3DL2 listener
   the game sets as it moves between environments.
