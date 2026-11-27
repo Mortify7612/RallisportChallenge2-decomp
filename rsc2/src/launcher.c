@@ -40,7 +40,7 @@ int nv2a_vk_device_names(char (*names)[256], int max);
 enum {
     O_RENDERER, O_GPU, O_SCALE, O_ASPECT, O_DISPLAY, O_FPS, O_FPSCOUNT, O_HDR, O_HDRPAPER,
     O_SHOW,
-    O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_KEYBOARD, O_KEYS, O_STEER, O_RUMBLE,
+    O_MSAA, O_ANISO, O_AO, O_SOUND, O_REVERB, O_LANGUAGE, O_KEYBOARD, O_KEYS, O_STEER, O_RUMBLE,
     O_COUNT
 };
 
@@ -236,6 +236,16 @@ static void opts_init(int list_gpus)
     opt_add(o, "Normal", "0.3");
     opt_add(o, "Strong", "0.5");
     o->def = 2;
+
+    o = opt_def(O_LANGUAGE, "language", "RECOMP_LANGUAGE", "GAME", 1, "Language",
+                "The language the game is set to, as the Xbox dashboard would set it: "
+                "menus, text and the co-driver's pace notes.");
+    opt_add(o, "English", "");          /* unset: the kernel's default */
+    opt_add(o, "Fran\xC3\xA7" "ais", "french");
+    opt_add(o, "Deutsch", "german");
+    opt_add(o, "Italiano", "italian");
+    opt_add(o, "Espa\xC3\xB1ol", "spanish");
+    opt_add(o, "Nihongo  (Japanese)", "japanese");   /* the launcher's font has no kana */
 
     o = opt_def(O_KEYBOARD, "keyboard", "RECOMP_KEYBOARD", "CONTROLS", 1, "Keyboard",
                 "Play with the keyboard as controller 1, alongside any real "
@@ -455,16 +465,16 @@ static int launcher_window(void) { return 1; }
 
 /* Layout in logical units; the renderer's pixels per unit is s_px. */
 #define WIN_W 1000
-#define WIN_H 816
+#define WIN_H 896
 #define ROW_H 42
 #define SEC_H 34
 #define COL_W 444
 #define COL0_X 40
 #define COL1_X 516
 #define TOP_Y 128
-#define HELP_Y 644                      /* the focused row's help text */
-#define FOOT_Y 702                      /* key hints; a rule below them */
-#define BTN_Y 752
+#define HELP_Y 724                      /* the focused row's help text */
+#define FOOT_Y 782                      /* key hints; a rule below them */
+#define BTN_Y 832
 
 enum { B_DEFAULTS = O_COUNT, B_STEAM, B_QUIT, B_START, FOCUS_COUNT };
 

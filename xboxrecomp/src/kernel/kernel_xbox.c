@@ -121,7 +121,7 @@ NTSTATUS __stdcall xbox_XeUnloadSection(PXBE_SECTION_HEADER Section)
  * SMBus. For recompilation, we return sensible defaults:
  *   - Region: North America
  *   - Video: NTSC, widescreen+HDTV enabled
- *   - Language: English
+ *   - Language: English (RECOMP_LANGUAGE sets another)
  *   - Audio: Stereo, Dolby Digital
  *   - DVD Region: Region 1 (North America)
  * ============================================================================ */
@@ -137,9 +137,29 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
 
     switch (ValueIndex) {
     case XC_LANGUAGE:
-        /* English = 1 */
+        /* The dashboard's language, which titles read through XGetLanguage
+         * for their text, fonts and speech. RECOMP_LANGUAGE=<name or
+         * number> sets it: english 1, japanese 2, german 3, french 4,
+         * spanish 5, italian 6, korean 7, chinese 8, portuguese 9. Default
+         * English. */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            static const char *const names[] = { NULL, "english", "japanese", "german",
+                "french", "spanish", "italian", "korean", "chinese", "portuguese" };
+            const char *e = getenv("RECOMP_LANGUAGE");
+            ULONG lang = 1, i;
+            if (e && *e) {
+                if (*e >= '1' && *e <= '9' && !e[1])
+                    lang = (ULONG)(*e - '0');
+                else
+                    for (i = 1; i < sizeof names / sizeof names[0]; i++) {
+                        const char *a = e, *b = names[i];
+                        while (*a && (*a | 0x20) == *b)
+                            a++, b++;
+                        if (!*a && !*b)
+                            lang = i;
+                    }
+            }
+            *(PULONG)Value = lang;
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
