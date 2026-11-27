@@ -176,7 +176,7 @@ static const uint32_t s_frag_fast_spv[] =
 #define VK_MAX_ZETA    8
 #define VK_MAX_PIPES   4096          /* power of two: hashed */
 #define VK_MAX_PROGS   1024          /* power of two */
-#define VK_PROG_VERSION 10           /* translated-program cache files */
+#define VK_PROG_VERSION 21           /* translated-program cache files */
 #define VK_MAX_SAMPLERS 512
 #define VK_TEX_SLOTS   8192          /* power of two */
 #define VK_MAX_RETIRED 4096
@@ -6461,7 +6461,46 @@ static int draw_common(const Nv2aVkState *st, VkShaderModule vs, uint32_t prog,
         k = force > 0.0f ? force : (16.0f / 9.0f) / view_aspect();
         ub->wide[0] = c && !c->swz && c->bpp == 4 && c->w == 640 && V.cur_zs && c->rows <= 480
                     ? k : 1.0f;
-        ub->wide[1] = ub->wide[2] = ub->wide[3] = 0.0f;
+        /* RECOMP_WIDE_UI (default on): squeeze only perspective geometry and
+         * let flat UI draws stretch across a screen wider than 16:9, instead
+         * of squeezing the HUD and menus toward the centre. =0 restores the
+         * earlier edge-tested squeeze for flats. */
+        {
+            static int ui = -1;
+            if (ui < 0) {
+                const char *e = getenv("RECOMP_WIDE_UI");
+                ui = !(e && strcmp(e, "0") == 0);
+            }
+            ub->wide[1] = (float)ui;
+        }
+        ub->wide[2] = ub->wide[3] = 0.0f;
+        {
+            /* Stages bound to one of the title's own 640x480 screen
+             * surfaces, sampled 1:1 against screen coordinates: their
+             * lookup must follow the geometry squeeze (k_prog_tail uses
+             * these bits), or screen pixels read content written for
+             * another position -- the SS1 pipeline-shadow ghosts. Match
+             * the texture's size, not the surface's: RSC2's shadow buffer
+             * 83E78000 is a 640x480 texture on a 640x1024 surface (rows
+             * 480). Read by the ground programs 29BF6A25 and CED240D4 on
+             * t3, written by 54B796C1. */
+            uint32_t bits = 0, st2;
+            for (st2 = 0; st2 < 4; st2++) {
+                int k2;
+                if (!st->tex[st2].valid || !st->tex[st2].offset
+                        || st->tex[st2].width != 640 || st->tex[st2].height != 480)
+                    continue;
+                for (k2 = 0; k2 < V.nsurf; k2++) {
+                    const Surf *q = &V.surf[k2];
+                    if (q->va == st->tex[st2].offset && !q->swz
+                            && q->w == 640 && q->rows <= 480 && q->bpp == 4) {
+                        bits |= 1u << st2;
+                        break;
+                    }
+                }
+            }
+            ub->wide[2] = (float)bits;
+        }
     }
     memcpy(ubm, ub, sizeof *ub);
 
@@ -6892,15 +6931,22 @@ static const char k_prog_main[] =
 static const char k_prog_tail[] =
     "    float w = R[12].w;\n"
     "    vec2 ndc = R[12].xy * u.vp.xy - 1.0;\n"
-    /* A screen wider than the title's: everything drawn into the scene is
-     * squeezed towards the centre, so the 3D view is widened rather than
-     * stretched and the HUD keeps its proportions -- except flat (w = 1)
-     * vertices on the screen's edges, which keep full-screen passes
-     * (colour grading, fades) covering the whole screen. "On the edge" is
-     * within a title pixel of it: D3D's half-pixel offset puts a full-screen
-     * quad at -0.5 .. 639.5, just outside on the left and just inside on the
-     * right, which a tighter test pinned on one side only. */
-    "    if (abs(w - 1.0) > 1e-5 || abs(ndc.x) < 1.0 - u.vp.x * 1.01) ndc.x *= u.wide.x;\n"
+    /* A screen wider than the title's. Two behaviours, RECOMP_WIDE_UI picks:
+     * the earlier one (RECOMP_WIDE_UI=0) squeezes everything drawn into
+     * the scene toward the centre -- 3D widened rather than stretched, HUD
+     * keeping its proportions but floating mid-screen -- except flat (w = 1)
+     * vertices on the screen's edges, which keep full-screen passes (colour
+     * grading, fades) covering the whole screen. "On the edge" is within a
+     * title pixel of it: D3D's half-pixel offset puts a full-screen quad at
+     * -0.5 .. 639.5, just outside on the left and just inside on the right,
+     * which a tighter test pinned on one side only.
+     * The default (u.wide.y, RECOMP_WIDE_UI=1) squeezes only
+     * perspective geometry (w != 1): the 3D view is still widened, while
+     * flat UI draws stretch to fill the wide screen, so menus and the
+     * on-screen keyboard read normally on a 21:9 monitor instead of
+     * shrinking into a 16:9 band with empty flanks. Full-screen flat passes
+     * are w = 1 too, so they still cover the whole screen either way. */
+    "    if (u.wide.y > 0.5 ? (abs(w - 1.0) > 1e-5) : (abs(w - 1.0) > 1e-5 || abs(ndc.x) < 1.0 - u.vp.x * 1.01)) ndc.x *= u.wide.x;\n"
     "    gl_Position = vec4(ndc * w, u.vp.w == 2.0 ? WREV_C : R[12].z * u.vp.z * w, w);\n"
     "    v_zs = R[12].z * u.vp.z;\n"
     /* oD0/oD1 are clamped to [0,1] by the hardware before interpolation
@@ -6909,6 +6955,24 @@ static const char k_prog_tail[] =
     "    v_d0 = clamp(O[3], 0.0, 1.0); v_d1 = clamp(O[4], 0.0, 1.0);\n"
     "    v_fog = fog_factor(O[5].x);\n"
     "    v_t0 = O[9]; v_t1 = O[10]; v_t2 = O[11]; v_t3 = O[12];\n"
+    /* A stage whose texture is one of the title's own 640x480 screen
+     * surfaces (u.wide.z bit per stage, set by the draw setup) is sampled
+     * 1:1 against screen coordinates -- and the geometry squeeze above has
+     * already moved where that surface's content sits. Look it up at the
+     * squeezed coordinate, or the content lands where it would if squeezed
+     * twice: RSC2's SS1 caster silhouettes showed as dark ghosts
+     * (x-320)(k-1) title px toward the centre of their casters. The
+     * coordinates are projective (oT = screen * w, q = w) and, for a
+     * linear texture, in texels (ts = 1/width), so the centre is
+     * (0.5 / ts) * q, not 0.5; the map is linear in (s, q), so it is exact
+     * per vertex. */
+    "    if (u.wide.x < 0.999 && u.wide.z > 0.0) {\n"
+    "        int wb = int(u.wide.z + 0.5);\n"
+    "        if ((wb & 1) != 0) v_t0.x = v_t0.x * u.wide.x + (1.0 - u.wide.x) * (0.5 / u.ts[0].x) * (v_t0.w != 0.0 ? v_t0.w : 1.0);\n"
+    "        if ((wb & 2) != 0) v_t1.x = v_t1.x * u.wide.x + (1.0 - u.wide.x) * (0.5 / u.ts[1].x) * (v_t1.w != 0.0 ? v_t1.w : 1.0);\n"
+    "        if ((wb & 4) != 0) v_t2.x = v_t2.x * u.wide.x + (1.0 - u.wide.x) * (0.5 / u.ts[2].x) * (v_t2.w != 0.0 ? v_t2.w : 1.0);\n"
+    "        if ((wb & 8) != 0) v_t3.x = v_t3.x * u.wide.x + (1.0 - u.wide.x) * (0.5 / u.ts[3].x) * (v_t3.w != 0.0 ? v_t3.w : 1.0);\n"
+    "    }\n"
     /* Points: the program's oPts when point parameters are on, else
      * SET_POINT_SIZE -- either at the render scale. */
     "    gl_PointSize = max(u.pts.w != 0.0 ? O[6].x * u.pts.y : u.pts.x, 1.0);\n"

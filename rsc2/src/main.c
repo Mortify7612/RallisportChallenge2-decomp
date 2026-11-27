@@ -639,6 +639,16 @@ static int rsc2_main(void *hInstance, void *hPrevInstance,
     }
 
     g_xbox_mem_offset = xbox_GetMemoryOffset();
+    /* Native wide (default; RSC2_WIDE_NATIVE=0 restores the renderer's
+     * squeeze): the game projects wide itself (the input hook in
+     * rsc2_overrides.c), so the renderer must not squeeze as well. */
+    if (!(getenv("RSC2_WIDE_NATIVE") && strcmp(getenv("RSC2_WIDE_NATIVE"), "0") == 0)) {
+#ifdef _WIN32
+        _putenv_s("RECOMP_VK_WIDE_X", "1");   /* MinGW and MSVC have no setenv */
+#else
+        setenv("RECOMP_VK_WIDE_X", "1", 1);
+#endif
+    }
     printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
 
     /* Bring up the emulated APU.

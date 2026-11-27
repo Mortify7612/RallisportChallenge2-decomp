@@ -84,6 +84,14 @@ Vulkan headers/loader and (for GPU vertex programs) `shaderc`.
   scene targets; each pass resolves into the image everything else reads.
 - `RECOMP_VK_ANISO=N`: anisotropic filtering, up to 16. Used where the game
   already filters linearly with mipmaps.
+- `RSC2_WIDE_NATIVE=0`: on a screen wider than 16:9 the game normally
+  projects at the screen's own aspect. `=0` goes back to the renderer
+  squeezing the game's 16:9 view, which culls scenery at the old 16:9
+  border in the pre-race flyover.
+- `RECOMP_WIDE_UI=0`: with the renderer's squeeze (`RSC2_WIDE_NATIVE=0`),
+  menus and the HUD are squeezed toward the centre with the 3D view, into
+  a 16:9 band. By default (`1`) only perspective draws are squeezed and
+  flat UI stretches across the screen.
 - `RECOMP_VK_AO=1`: screen-space ambient occlusion. It's worked out from the
   game's w-buffer and applied to the shown scene before the HUD.
   - It's computed at reduced size, `RECOMP_VK_AO_RES` render-scale steps
